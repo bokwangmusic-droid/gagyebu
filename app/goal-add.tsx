@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Keyboard, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { Field, HeaderTextButton, TextField } from '@/components/ui/controls';
@@ -69,7 +69,10 @@ export default function GoalAdd() {
         </Field>
         <Field label="목표 날짜 (선택)">
           <Pressable
-            onPress={() => setUseDeadline((v) => !v)}
+            onPress={() => {
+              Keyboard.dismiss();
+              setUseDeadline((v) => !v);
+            }}
             style={{
               flexDirection: 'row',
               alignItems: 'center',
@@ -103,7 +106,10 @@ export default function GoalAdd() {
               return (
                 <Pressable
                   key={ic.id}
-                  onPress={() => setIcon(ic.id)}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setIcon(ic.id);
+                  }}
                   style={{
                     flexDirection: 'row',
                     alignItems: 'center',

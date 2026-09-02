@@ -1,16 +1,10 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
-import {
-  KeyboardAvoidingView,
-  Modal,
-  Platform,
-  Pressable,
-  Text,
-  View,
-} from 'react-native';
+import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { BottomSheet } from '@/components/ui/BottomSheet';
 import { Field, TextField } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { GradientButton } from '@/components/ui/GradientButton';
@@ -29,8 +23,9 @@ export default function GoalsList() {
   const { goals, updateGoal, deleteGoal } = useStore();
 
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
-  const [depositFor, setDepositFor] = useState<Goal | null>(null);
-  const [depositAmount, setDepositAmount] = useState('');
+  const [moveFor, setMoveFor] = useState<Goal | null>(null);
+  const [moveMode, setMoveMode] = useState<'in' | 'out'>('in');
+  const [moveAmount, setMoveAmount] = useState('');
 
   useEffect(() => {
     if (!confirmDel) return;
@@ -49,14 +44,21 @@ export default function GoalsList() {
     }
   };
 
-  const doDeposit = () => {
-    const n = parseNum(depositAmount);
-    if (n > 0 && depositFor) {
-      updateGoal(depositFor.id, { saved: depositFor.saved + n });
-      toast.show('입금됐어요');
-      setDepositFor(null);
-      setDepositAmount('');
-    }
+  const openMove = (g: Goal, mode: 'in' | 'out') => {
+    setMoveFor(g);
+    setMoveMode(mode);
+    setMoveAmount('');
+  };
+
+  const doMove = () => {
+    const n = parseNum(moveAmount);
+    if (n <= 0 || !moveFor) return;
+    const next =
+      moveMode === 'in' ? moveFor.saved + n : Math.max(0, moveFor.saved - n);
+    updateGoal(moveFor.id, { saved: next });
+    toast.show(moveMode === 'in' ? '입금했어요' : '출금했어요');
+    setMoveFor(null);
+    setMoveAmount('');
   };
 
   const addBtn = (
@@ -171,27 +173,37 @@ export default function GoalsList() {
               </View>
               <ProgressBar percent={pct} size="md" style={{ marginTop: spacing.md }} />
               <View style={{ flexDirection: 'row', gap: 6, marginTop: spacing.md, justifyContent: 'flex-end' }}>
+                {g.saved > 0 && (
+                  <Pressable
+                    onPress={() => openMove(g, 'out')}
+                    style={{
+                      paddingVertical: 10,
+                      paddingHorizontal: 14,
+                      borderRadius: radii.md,
+                      backgroundColor: colors.white,
+                      borderWidth: 1,
+                      borderColor: colors.border,
+                    }}
+                  >
+                    <Text style={{ fontFamily: fontFamily.semibold, fontSize: 14, color: colors.textSub }}>− 출금</Text>
+                  </Pressable>
+                )}
                 <Pressable
-                  onPress={() => {
-                    setDepositFor(g);
-                    setDepositAmount('');
-                  }}
+                  onPress={() => openMove(g, 'in')}
                   style={{
                     paddingVertical: 10,
-                    paddingHorizontal: 16,
+                    paddingHorizontal: 14,
                     borderRadius: radii.md,
-                    backgroundColor: colors.white,
-                    borderWidth: 1,
-                    borderColor: colors.border,
+                    backgroundColor: colors.primaryLight,
                   }}
                 >
-                  <Text style={{ fontFamily: fontFamily.semibold, fontSize: 14, color: colors.text }}>+ 입금</Text>
+                  <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.primaryStrong }}>+ 입금</Text>
                 </Pressable>
                 <Pressable
                   onPress={() => handleDelete(g.id)}
                   style={{
                     paddingVertical: 10,
-                    paddingHorizontal: 16,
+                    paddingHorizontal: 14,
                     borderRadius: radii.md,
                     backgroundColor: confirmDel === g.id ? colors.expenseSolid : colors.white,
                     borderWidth: 1,
@@ -214,58 +226,45 @@ export default function GoalsList() {
         })
       )}
 
-      {depositFor && (
-        <Modal
-          transparent
+      {moveFor && (
+        <BottomSheet
           visible
-          animationType="slide"
-          statusBarTranslucent
-          onRequestClose={() => setDepositFor(null)}
+          onClose={() => setMoveFor(null)}
+          title={`「${moveFor.name}」${moveMode === 'in' ? '에 입금' : '에서 출금'}`}
         >
-          <View style={{ flex: 1, backgroundColor: colors.overlayStrong, justifyContent: 'flex-end' }}>
-            <Pressable style={{ flex: 1 }} onPress={() => setDepositFor(null)} />
-            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-              <View
-                style={{
-                  backgroundColor: colors.bg,
-                  borderTopLeftRadius: 20,
-                  borderTopRightRadius: 20,
-                  padding: spacing.xl,
-                  paddingBottom: 32,
-                }}
-              >
-              <View
-                style={{
-                  flexDirection: 'row',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  marginBottom: spacing.lg,
-                }}
-              >
-                <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text }}>
-                  「{depositFor.name}」에 입금
-                </Text>
-                <Pressable onPress={() => setDepositFor(null)} hitSlop={10}>
-                  <AppIcon name="x" size={18} color={colors.textSub} />
-                </Pressable>
-              </View>
-              <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub, marginBottom: spacing.md }}>
-                현재 {fmt(depositFor.saved)}원 · 목표 {fmt(depositFor.target)}원
+          <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub, marginBottom: spacing.md }}>
+            현재 {fmt(moveFor.saved)}원
+            {moveMode === 'in' ? ` · 목표 ${fmt(moveFor.target)}원` : ' 에서 뺄 금액을 입력하세요'}
+          </Text>
+          <Field label={moveMode === 'in' ? '얼마 넣을까요?' : '얼마 뺄까요?'}>
+            <TextField
+              keyboardType="number-pad"
+              autoFocus
+              value={moveAmount ? fmt(Number(moveAmount)) : ''}
+              onChangeText={(t) => {
+                const n = parseNum(t);
+                setMoveAmount(String(moveMode === 'out' ? Math.min(n, moveFor.saved) : n));
+              }}
+              placeholder="0"
+            />
+          </Field>
+          {moveMode === 'out' && (
+            <Pressable
+              onPress={() => setMoveAmount(String(moveFor.saved))}
+              style={{ alignSelf: 'flex-start', marginTop: -spacing.sm, marginBottom: spacing.md }}
+              hitSlop={8}
+            >
+              <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.primaryStrong }}>
+                전액 {fmt(moveFor.saved)}원
               </Text>
-              <Field label="얼마 넣을까요?">
-                <TextField
-                  keyboardType="number-pad"
-                  autoFocus
-                  value={depositAmount ? fmt(Number(depositAmount)) : ''}
-                  onChangeText={(t) => setDepositAmount(String(parseNum(t)))}
-                  placeholder="0"
-                />
-              </Field>
-              <GradientButton label="입금하기" onPress={doDeposit} disabled={!parseNum(depositAmount)} />
-              </View>
-            </KeyboardAvoidingView>
-          </View>
-        </Modal>
+            </Pressable>
+          )}
+          <GradientButton
+            label={moveMode === 'in' ? '입금하기' : '출금하기'}
+            onPress={doMove}
+            disabled={!parseNum(moveAmount)}
+          />
+        </BottomSheet>
       )}
     </ModalScreen>
   );

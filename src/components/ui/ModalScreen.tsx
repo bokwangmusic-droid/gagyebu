@@ -1,5 +1,5 @@
-import type { ReactNode } from 'react';
-import { Pressable, ScrollView, Text, View } from 'react-native';
+import { useEffect, useState, type ReactNode } from 'react';
+import { Keyboard, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
@@ -31,6 +31,21 @@ export function ModalScreen({
   scroll = true,
 }: ModalScreenProps) {
   const insets = useSafeAreaInsets();
+  const [kb, setKb] = useState(0);
+
+  // Shrink the scroll viewport to the keyboard top so a focused field lower
+  // on the form (e.g. the memo box) scrolls fully into view rather than
+  // hiding behind the keyboard — RN's built-in focus-scroll then lands it.
+  useEffect(() => {
+    const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvt = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const s = Keyboard.addListener(showEvt, (e) => setKb(e.endCoordinates?.height ?? 0));
+    const h = Keyboard.addListener(hideEvt, () => setKb(0));
+    return () => {
+      s.remove();
+      h.remove();
+    };
+  }, []);
 
   const body = (
     <View style={{ width: '100%', maxWidth: layout.maxContentWidth, alignSelf: 'center', flex: scroll ? undefined : 1 }}>
@@ -67,10 +82,11 @@ export function ModalScreen({
 
       {scroll ? (
         <ScrollView
-          style={{ flex: 1 }}
-          contentContainerStyle={{ paddingBottom: insets.bottom + 32 }}
+          style={{ flex: 1, marginBottom: kb }}
+          contentContainerStyle={{ paddingBottom: insets.bottom + 32 + (kb > 0 ? 24 : 0) }}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
         >
           {body}
         </ScrollView>

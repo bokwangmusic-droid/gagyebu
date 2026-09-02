@@ -6,7 +6,6 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -455,10 +454,7 @@ export default function InputModal() {
       {/* Paste sheet */}
       {showPaste && (
         <Pressable style={styles.backdrop} onPress={() => setShowPaste(false)}>
-          <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            style={{ width: '100%' }}
-          >
+          <KeyboardAvoidingView behavior="padding" style={{ width: '100%' }}>
             <Pressable
               style={[styles.sheet, { paddingBottom: insets.bottom + 20 }]}
               onPress={(e) => e.stopPropagation()}

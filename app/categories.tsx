@@ -1,16 +1,7 @@
 import * as Haptics from 'expo-haptics';
 import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import {
-  Alert,
-  KeyboardAvoidingView,
-  Modal,
-  Platform,
-  Pressable,
-  ScrollView,
-  Text,
-  View,
-} from 'react-native';
+import { Alert, Pressable, Text, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   runOnJS,
@@ -18,9 +9,9 @@ import Animated, {
   useSharedValue,
   withSpring,
 } from 'react-native-reanimated';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
+import { BottomSheet } from '@/components/ui/BottomSheet';
 import { Field, SegmentedTabs, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
@@ -389,7 +380,6 @@ function AddCategoryOverlay({
   onCancel: () => void;
   onSave: (cat: { name: string; icon: IconKey; color: string; bg: string }) => void;
 }) {
-  const insets = useSafeAreaInsets();
   const [name, setName] = useState('');
   const [iconIdx, setIconIdx] = useState(0);
   const [colorIdx, setColorIdx] = useState(0);
@@ -398,44 +388,12 @@ function AddCategoryOverlay({
   const canSave = name.trim().length > 0;
 
   return (
-    <Modal transparent visible animationType="slide" statusBarTranslucent onRequestClose={onCancel}>
-      <View style={{ flex: 1, backgroundColor: colors.overlayStrong, justifyContent: 'flex-end' }}>
-        {/* Tap the dimmed area above the sheet to dismiss. */}
-        <Pressable style={{ flex: 1 }} onPress={onCancel} />
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <View
-            style={{
-              backgroundColor: colors.bg,
-              borderTopLeftRadius: 20,
-              borderTopRightRadius: 20,
-              maxHeight: '90%',
-            }}
-          >
-            <ScrollView
-              contentContainerStyle={{
-                padding: spacing.xl,
-                paddingBottom: insets.bottom + 28,
-              }}
-              keyboardShouldPersistTaps="handled"
-              keyboardDismissMode="on-drag"
-              showsVerticalScrollIndicator={false}
-            >
-          <View
-            style={{
-              flexDirection: 'row',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              marginBottom: spacing.lg,
-            }}
-          >
-            <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text }}>
-              {type === 'expense' ? '지출' : '수입'} 카테고리 추가
-            </Text>
-            <Pressable onPress={onCancel} hitSlop={10}>
-              <AppIcon name="x" size={18} color={colors.textSub} />
-            </Pressable>
-          </View>
-
+    <BottomSheet
+      visible
+      onClose={onCancel}
+      title={`${type === 'expense' ? '지출' : '수입'} 카테고리 추가`}
+      scroll
+    >
           <View
             style={{
               alignItems: 'center',
@@ -531,10 +489,6 @@ function AddCategoryOverlay({
               onSave({ name: name.trim().slice(0, 12), icon, color: color.color, bg: color.bg })
             }
           />
-            </ScrollView>
-          </View>
-        </KeyboardAvoidingView>
-      </View>
-    </Modal>
+    </BottomSheet>
   );
 }

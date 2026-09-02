@@ -1,14 +1,16 @@
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { Alert, KeyboardAvoidingView, Modal, Platform, Pressable, Text, View } from 'react-native';
+import { Alert, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { BottomSheet } from '@/components/ui/BottomSheet';
 import { Field, Toggle, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { Screen } from '@/components/ui/Screen';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { useToast } from '@/components/ui/Toast';
 import { EXPENSE_CATS, INCOME_CATS } from '@/data/categories';
+import { fmt } from '@/lib/format';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
@@ -16,7 +18,7 @@ import { fontFamily, noPad } from '@/theme/typography';
 export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
-  const { settings, setSettings, recurring, goals, customCats, transactions, budgets, resetAll } =
+  const { settings, setSettings, recurring, goals, loans, customCats, transactions, budgets, resetAll } =
     useStore();
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -125,6 +127,20 @@ export default function ProfileScreen() {
           onPress={() => router.push('/goals')}
         />
         <Row
+          icon="landmark"
+          iconBg={colors.infoLight}
+          iconColor={colors.infoText}
+          title="대출 관리"
+          sub={
+            loans.length > 0
+              ? `${loans.length}건 · 남은 원금 ${fmt(
+                  loans.reduce((s, l) => s + Math.max(0, l.principal - l.paid), 0),
+                )}원`
+              : '원금·이자·상환일 한눈에 관리'
+          }
+          onPress={() => router.push('/loans')}
+        />
+        <Row
           icon="sparkle"
           iconBg={colors.warningLight}
           iconColor={colors.warningText}
@@ -188,49 +204,25 @@ export default function ProfileScreen() {
       </View>
 
       {editingName && (
-        <Modal
-          transparent
-          visible
-          animationType="slide"
-          statusBarTranslucent
-          onRequestClose={() => setEditingName(false)}
-        >
-          <View style={{ flex: 1, backgroundColor: colors.overlayStrong, justifyContent: 'flex-end' }}>
-            <Pressable style={{ flex: 1 }} onPress={() => setEditingName(false)} />
-            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-              <View
-                style={{
-                  backgroundColor: colors.bg,
-                  borderTopLeftRadius: 20,
-                  borderTopRightRadius: 20,
-                  padding: spacing.xl,
-                  paddingBottom: 32,
-                }}
-              >
-                <Text style={{ fontFamily: fontFamily.bold, fontSize: 16, color: colors.text, marginBottom: spacing.md }}>
-                  이름 변경
-                </Text>
-              <Field label="이름">
-                <TextField
-                  value={draftName}
-                  onChangeText={setDraftName}
-                  placeholder="예: 에드가"
-                  maxLength={20}
-                  autoFocus
-                />
-              </Field>
-                <GradientButton
-                  label="저장"
-                  onPress={() => {
-                    const n = draftName.trim();
-                    if (n) setSettings({ profileName: n });
-                    setEditingName(false);
-                  }}
-                />
-              </View>
-            </KeyboardAvoidingView>
-          </View>
-        </Modal>
+        <BottomSheet visible onClose={() => setEditingName(false)} title="이름 변경">
+          <Field label="이름">
+            <TextField
+              value={draftName}
+              onChangeText={setDraftName}
+              placeholder="예: 에드가"
+              maxLength={20}
+              autoFocus
+            />
+          </Field>
+          <GradientButton
+            label="저장"
+            onPress={() => {
+              const n = draftName.trim();
+              if (n) setSettings({ profileName: n });
+              setEditingName(false);
+            }}
+          />
+        </BottomSheet>
       )}
     </Screen>
   );
