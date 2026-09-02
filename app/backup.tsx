@@ -22,7 +22,7 @@ import { fontFamily } from '@/theme/typography';
 export default function Backup() {
   const router = useRouter();
   const toast = useToast();
-  const { transactions, budgets, goals, recurring, planned, loans, notes, settings, importData } =
+  const { transactions, budgets, goals, recurring, planned, loans, cards, notes, settings, importData } =
     useStore();
 
   const [mode, setMode] = useState<'export' | 'import'>('export');
@@ -40,6 +40,7 @@ export default function Backup() {
           recurring,
           planned,
           loans,
+          cards,
           notes,
           settings,
           exportedAt: new Date().toISOString(),
@@ -47,7 +48,7 @@ export default function Backup() {
         null,
         2,
       ),
-    [transactions, budgets, goals, recurring, planned, loans, notes, settings],
+    [transactions, budgets, goals, recurring, planned, loans, cards, notes, settings],
   );
 
   const copy = async () => {

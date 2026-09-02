@@ -34,6 +34,7 @@ import {
   DEFAULT_SETTINGS,
   type AppState,
   type BudgetMap,
+  type CreditCard,
   type Goal,
   type Loan,
   type LoanPayment,
@@ -54,6 +55,7 @@ const DEFAULT_STATE: AppState = {
   recurring: [],
   planned: [],
   loans: [],
+  cards: [],
   notes: '',
   customCats: DEFAULT_CUSTOM_CATS,
   catOrder: DEFAULT_CAT_ORDER,
@@ -95,6 +97,10 @@ interface StoreValue extends AppState {
   ) => void;
   deleteLoanPayment: (loanId: string, paymentId: string) => void;
 
+  addCard: (c: Omit<CreditCard, 'id' | 'createdAt'>) => void;
+  updateCard: (id: string, patch: Partial<CreditCard>) => void;
+  deleteCard: (id: string) => void;
+
   setNotes: (v: string) => void;
 
   addCustomCat: (type: TxnType, cat: Omit<Category, 'id' | 'custom'>) => void;
@@ -117,6 +123,7 @@ const PERSIST_KEYS: (keyof AppState)[] = [
   'recurring',
   'planned',
   'loans',
+  'cards',
   'notes',
   'customCats',
   'catOrder',
@@ -148,6 +155,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         recurring,
         planned,
         loans,
+        cards,
         notes,
         customCats,
         catOrder,
@@ -161,6 +169,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         loadItem('recurring', DEFAULT_STATE.recurring),
         loadItem('planned', DEFAULT_STATE.planned),
         loadItem('loans', DEFAULT_STATE.loans),
+        loadItem('cards', DEFAULT_STATE.cards),
         loadItem('notes', DEFAULT_STATE.notes),
         loadItem('customCats', DEFAULT_STATE.customCats),
         loadItem('catOrder', DEFAULT_STATE.catOrder),
@@ -176,6 +185,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         recurring,
         planned,
         loans,
+        cards,
         notes,
         customCats,
         catOrder,
@@ -524,6 +534,41 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [mutate],
   );
 
+  const addCard: StoreValue['addCard'] = useCallback(
+    (c) =>
+      mutate(
+        (s) => ({
+          ...s,
+          cards: [
+            ...s.cards,
+            { id: uid('card'), createdAt: new Date().toISOString(), ...c },
+          ],
+        }),
+        ['cards'],
+      ),
+    [mutate],
+  );
+
+  const updateCard: StoreValue['updateCard'] = useCallback(
+    (id, patch) =>
+      mutate(
+        (s) => ({
+          ...s,
+          cards: s.cards.map((c) => (c.id === id ? { ...c, ...patch } : c)),
+        }),
+        ['cards'],
+      ),
+    [mutate],
+  );
+
+  // Deleting a card never touches transactions: rows keep their `cardId` and
+  // are shown / billed as "카드 미지정" until reassigned.
+  const deleteCard: StoreValue['deleteCard'] = useCallback(
+    (id) =>
+      mutate((s) => ({ ...s, cards: s.cards.filter((c) => c.id !== id) }), ['cards']),
+    [mutate],
+  );
+
   const setNotes: StoreValue['setNotes'] = useCallback(
     (v) => mutate((s) => ({ ...s, notes: v }), ['notes']),
     [mutate],
@@ -615,6 +660,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             recurring: parsed.recurring ?? s.recurring,
             planned: parsed.planned ?? s.planned,
             loans: parsed.loans ?? s.loans,
+            cards: parsed.cards ?? s.cards,
             notes: parsed.notes ?? s.notes,
             customCats: parsed.customCats ?? s.customCats,
             catOrder: parsed.catOrder ?? s.catOrder,
@@ -645,6 +691,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           recurring: [],
           planned: [],
           loans: [],
+          cards: [],
           notes: '',
           settings: DEFAULT_SETTINGS,
         }),
@@ -679,6 +726,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       deleteLoan,
       addLoanPayment,
       deleteLoanPayment,
+      addCard,
+      updateCard,
+      deleteCard,
       setNotes,
       addCustomCat,
       deleteCustomCat,
@@ -713,6 +763,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       deleteLoan,
       addLoanPayment,
       deleteLoanPayment,
+      addCard,
+      updateCard,
+      deleteCard,
       setNotes,
       addCustomCat,
       deleteCustomCat,

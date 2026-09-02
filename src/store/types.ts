@@ -14,6 +14,17 @@ export interface TransactionSplit {
   memo?: string;
 }
 
+/**
+ * Instalment plan for a single credit-card purchase. `months >= 2`
+ * (1 month = 일시불, which stores no `installment` at all). The plan's start
+ * month is the parent transaction's `date` month — not stored here. The
+ * per-month charge is always a derived value (see `src/lib/card.ts`); the
+ * transaction's `amount` stays the full purchase price.
+ */
+export interface TransactionInstallment {
+  months: number;
+}
+
 export interface Transaction {
   id: string;
   type: TxnType;
@@ -27,6 +38,10 @@ export interface Transaction {
   /* ---- extension fields — all optional; absent = current behaviour ---- */
   /** Payment instrument. Foundation for card / 할부 tracking. */
   paymentMethod?: PaymentMethod;
+  /** Which registered card was used. Only meaningful when `paymentMethod === 'credit'`. */
+  cardId?: string;
+  /** Present = 할부; absent = 일시불. Never materialised as separate rows. */
+  installment?: TransactionInstallment;
   /**
    * Per-category breakdown of a single payment. When present and non-empty,
    * per-category aggregation uses these instead of `category` / `amount`.
@@ -36,6 +51,23 @@ export interface Transaction {
   memberId?: string;
   /** Free-form labels. */
   tags?: string[];
+}
+
+/**
+ * A credit card the user registered. `closingDay` / `paymentDay` are stored
+ * for display only in the MVP — card billing is computed on the purchase
+ * month, not on carrier-specific 이용기간 windows.
+ */
+export interface CreditCard {
+  id: string;
+  name: string;
+  /** Optional accent colour ({ bg, color } from CAT_COLOR_PALETTE). */
+  color?: { bg: string; color: string };
+  /** 결제일 1–31 (표시 전용). */
+  paymentDay?: number;
+  /** 마감일 1–31 (표시 전용, MVP 계산 미사용). */
+  closingDay?: number;
+  createdAt: string;
 }
 
 /** Category id -> monthly budget won. */
@@ -122,6 +154,7 @@ export interface AppState {
   recurring: RecurringRule[];
   planned: PlannedExpense[];
   loans: Loan[];
+  cards: CreditCard[];
   notes: string;
   customCats: CustomCatMap;
   catOrder: CatOrderMap;

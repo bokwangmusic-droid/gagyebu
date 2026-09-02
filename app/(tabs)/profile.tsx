@@ -10,6 +10,7 @@ import { Screen } from '@/components/ui/Screen';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { useToast } from '@/components/ui/Toast';
 import { EXPENSE_CATS, INCOME_CATS } from '@/data/categories';
+import { cardBillingForMonth } from '@/lib/card';
 import { fmt } from '@/lib/format';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -18,8 +19,9 @@ import { fontFamily, noPad } from '@/theme/typography';
 export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
-  const { settings, setSettings, recurring, goals, loans, customCats, transactions, budgets, resetAll } =
+  const { settings, setSettings, recurring, goals, loans, cards, customCats, transactions, budgets, resetAll } =
     useStore();
+  const cardBillTotal = cardBillingForMonth(transactions, cards).total;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState('');
 
@@ -139,6 +141,18 @@ export default function ProfileScreen() {
               : '원금·이자·상환일 한눈에 관리'
           }
           onPress={() => router.push('/loans')}
+        />
+        <Row
+          icon="card"
+          iconBg={colors.primaryLight}
+          iconColor={colors.primaryStrong}
+          title="카드 관리"
+          sub={
+            cards.length > 0
+              ? `${cards.length}장 · 사용월 기준 예상 ${fmt(cardBillTotal)}원`
+              : '카드 등록 · 일시불/할부 · 예상 카드값'
+          }
+          onPress={() => router.push('/cards')}
         />
         <Row
           icon="sparkle"

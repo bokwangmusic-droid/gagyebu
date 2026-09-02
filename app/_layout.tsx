@@ -129,6 +129,8 @@ function RootNav() {
         <Stack.Screen name="goal-add" options={MODAL} />
         <Stack.Screen name="loans" options={MODAL} />
         <Stack.Screen name="loan-add" options={MODAL} />
+        <Stack.Screen name="cards" options={MODAL} />
+        <Stack.Screen name="card-add" options={MODAL} />
         <Stack.Screen name="categories" options={MODAL} />
         <Stack.Screen name="budget-add" options={MODAL} />
         <Stack.Screen name="planned-add" options={MODAL} />

@@ -18,6 +18,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AppIcon } from '@/components/AppIcon';
 import { CalendarSheet } from '@/components/ui/CalendarSheet';
 import { getAllCats, getCat, type TxnType } from '@/data/categories';
+import { installmentPerMonth } from '@/lib/card';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
@@ -29,8 +30,18 @@ import {
   type SplitDraft,
 } from '@/lib/splits';
 import { useStore } from '@/store/store';
+import type { PaymentMethod } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
+
+const PAY_METHODS: { value: PaymentMethod; label: string }[] = [
+  { value: 'cash', label: '현금' },
+  { value: 'debit', label: '체크' },
+  { value: 'credit', label: '신용' },
+  { value: 'transfer', label: '이체' },
+  { value: 'other', label: '기타' },
+];
+const INSTALLMENT_PRESETS = ['3', '6', '12'];
 
 /* ------------------------------------------------------------------ *
  * 지출·수입 입력 — custom keypad, category picker, card-SMS auto-fill.
@@ -69,6 +80,7 @@ export default function InputModal() {
     deleteTransaction,
     customCats,
     catOrder,
+    cards,
   } = useStore();
 
   const editing = params.id ? transactions.find((t) => t.id === params.id) ?? null : null;
@@ -88,6 +100,16 @@ export default function InputModal() {
     editing?.splits?.length
       ? editing.splits.map((s) => ({ category: s.category, amount: String(s.amount) }))
       : [makeSplitDraft('food'), makeSplitDraft('transit')],
+  );
+
+  // Payment method / card / 할부 — all optional; absent = legacy behaviour.
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | undefined>(
+    editing?.paymentMethod,
+  );
+  const [cardId, setCardId] = useState<string | undefined>(editing?.cardId);
+  const [installmentOn, setInstallmentOn] = useState(!!editing?.installment);
+  const [installmentMonths, setInstallmentMonths] = useState(
+    editing?.installment ? String(editing.installment.months) : '3',
   );
 
   const [showDate, setShowDate] = useState(false);
@@ -130,6 +152,19 @@ export default function InputModal() {
     if (type !== 'expense' && splitOn) setSplitOn(false);
   }, [type, splitOn]);
 
+  // Payment method is expense-only.
+  useEffect(() => {
+    if (type !== 'expense' && paymentMethod !== undefined) setPaymentMethod(undefined);
+  }, [type, paymentMethod]);
+
+  // Card & 할부 details only apply to 신용; clear them otherwise.
+  useEffect(() => {
+    if (paymentMethod !== 'credit') {
+      if (cardId !== undefined) setCardId(undefined);
+      if (installmentOn) setInstallmentOn(false);
+    }
+  }, [paymentMethod, cardId, installmentOn]);
+
   const displayAmount = amount ? fmt(Number(amount)) : '0';
   const total = parseNum(amount);
   const normSplits = useMemo(() => normalizeSplits(splits), [splits]);
@@ -137,7 +172,14 @@ export default function InputModal() {
     () => checkSplits(total, normSplits),
     [total, normSplits],
   );
-  const canSave = total > 0 && (!splitOn || splitCheck.ok);
+  const installmentActive = paymentMethod === 'credit' && installmentOn;
+  const instMonths = parseNum(installmentMonths);
+  const instPreview =
+    installmentActive && instMonths >= 2 ? installmentPerMonth(total, instMonths) : null;
+  const canSave =
+    total > 0 &&
+    (!splitOn || splitCheck.ok) &&
+    (!installmentActive || instMonths >= 2);
   const today = toDateKey(new Date());
 
   const setSplitRow = (i: number, patch: Partial<SplitDraft>) =>
@@ -184,7 +226,11 @@ export default function InputModal() {
         now.getSeconds(),
       ).toISOString();
     }
-    const base = {
+    const isCredit = paymentMethod === 'credit';
+    // Every optional field is written explicitly (value or `undefined`) so an
+    // edit that turns a feature OFF clears the stored field — same pattern as
+    // STEP 5's `splits: undefined`. `undefined` keys are dropped on persist.
+    const payload = {
       type,
       // Keep a representative category so list rows still show an icon;
       // aggregation ignores it whenever `splits` is present.
@@ -192,13 +238,14 @@ export default function InputModal() {
       amount: total,
       memo: memo.trim(),
       date: dateISO,
+      splits: splitOn ? normSplits : undefined,
+      paymentMethod: paymentMethod ?? undefined,
+      cardId: isCredit ? cardId ?? undefined : undefined,
+      installment:
+        isCredit && installmentOn && instMonths >= 2
+          ? { months: instMonths }
+          : undefined,
     };
-    const payload =
-      splitOn
-        ? { ...base, splits: normSplits }
-        : editing?.splits
-          ? { ...base, splits: undefined } // split -> normal: drop the breakdown
-          : base;
     if (editing) updateTransaction(editing.id, payload);
     else addTransaction(payload);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
@@ -243,6 +290,10 @@ export default function InputModal() {
     if (pastePreview.merchant) setMemo(pastePreview.merchant);
     setType(pastePreview.type);
     setSplitOn(false); // a card message is always one single-category charge
+    // The parser doesn't detect card / 할부 — clear any stale edit state.
+    setPaymentMethod(undefined);
+    setCardId(undefined);
+    setInstallmentOn(false);
     if (pastePreview.category) {
       const c = pastePreview.category;
       setTimeout(() => setCategory(c), 0);
@@ -262,6 +313,9 @@ export default function InputModal() {
     if (r.amount == null) return; // nothing to apply — the hint tells the user why
     setType(r.type);
     setSplitOn(false); // quick entry always fills a normal single-category row
+    setPaymentMethod(undefined); // parser has no card / 할부 concept
+    setCardId(undefined);
+    setInstallmentOn(false);
     setAmount(String(r.amount));
     if (r.category) setCategory(r.category);
     if (r.memo) setMemo(r.memo);
@@ -443,159 +497,292 @@ export default function InputModal() {
           </Pressable>
         )}
 
-        {!splitOn ? (
-          <>
-            <Text style={styles.catLabel}>카테고리</Text>
-            <ScrollView
-              horizontal
-              style={styles.catScroll}
-              showsHorizontalScrollIndicator={false}
-              keyboardShouldPersistTaps="handled"
-              contentContainerStyle={styles.catPicker}
-            >
-              {cats.map((c) => {
-                const active = category === c.id;
-                return (
-                  <Pressable
-                    key={c.id}
-                    onPress={() => {
-                      tap();
-                      setCategory(c.id);
-                    }}
-                    style={[styles.catPick, active && styles.catPickActive]}
-                  >
-                    <View
-                      style={[
-                        styles.catPickIcon,
-                        { backgroundColor: active ? colors.primary : c.bg },
-                      ]}
-                    >
-                      <AppIcon
-                        name={c.icon}
-                        size={16}
-                        color={active ? colors.white : c.color}
-                        strokeWidth={2.2}
-                      />
-                    </View>
-                    <Text
-                      style={{
-                        fontFamily: active ? fontFamily.bold : fontFamily.medium,
-                        fontSize: 10,
-                        color: active ? colors.primaryStrong : colors.text,
+        <ScrollView
+          style={styles.lowerScroll}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          {!splitOn ? (
+            <>
+              <Text style={styles.catLabel}>카테고리</Text>
+              <ScrollView
+                horizontal
+                style={styles.catScroll}
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                contentContainerStyle={styles.catPicker}
+              >
+                {cats.map((c) => {
+                  const active = category === c.id;
+                  return (
+                    <Pressable
+                      key={c.id}
+                      onPress={() => {
+                        tap();
+                        setCategory(c.id);
                       }}
+                      style={[styles.catPick, active && styles.catPickActive]}
                     >
-                      {c.name}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </ScrollView>
-          </>
-        ) : (
-          <ScrollView
-            style={styles.splitScroll}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
-          >
-            <View style={styles.splitHeadRow}>
-              <Text style={styles.catLabel}>분할 내역</Text>
-              <Text style={styles.splitTotalHint}>총 {fmt(total)}원</Text>
-            </View>
+                      <View
+                        style={[
+                          styles.catPickIcon,
+                          { backgroundColor: active ? colors.primary : c.bg },
+                        ]}
+                      >
+                        <AppIcon
+                          name={c.icon}
+                          size={16}
+                          color={active ? colors.white : c.color}
+                          strokeWidth={2.2}
+                        />
+                      </View>
+                      <Text
+                        style={{
+                          fontFamily: active ? fontFamily.bold : fontFamily.medium,
+                          fontSize: 10,
+                          color: active ? colors.primaryStrong : colors.text,
+                        }}
+                      >
+                        {c.name}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            </>
+          ) : (
+            <>
+              <View style={styles.splitHeadRow}>
+                <Text style={styles.catLabel}>분할 내역</Text>
+                <Text style={styles.splitTotalHint}>총 {fmt(total)}원</Text>
+              </View>
 
-            {splits.map((row, i) => (
-              <View key={i} style={styles.splitRow}>
-                <View style={styles.splitRowTop}>
-                  <ScrollView
-                    horizontal
-                    showsHorizontalScrollIndicator={false}
-                    keyboardShouldPersistTaps="handled"
-                    contentContainerStyle={{ gap: 4, alignItems: 'center', paddingRight: 4 }}
-                    style={{ flex: 1 }}
-                  >
-                    {cats.map((c) => {
-                      const active = row.category === c.id;
+              {splits.map((row, i) => (
+                <View key={i} style={styles.splitRow}>
+                  <View style={styles.splitRowTop}>
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      keyboardShouldPersistTaps="handled"
+                      contentContainerStyle={{ gap: 4, alignItems: 'center', paddingRight: 4 }}
+                      style={{ flex: 1 }}
+                    >
+                      {cats.map((c) => {
+                        const active = row.category === c.id;
+                        return (
+                          <Pressable
+                            key={c.id}
+                            onPress={() => {
+                              tap();
+                              setSplitRow(i, { category: c.id });
+                            }}
+                            style={[styles.splitCatChip, active && styles.splitCatChipOn]}
+                          >
+                            <AppIcon
+                              name={c.icon}
+                              size={12}
+                              color={active ? colors.white : c.color}
+                              strokeWidth={2.2}
+                            />
+                            <Text
+                              style={{
+                                fontFamily: active ? fontFamily.bold : fontFamily.medium,
+                                fontSize: 11,
+                                color: active ? colors.white : colors.text,
+                              }}
+                            >
+                              {c.name}
+                            </Text>
+                          </Pressable>
+                        );
+                      })}
+                    </ScrollView>
+                    <Pressable
+                      onPress={() => removeSplitRow(i)}
+                      disabled={splits.length <= 2}
+                      hitSlop={8}
+                      style={{ padding: 6, opacity: splits.length <= 2 ? 0.3 : 1 }}
+                    >
+                      <AppIcon name="trash" size={16} color={colors.expenseText} />
+                    </Pressable>
+                  </View>
+                  <View style={styles.splitAmountRow}>
+                    <TextInput
+                      value={row.amount && Number(row.amount) > 0 ? fmt(Number(row.amount)) : ''}
+                      onChangeText={(t) => setSplitRow(i, { amount: String(parseNum(t)) })}
+                      onFocus={() => setPadVisible(false)}
+                      keyboardType="number-pad"
+                      placeholder="0"
+                      placeholderTextColor={colors.textMuted}
+                      style={styles.splitAmountInput}
+                    />
+                    <Text style={styles.splitAmountUnit}>원</Text>
+                  </View>
+                </View>
+              ))}
+
+              <Pressable onPress={addSplitRow} style={styles.splitAddBtn}>
+                <AppIcon name="plus" size={14} color={colors.primaryStrong} strokeWidth={2.6} />
+                <Text style={styles.splitAddText}>분할 추가</Text>
+              </Pressable>
+
+              <View style={styles.splitSumRow}>
+                <Text style={styles.splitSumLabel}>분할 합계</Text>
+                <Text
+                  style={[
+                    styles.splitSumValue,
+                    { color: splitCheck.ok ? colors.incomeStrong : colors.expenseText },
+                  ]}
+                >
+                  {fmt(splitCheck.sum)}원
+                </Text>
+              </View>
+              <Text
+                style={[
+                  styles.splitStatus,
+                  { color: splitCheck.ok ? colors.incomeStrong : colors.expenseText },
+                ]}
+              >
+                {splitCheck.ok
+                  ? '✓ 금액이 일치합니다.'
+                  : splitCheck.error === 'sum-mismatch'
+                    ? `⚠ 분할 금액이 총 금액과 일치하지 않습니다. (차액 ${fmt(Math.abs(total - splitCheck.sum))}원)`
+                    : `⚠ ${SPLIT_ERROR_TEXT[splitCheck.error ?? 'sum-mismatch']}`}
+              </Text>
+            </>
+          )}
+
+          {type === 'expense' && (
+            <View style={styles.paySection}>
+              <Text style={styles.catLabel}>결제수단 (선택)</Text>
+              <View style={styles.payMethodRow}>
+                {PAY_METHODS.map((pm) => {
+                  const active = paymentMethod === pm.value;
+                  return (
+                    <Pressable
+                      key={pm.value}
+                      onPress={() => {
+                        tap();
+                        setPaymentMethod(active ? undefined : pm.value);
+                        if (pm.value === 'credit' && !active) setPadVisible(false);
+                      }}
+                      style={[styles.payChip, active && styles.payChipOn]}
+                    >
+                      <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
+                        {pm.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              {paymentMethod === 'credit' && (
+                <View style={styles.creditPanel}>
+                  <Text style={styles.creditLabel}>카드</Text>
+                  <View style={styles.payChipRow}>
+                    {cards.map((c) => {
+                      const active = cardId === c.id;
                       return (
                         <Pressable
                           key={c.id}
                           onPress={() => {
                             tap();
-                            setSplitRow(i, { category: c.id });
+                            setCardId(active ? undefined : c.id);
                           }}
-                          style={[styles.splitCatChip, active && styles.splitCatChipOn]}
+                          style={[styles.payChip, active && styles.payChipOn]}
                         >
-                          <AppIcon
-                            name={c.icon}
-                            size={12}
-                            color={active ? colors.white : c.color}
-                            strokeWidth={2.2}
-                          />
-                          <Text
-                            style={{
-                              fontFamily: active ? fontFamily.bold : fontFamily.medium,
-                              fontSize: 11,
-                              color: active ? colors.white : colors.text,
-                            }}
-                          >
+                          <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
                             {c.name}
                           </Text>
                         </Pressable>
                       );
                     })}
-                  </ScrollView>
-                  <Pressable
-                    onPress={() => removeSplitRow(i)}
-                    disabled={splits.length <= 2}
-                    hitSlop={8}
-                    style={{ padding: 6, opacity: splits.length <= 2 ? 0.3 : 1 }}
-                  >
-                    <AppIcon name="trash" size={16} color={colors.expenseText} />
-                  </Pressable>
-                </View>
-                <View style={styles.splitAmountRow}>
-                  <TextInput
-                    value={row.amount && Number(row.amount) > 0 ? fmt(Number(row.amount)) : ''}
-                    onChangeText={(t) => setSplitRow(i, { amount: String(parseNum(t)) })}
-                    onFocus={() => setPadVisible(false)}
-                    keyboardType="number-pad"
-                    placeholder="0"
-                    placeholderTextColor={colors.textMuted}
-                    style={styles.splitAmountInput}
-                  />
-                  <Text style={styles.splitAmountUnit}>원</Text>
-                </View>
-              </View>
-            ))}
+                    <Pressable
+                      onPress={() => router.push('/card-add')}
+                      style={styles.payChipAdd}
+                    >
+                      <AppIcon name="plus" size={12} color={colors.primaryStrong} strokeWidth={2.6} />
+                      <Text style={styles.payChipAddText}>카드 등록</Text>
+                    </Pressable>
+                  </View>
+                  {cards.length === 0 && (
+                    <Text style={styles.creditHint}>
+                      등록된 카드가 없어요. 지금 저장하면 「카드 미지정」으로 기록돼요.
+                    </Text>
+                  )}
 
-            <Pressable onPress={addSplitRow} style={styles.splitAddBtn}>
-              <AppIcon name="plus" size={14} color={colors.primaryStrong} strokeWidth={2.6} />
-              <Text style={styles.splitAddText}>분할 추가</Text>
-            </Pressable>
+                  <Text style={[styles.creditLabel, { marginTop: 12 }]}>결제 방식</Text>
+                  <View style={styles.payChipRow}>
+                    {([['lump', '일시불'], ['inst', '할부']] as const).map(([k, label]) => {
+                      const active = (k === 'inst') === installmentOn;
+                      return (
+                        <Pressable
+                          key={k}
+                          onPress={() => {
+                            tap();
+                            setInstallmentOn(k === 'inst');
+                            setPadVisible(false);
+                          }}
+                          style={[styles.payChip, active && styles.payChipOn]}
+                        >
+                          <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
+                            {label}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
 
-            <View style={styles.splitSumRow}>
-              <Text style={styles.splitSumLabel}>분할 합계</Text>
-              <Text
-                style={[
-                  styles.splitSumValue,
-                  { color: splitCheck.ok ? colors.incomeStrong : colors.expenseText },
-                ]}
-              >
-                {fmt(splitCheck.sum)}원
-              </Text>
+                  {installmentOn && (
+                    <>
+                      <Text style={[styles.creditLabel, { marginTop: 12 }]}>할부 개월</Text>
+                      <View style={styles.payChipRow}>
+                        {INSTALLMENT_PRESETS.map((m) => {
+                          const active = installmentMonths === m;
+                          return (
+                            <Pressable
+                              key={m}
+                              onPress={() => {
+                                tap();
+                                setInstallmentMonths(m);
+                              }}
+                              style={[styles.payChip, active && styles.payChipOn]}
+                            >
+                              <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
+                                {m}개월
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                        <TextInput
+                          value={installmentMonths}
+                          onChangeText={(t) =>
+                            setInstallmentMonths(t.replace(/[^0-9]/g, '').slice(0, 2))
+                          }
+                          onFocus={() => setPadVisible(false)}
+                          keyboardType="number-pad"
+                          placeholder="직접"
+                          placeholderTextColor={colors.textMuted}
+                          style={styles.instInput}
+                        />
+                      </View>
+                      {instPreview ? (
+                        <Text style={styles.creditPreview}>
+                          월 약 {fmt(instPreview.perMonth)}원 × {instMonths}개월
+                          {instPreview.lastMonth !== instPreview.perMonth
+                            ? ` · 마지막 달 ${fmt(instPreview.lastMonth)}원`
+                            : ''}
+                        </Text>
+                      ) : (
+                        <Text style={styles.creditWarn}>할부는 2개월 이상이어야 해요.</Text>
+                      )}
+                    </>
+                  )}
+                </View>
+              )}
             </View>
-            <Text
-              style={[
-                styles.splitStatus,
-                { color: splitCheck.ok ? colors.incomeStrong : colors.expenseText },
-              ]}
-            >
-              {splitCheck.ok
-                ? '✓ 금액이 일치합니다.'
-                : splitCheck.error === 'sum-mismatch'
-                  ? `⚠ 분할 금액이 총 금액과 일치하지 않습니다. (차액 ${fmt(Math.abs(total - splitCheck.sum))}원)`
-                  : `⚠ ${SPLIT_ERROR_TEXT[splitCheck.error ?? 'sum-mismatch']}`}
-            </Text>
-          </ScrollView>
-        )}
+          )}
+        </ScrollView>
       </View>
 
       {/* Keypad / collapsed bar */}
@@ -1097,8 +1284,8 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: colors.textMuted,
   },
-  splitScroll: { flex: 1, marginTop: 2 },
   splitHeadRow: {
+    marginTop: 2,
     flexDirection: 'row',
     alignItems: 'baseline',
     justifyContent: 'space-between',
@@ -1197,6 +1384,112 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.semibold,
     fontSize: 11,
     lineHeight: 16,
+  },
+
+  /* ---- payment method / card / 할부 ---- */
+  lowerScroll: { flex: 1 },
+  paySection: {
+    marginTop: spacing.sm,
+    paddingBottom: spacing.md,
+  },
+  payChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 6,
+  },
+  payMethodRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    paddingHorizontal: spacing.lg,
+  },
+  payChip: {
+    paddingVertical: 7,
+    paddingHorizontal: 14,
+    borderRadius: radii.pill,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  payChipOn: {
+    backgroundColor: colors.primary,
+    borderColor: colors.primary,
+  },
+  payChipText: {
+    fontFamily: fontFamily.semibold,
+    fontSize: 12,
+    color: colors.textSub,
+  },
+  payChipTextOn: { color: colors.white },
+  payChipAdd: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: radii.pill,
+    backgroundColor: colors.primaryLighter,
+    borderWidth: 1,
+    borderColor: colors.primaryLight,
+    borderStyle: 'dashed',
+  },
+  payChipAddText: {
+    fontFamily: fontFamily.bold,
+    fontSize: 12,
+    color: colors.primaryStrong,
+  },
+  creditPanel: {
+    marginTop: 10,
+    marginHorizontal: spacing.lg,
+    padding: spacing.md,
+    backgroundColor: colors.white,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  creditLabel: {
+    paddingHorizontal: spacing.xs,
+    paddingBottom: spacing.sm,
+    fontFamily: fontFamily.bold,
+    fontSize: 11,
+    letterSpacing: 0.2,
+    color: colors.textSub,
+  },
+  creditHint: {
+    marginTop: 8,
+    paddingHorizontal: spacing.xs,
+    fontFamily: fontFamily.regular,
+    fontSize: 10,
+    lineHeight: 15,
+    color: colors.textMuted,
+  },
+  creditPreview: {
+    marginTop: 10,
+    paddingHorizontal: spacing.xs,
+    fontFamily: fontFamily.bold,
+    fontSize: 12,
+    color: colors.primaryStrong,
+  },
+  creditWarn: {
+    marginTop: 10,
+    paddingHorizontal: spacing.xs,
+    fontFamily: fontFamily.semibold,
+    fontSize: 11,
+    color: colors.expenseText,
+  },
+  instInput: {
+    minWidth: 56,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: radii.pill,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+    fontFamily: fontFamily.semibold,
+    fontSize: 12,
+    color: colors.text,
+    textAlign: 'center',
   },
 
   numPad: {

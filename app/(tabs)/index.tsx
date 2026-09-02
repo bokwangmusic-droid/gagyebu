@@ -8,6 +8,7 @@ import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
 import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
+import { cardBillingForMonth } from '@/lib/card';
 import { fmt, formatMonthLabel, formatRelativeDateTime } from '@/lib/format';
 import { useMonthlyTotals, useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -15,8 +16,22 @@ import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { transactions, planned, customCats } = useStore();
+  const { transactions, planned, customCats, cards } = useStore();
   const { income, expense, byCategory, totalBudget, remaining } = useMonthlyTotals();
+
+  const cardBill = useMemo(
+    () => cardBillingForMonth(transactions, cards),
+    [transactions, cards],
+  );
+  const cardBillRows = useMemo(() => {
+    const rows: [string, number][] = [
+      ...cards.map((c) => [c.name, cardBill.byCard[c.id] ?? 0] as [string, number]),
+      ...(cardBill.unassigned > 0
+        ? [['카드 미지정', cardBill.unassigned] as [string, number]]
+        : []),
+    ];
+    return rows.filter(([, v]) => v > 0);
+  }, [cards, cardBill]);
 
   const percent = totalBudget > 0 ? Math.min(100, Math.round((expense / totalBudget) * 100)) : 0;
   const recent = transactions.slice(0, 5);
@@ -166,6 +181,36 @@ export default function HomeScreen() {
         <StatTile label="수입" value={income} tone="income" onPress={() => goToTxns('income')} />
         <StatTile label="지출" value={expense} tone="expense" onPress={() => goToTxns('expense')} />
       </View>
+
+      {/* 사용월 기준 예상 카드값 — only when there's something to show */}
+      {cardBillRows.length > 0 && (
+        <Pressable onPress={() => router.push('/cards')}>
+          <Card>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>사용월 기준 예상 카드값</Text>
+                <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+              </View>
+              <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, ...tabularNums }}>
+                {fmt(cardBill.total)}원
+              </Text>
+            </View>
+            <View style={{ gap: 8 }}>
+              {cardBillRows.map(([name, amt]) => (
+                <View key={name} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>{name}</Text>
+                  <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.text, ...tabularNums }}>
+                    {fmt(amt)}원
+                  </Text>
+                </View>
+              ))}
+            </View>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, color: colors.textMuted, marginTop: 10 }}>
+              카드사 실제 청구일과 다를 수 있어요
+            </Text>
+          </Card>
+        </Pressable>
+      )}
 
       {/* Category breakdown */}
       {topCats.length > 0 && (

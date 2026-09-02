@@ -23,7 +23,7 @@ const WD = ['일', '월', '화', '수', '목', '금', '토'];
 export default function AllTransactions() {
   const router = useRouter();
   const params = useLocalSearchParams<{ filter?: string; scope?: string }>();
-  const { transactions, customCats } = useStore();
+  const { transactions, customCats, cards } = useStore();
 
   const [filter, setFilter] = useState<Filter>((params.filter as Filter) || 'all');
   const [scope, setScope] = useState<Scope>((params.scope as Scope) || 'all');
@@ -196,6 +196,12 @@ export default function AllTransactions() {
                 const cat = getCat(t.category, t.type, customCats);
                 const d = new Date(t.date);
                 const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+                const card =
+                  t.paymentMethod === 'credit'
+                    ? `${cards.find((c) => c.id === t.cardId)?.name ?? '카드 미지정'}${
+                        t.installment ? ` ${t.installment.months}개월 할부` : ''
+                      }`
+                    : '';
                 return (
                   <Pressable
                     key={t.id}
@@ -225,9 +231,10 @@ export default function AllTransactions() {
                       <Text numberOfLines={1} style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}>
                         {t.memo || cat.name}
                       </Text>
-                      <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+                      <Text numberOfLines={1} style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
                         {hm} · {cat.name}
                         {hasSplits(t) ? ` · 분할 ${t.splits!.length}` : ''}
+                        {card ? ` · ${card}` : ''}
                       </Text>
                     </View>
                     <Text
