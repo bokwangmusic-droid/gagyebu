@@ -9,6 +9,7 @@ import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
 import { sumByType } from '@/lib/aggregate';
 import { fmt, toDateKey } from '@/lib/format';
+import { hasSplits } from '@/lib/splits';
 import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -226,6 +227,7 @@ export default function AllTransactions() {
                       </Text>
                       <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
                         {hm} · {cat.name}
+                        {hasSplits(t) ? ` · 분할 ${t.splits!.length}` : ''}
                       </Text>
                     </View>
                     <Text
