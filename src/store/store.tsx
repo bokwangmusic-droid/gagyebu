@@ -26,12 +26,15 @@ import {
   type TxnType,
 } from '@/data/categories';
 import { startOfMonth } from '@/lib/format';
+import { splitPayment } from '@/lib/loan';
 import { loadItem, saveItem } from '@/lib/storage';
 import {
   DEFAULT_SETTINGS,
   type AppState,
   type BudgetMap,
   type Goal,
+  type Loan,
+  type LoanPayment,
   type PlannedExpense,
   type RecurringRule,
   type Settings,
@@ -48,6 +51,7 @@ const DEFAULT_STATE: AppState = {
   goals: [],
   recurring: [],
   planned: [],
+  loans: [],
   notes: '',
   customCats: DEFAULT_CUSTOM_CATS,
   catOrder: DEFAULT_CAT_ORDER,
@@ -80,6 +84,15 @@ interface StoreValue extends AppState {
   deletePlanned: (id: string) => void;
   markPlannedDone: (p: PlannedExpense) => void;
 
+  addLoan: (l: Omit<Loan, 'id' | 'createdAt' | 'paid' | 'payments'>) => void;
+  updateLoan: (id: string, patch: Partial<Loan>) => void;
+  deleteLoan: (id: string) => void;
+  addLoanPayment: (
+    loanId: string,
+    entry: { amount: number; date: string; memo?: string },
+  ) => void;
+  deleteLoanPayment: (loanId: string, paymentId: string) => void;
+
   setNotes: (v: string) => void;
 
   addCustomCat: (type: TxnType, cat: Omit<Category, 'id' | 'custom'>) => void;
@@ -101,6 +114,7 @@ const PERSIST_KEYS: (keyof AppState)[] = [
   'goals',
   'recurring',
   'planned',
+  'loans',
   'notes',
   'customCats',
   'catOrder',
@@ -130,6 +144,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         goals,
         recurring,
         planned,
+        loans,
         notes,
         customCats,
         catOrder,
@@ -141,6 +156,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         loadItem('goals', DEFAULT_STATE.goals),
         loadItem('recurring', DEFAULT_STATE.recurring),
         loadItem('planned', DEFAULT_STATE.planned),
+        loadItem('loans', DEFAULT_STATE.loans),
         loadItem('notes', DEFAULT_STATE.notes),
         loadItem('customCats', DEFAULT_STATE.customCats),
         loadItem('catOrder', DEFAULT_STATE.catOrder),
@@ -154,6 +170,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         goals,
         recurring,
         planned,
+        loans,
         notes,
         customCats,
         catOrder,
@@ -398,6 +415,99 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [mutate],
   );
 
+  const addLoan: StoreValue['addLoan'] = useCallback(
+    (l) =>
+      mutate(
+        (s) => ({
+          ...s,
+          loans: [
+            ...s.loans,
+            {
+              id: uid('loan'),
+              createdAt: new Date().toISOString(),
+              paid: 0,
+              payments: [],
+              ...l,
+            },
+          ],
+        }),
+        ['loans'],
+      ),
+    [mutate],
+  );
+
+  const updateLoan: StoreValue['updateLoan'] = useCallback(
+    (id, patch) =>
+      mutate(
+        (s) => ({
+          ...s,
+          loans: s.loans.map((ln) => (ln.id === id ? { ...ln, ...patch } : ln)),
+        }),
+        ['loans'],
+      ),
+    [mutate],
+  );
+
+  const deleteLoan: StoreValue['deleteLoan'] = useCallback(
+    (id) =>
+      mutate((s) => ({ ...s, loans: s.loans.filter((ln) => ln.id !== id) }), ['loans']),
+    [mutate],
+  );
+
+  const addLoanPayment: StoreValue['addLoanPayment'] = useCallback(
+    (loanId, entry) =>
+      mutate(
+        (s) => ({
+          ...s,
+          loans: s.loans.map((ln) => {
+            if (ln.id !== loanId) return ln;
+            const remaining = Math.max(0, ln.principal - ln.paid);
+            const { interestPart, principalPart } = splitPayment(
+              remaining,
+              ln.annualRate,
+              entry.amount,
+            );
+            const payment: LoanPayment = {
+              id: uid('lp'),
+              date: entry.date,
+              amount: entry.amount,
+              principalPart,
+              interestPart,
+              memo: entry.memo,
+            };
+            return {
+              ...ln,
+              paid: ln.paid + principalPart,
+              payments: [payment, ...ln.payments],
+            };
+          }),
+        }),
+        ['loans'],
+      ),
+    [mutate],
+  );
+
+  const deleteLoanPayment: StoreValue['deleteLoanPayment'] = useCallback(
+    (loanId, paymentId) =>
+      mutate(
+        (s) => ({
+          ...s,
+          loans: s.loans.map((ln) => {
+            if (ln.id !== loanId) return ln;
+            const p = ln.payments.find((x) => x.id === paymentId);
+            if (!p) return ln;
+            return {
+              ...ln,
+              paid: Math.max(0, ln.paid - p.principalPart),
+              payments: ln.payments.filter((x) => x.id !== paymentId),
+            };
+          }),
+        }),
+        ['loans'],
+      ),
+    [mutate],
+  );
+
   const setNotes: StoreValue['setNotes'] = useCallback(
     (v) => mutate((s) => ({ ...s, notes: v }), ['notes']),
     [mutate],
@@ -488,6 +598,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             goals: parsed.goals ?? s.goals,
             recurring: parsed.recurring ?? s.recurring,
             planned: parsed.planned ?? s.planned,
+            loans: parsed.loans ?? s.loans,
             notes: parsed.notes ?? s.notes,
             customCats: parsed.customCats ?? s.customCats,
             catOrder: parsed.catOrder ?? s.catOrder,
@@ -515,6 +626,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           goals: [],
           recurring: [],
           planned: [],
+          loans: [],
           notes: '',
           settings: DEFAULT_SETTINGS,
         }),
@@ -544,6 +656,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       addPlanned,
       deletePlanned,
       markPlannedDone,
+      addLoan,
+      updateLoan,
+      deleteLoan,
+      addLoanPayment,
+      deleteLoanPayment,
       setNotes,
       addCustomCat,
       deleteCustomCat,
@@ -573,6 +690,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       addPlanned,
       deletePlanned,
       markPlannedDone,
+      addLoan,
+      updateLoan,
+      deleteLoan,
+      addLoanPayment,
+      deleteLoanPayment,
       setNotes,
       addCustomCat,
       deleteCustomCat,

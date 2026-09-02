@@ -127,6 +127,8 @@ function RootNav() {
         <Stack.Screen name="recurring-add" options={MODAL} />
         <Stack.Screen name="goals" options={MODAL} />
         <Stack.Screen name="goal-add" options={MODAL} />
+        <Stack.Screen name="loans" options={MODAL} />
+        <Stack.Screen name="loan-add" options={MODAL} />
         <Stack.Screen name="categories" options={MODAL} />
         <Stack.Screen name="budget-add" options={MODAL} />
         <Stack.Screen name="planned-add" options={MODAL} />

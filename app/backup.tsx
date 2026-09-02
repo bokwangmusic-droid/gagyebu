@@ -21,7 +21,8 @@ import { fontFamily } from '@/theme/typography';
 export default function Backup() {
   const router = useRouter();
   const toast = useToast();
-  const { transactions, budgets, goals, recurring, settings, importData } = useStore();
+  const { transactions, budgets, goals, recurring, planned, loans, notes, settings, importData } =
+    useStore();
 
   const [mode, setMode] = useState<'export' | 'import'>('export');
   const [importText, setImportText] = useState('');
@@ -30,11 +31,21 @@ export default function Backup() {
   const payload = useMemo(
     () =>
       JSON.stringify(
-        { transactions, budgets, goals, recurring, settings, exportedAt: new Date().toISOString() },
+        {
+          transactions,
+          budgets,
+          goals,
+          recurring,
+          planned,
+          loans,
+          notes,
+          settings,
+          exportedAt: new Date().toISOString(),
+        },
         null,
         2,
       ),
-    [transactions, budgets, goals, recurring, settings],
+    [transactions, budgets, goals, recurring, planned, loans, notes, settings],
   );
 
   const copy = async () => {
@@ -57,7 +68,7 @@ export default function Backup() {
   return (
     <ModalScreen title="데이터 백업 · 복원" closeIcon="x" onClose={() => router.back()} scroll={false}>
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         style={{ flex: 1, paddingHorizontal: spacing.xl }}
       >
         <SegmentedTabs

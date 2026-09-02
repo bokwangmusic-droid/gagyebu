@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { forwardRef, type ReactNode } from 'react';
 import {
   Pressable,
   Text,
@@ -200,9 +200,10 @@ export function Field({
 /* ------------------------------------------------------------------ *
  * Text input — the web `.form-input`.
  * ------------------------------------------------------------------ */
-export function TextField(props: TextInputProps) {
+export const TextField = forwardRef<TextInput, TextInputProps>(function TextField(props, ref) {
   return (
     <TextInput
+      ref={ref}
       placeholderTextColor={colors.textMuted}
       {...props}
       style={[
@@ -222,7 +223,7 @@ export function TextField(props: TextInputProps) {
       ]}
     />
   );
-}
+});
 
 /* ------------------------------------------------------------------ *
  * Header text button — the web `.btn-ghost` "저장".
