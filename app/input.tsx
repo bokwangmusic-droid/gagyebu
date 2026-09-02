@@ -19,6 +19,7 @@ import { AppIcon } from '@/components/AppIcon';
 import { CalendarSheet } from '@/components/ui/CalendarSheet';
 import { getAllCats, getCat, type TxnType } from '@/data/categories';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
+import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
 import { useStore } from '@/store/store';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
@@ -79,9 +80,20 @@ export default function InputModal() {
   const [pasteText, setPasteText] = useState('');
   const [pastePreview, setPastePreview] = useState<ParsedCardMessage | null>(null);
 
+  const [showQuick, setShowQuick] = useState(false);
+  const [quickText, setQuickText] = useState('');
+  const [quickResult, setQuickResult] = useState<NaturalParseResult | null>(null);
+
   const cats = useMemo(
     () => getAllCats(type, customCats, catOrder),
     [type, customCats, catOrder],
+  );
+  const allUserCats = useMemo(
+    () => [
+      ...getAllCats('expense', customCats, catOrder),
+      ...getAllCats('income', customCats, catOrder),
+    ],
+    [customCats, catOrder],
   );
 
   // Keep the selected category valid when the type flips.
@@ -198,6 +210,23 @@ export default function InputModal() {
     setPastePreview(null);
   };
 
+  /**
+   * Natural-language quick entry. Parses the one-liner and pre-fills the
+   * normal form — it never saves. The user reviews/edits and taps 저장.
+   */
+  const analyzeQuick = () => {
+    const r = parseNaturalInput(quickText, new Date(), { categories: allUserCats });
+    setQuickResult(r);
+    if (r.amount == null) return; // nothing to apply — the hint tells the user why
+    setType(r.type);
+    setAmount(String(r.amount));
+    if (r.category) setCategory(r.category);
+    if (r.memo) setMemo(r.memo);
+    setSelectedDate(r.dateKey > today ? today : r.dateKey);
+    setPadVisible(false);
+    void Haptics.selectionAsync().catch(() => {});
+  };
+
   const amountColor =
     amount === ''
       ? colors.textMuted
@@ -259,13 +288,71 @@ export default function InputModal() {
         })}
       </View>
 
-      {/* Card-SMS auto-fill pill */}
-      <View style={{ alignItems: 'center', marginTop: 10 }}>
+      {/* Quick-entry + card-SMS pills */}
+      <View style={styles.pillRow}>
+        <Pressable
+          onPress={() => {
+            setShowQuick((v) => !v);
+            setPadVisible(false);
+          }}
+          style={[styles.pastePill, showQuick && styles.pastePillOn]}
+        >
+          <AppIcon name="sparkle" size={13} color={showQuick ? colors.white : colors.primaryStrong} />
+          <Text style={[styles.pastePillText, showQuick && { color: colors.white }]}>한 줄 빠른 입력</Text>
+        </Pressable>
         <Pressable onPress={openPaste} style={styles.pastePill}>
           <AppIcon name="clipboard" size={13} color={colors.primaryStrong} />
-          <Text style={styles.pastePillText}>카드 문자에서 자동 입력</Text>
+          <Text style={styles.pastePillText}>카드 문자</Text>
         </Pressable>
       </View>
+
+      {showQuick && (
+        <>
+          <View style={styles.quickPanel}>
+            <TextInput
+              value={quickText}
+              onChangeText={setQuickText}
+              onFocus={() => setPadVisible(false)}
+              placeholder="예: 점심 김치찌개 9000 · 월급 320만원"
+              placeholderTextColor={colors.textMuted}
+              returnKeyType="done"
+              onSubmitEditing={analyzeQuick}
+              style={styles.quickInput}
+            />
+            <Pressable
+              onPress={analyzeQuick}
+              disabled={!quickText.trim()}
+              style={({ pressed }) => [
+                styles.quickBtn,
+                { opacity: !quickText.trim() ? 0.4 : pressed ? 0.9 : 1 },
+              ]}
+            >
+              <LinearGradient
+                colors={gradients.primary}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.quickBtnFill}
+              >
+                <Text style={styles.quickBtnText}>분석</Text>
+              </LinearGradient>
+            </Pressable>
+          </View>
+          {quickResult &&
+            (quickResult.amount == null ? (
+              <Text style={styles.quickErr}>
+                금액을 찾지 못했어요. 숫자를 넣어 다시 입력해 주세요.
+              </Text>
+            ) : (
+              <Text style={styles.quickResultText}>
+                분석됨 · {quickResult.type === 'income' ? '수입' : '지출'} {fmt(quickResult.amount)}원
+                {quickResult.category
+                  ? ` · ${getCat(quickResult.category, quickResult.type, customCats).name}`
+                  : ' · 카테고리 직접 선택'}
+                {quickResult.memo ? ` · ${quickResult.memo}` : ''} — 아래에서 확인 후 저장하세요
+              </Text>
+            ))}
+        </>
+      )}
 
       {/* Flexible middle: amount · memo · categories */}
       <View style={styles.middle}>
@@ -665,6 +752,12 @@ const styles = StyleSheet.create({
     backgroundColor: colors.white,
   },
 
+  pillRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 8,
+    marginTop: 10,
+  },
   pastePill: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -674,10 +767,55 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primaryLight,
     borderRadius: radii.pill,
   },
+  pastePillOn: {
+    backgroundColor: colors.primary,
+  },
   pastePillText: {
     fontFamily: fontFamily.bold,
     fontSize: 12,
     color: colors.primaryStrong,
+  },
+  quickPanel: {
+    flexDirection: 'row',
+    gap: 8,
+    marginHorizontal: spacing.lg,
+    marginTop: 10,
+  },
+  quickInput: {
+    flex: 1,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.primary,
+    borderRadius: radii.md,
+    fontFamily: fontFamily.regular,
+    fontSize: 14,
+    color: colors.text,
+  },
+  quickBtn: { borderRadius: radii.md, overflow: 'hidden' },
+  quickBtnFill: {
+    paddingHorizontal: 16,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  quickBtnText: { fontFamily: fontFamily.bold, fontSize: 14, color: colors.white },
+  quickResultText: {
+    marginHorizontal: spacing.lg,
+    marginTop: 8,
+    fontFamily: fontFamily.medium,
+    fontSize: 11,
+    lineHeight: 16,
+    color: colors.primaryStrong,
+  },
+  quickErr: {
+    marginHorizontal: spacing.lg,
+    marginTop: 8,
+    fontFamily: fontFamily.medium,
+    fontSize: 11,
+    lineHeight: 16,
+    color: colors.expenseText,
   },
 
   middle: { flex: 1, justifyContent: 'flex-start', paddingTop: spacing.xs },
