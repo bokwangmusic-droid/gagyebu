@@ -57,10 +57,12 @@ export const STORAGE_KEYS = [
   'goals',
   'recurring',
   'planned',
+  'loans',
   'notes',
   'customCats',
   'catOrder',
   'settings',
+  'schemaVersion',
 ] as const;
 
 export type StorageKey = (typeof STORAGE_KEYS)[number];

@@ -7,7 +7,9 @@ import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
+import { sumByType } from '@/lib/aggregate';
 import { fmt, toDateKey } from '@/lib/format';
+import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -26,19 +28,8 @@ export default function AllTransactions() {
   const [scope, setScope] = useState<Scope>((params.scope as Scope) || 'all');
 
   const bounds = useMemo(() => {
-    const now = new Date();
-    if (scope === 'thisMonth') {
-      return {
-        start: new Date(now.getFullYear(), now.getMonth(), 1),
-        end: new Date(now.getFullYear(), now.getMonth() + 1, 1),
-      };
-    }
-    if (scope === 'lastMonth') {
-      return {
-        start: new Date(now.getFullYear(), now.getMonth() - 1, 1),
-        end: new Date(now.getFullYear(), now.getMonth(), 1),
-      };
-    }
+    if (scope === 'thisMonth') return periodRange('month');
+    if (scope === 'lastMonth') return prevPeriodRange('month');
     return { start: null as Date | null, end: null as Date | null };
   }, [scope]);
 
@@ -66,8 +57,8 @@ export default function AllTransactions() {
     return Object.entries(groups).sort((a, b) => b[0].localeCompare(a[0]));
   }, [filtered]);
 
-  const totalExpense = filtered.filter((t) => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
-  const totalIncome = filtered.filter((t) => t.type === 'income').reduce((s, t) => s + t.amount, 0);
+  const totalExpense = sumByType(filtered, 'expense');
+  const totalIncome = sumByType(filtered, 'income');
 
   const groupLabel = (d: Date) => {
     const today = new Date();

@@ -10,7 +10,9 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Screen } from '@/components/ui/Screen';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
+import { inRange, sortedExpenseCategories, sumByType } from '@/lib/aggregate';
 import { fmt } from '@/lib/format';
+import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -37,72 +39,43 @@ export default function StatsScreen() {
 
   const info = useMemo(() => {
     const now = new Date();
+    const cur = periodRange(period, now);
+    const prev = prevPeriodRange(period, now);
+    const base = { start: cur.start, end: cur.end, prevStart: prev.start, prevEnd: prev.end };
     if (period === 'week') {
-      const since = (now.getDay() + 6) % 7;
-      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - since);
-      const end = new Date(start);
-      end.setDate(start.getDate() + 7);
-      const prevStart = new Date(start);
-      prevStart.setDate(start.getDate() - 7);
-      const endShow = new Date(end);
-      endShow.setDate(end.getDate() - 1);
+      const endShow = new Date(cur.end);
+      endShow.setDate(endShow.getDate() - 1);
       return {
-        start,
-        end,
-        prevStart,
-        prevEnd: new Date(start),
+        ...base,
         label: '이번 주',
         prevLabel: '지난주',
-        header: `${start.getMonth() + 1}.${start.getDate()} ~ ${endShow.getMonth() + 1}.${endShow.getDate()}`,
+        header: `${cur.start.getMonth() + 1}.${cur.start.getDate()} ~ ${endShow.getMonth() + 1}.${endShow.getDate()}`,
       };
     }
     if (period === 'month') {
       return {
-        start: new Date(now.getFullYear(), now.getMonth(), 1),
-        end: new Date(now.getFullYear(), now.getMonth() + 1, 1),
-        prevStart: new Date(now.getFullYear(), now.getMonth() - 1, 1),
-        prevEnd: new Date(now.getFullYear(), now.getMonth(), 1),
+        ...base,
         label: '이번 달',
         prevLabel: '지난달',
         header: `${now.getFullYear()}년 ${now.getMonth() + 1}월`,
       };
     }
-    return {
-      start: new Date(now.getFullYear(), 0, 1),
-      end: new Date(now.getFullYear() + 1, 0, 1),
-      prevStart: new Date(now.getFullYear() - 1, 0, 1),
-      prevEnd: new Date(now.getFullYear(), 0, 1),
-      label: '올해',
-      prevLabel: '작년',
-      header: `${now.getFullYear()}년`,
-    };
+    return { ...base, label: '올해', prevLabel: '작년', header: `${now.getFullYear()}년` };
   }, [period]);
 
   const periodTxns = useMemo(
-    () => transactions.filter((t) => new Date(t.date) >= info.start && new Date(t.date) < info.end),
+    () => inRange(transactions, info.start, info.end),
     [transactions, info],
   );
-  const periodExpense = periodTxns.filter((t) => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
+  const periodExpense = sumByType(periodTxns, 'expense');
 
   const catData = useMemo(() => {
-    const byCat: Record<string, number> = {};
-    for (const t of periodTxns) {
-      if (t.type !== 'expense') continue;
-      byCat[t.category] = (byCat[t.category] || 0) + t.amount;
-    }
-    const entries = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+    const entries = sortedExpenseCategories(periodTxns);
     return { entries, total: entries.reduce((s, [, v]) => s + v, 0) };
   }, [periodTxns]);
 
   const prevExpense = useMemo(
-    () =>
-      transactions
-        .filter((t) => {
-          if (t.type !== 'expense') return false;
-          const d = new Date(t.date);
-          return d >= info.prevStart && d < info.prevEnd;
-        })
-        .reduce((s, t) => s + t.amount, 0),
+    () => sumByType(inRange(transactions, info.prevStart, info.prevEnd), 'expense'),
     [transactions, info],
   );
   const diff = periodExpense - prevExpense;
@@ -111,7 +84,7 @@ export default function StatsScreen() {
   const bars = useMemo<{ list: Bar[]; max: number }>(() => {
     const now = new Date();
     const list: Bar[] = [];
-    const inRange = (d: Date, a: Date, b: Date) => d >= a && d < b;
+    const within = (d: Date, a: Date, b: Date) => d >= a && d < b;
     if (period === 'week') {
       const names = ['월', '화', '수', '목', '금', '토', '일'];
       for (let i = 0; i < 7; i++) {
@@ -119,7 +92,7 @@ export default function StatsScreen() {
         ds.setDate(ds.getDate() + i);
         const de = new Date(ds);
         de.setDate(ds.getDate() + 1);
-        const txns = periodTxns.filter((t) => t.type === 'expense' && inRange(new Date(t.date), ds, de));
+        const txns = periodTxns.filter((t) => t.type === 'expense' && within(new Date(t.date), ds, de));
         list.push({
           label: names[i],
           total: txns.reduce((s, t) => s + t.amount, 0),
@@ -135,7 +108,7 @@ export default function StatsScreen() {
       while (weekStart < info.end) {
         const weekEnd = new Date(weekStart);
         weekEnd.setDate(weekStart.getDate() + 7);
-        const txns = transactions.filter((t) => t.type === 'expense' && inRange(new Date(t.date), weekStart, weekEnd));
+        const txns = transactions.filter((t) => t.type === 'expense' && within(new Date(t.date), weekStart, weekEnd));
         list.push({
           label: `${idx}주`,
           total: txns.reduce((s, t) => s + t.amount, 0),
@@ -151,7 +124,7 @@ export default function StatsScreen() {
       for (let m = 0; m < 12; m++) {
         const ms = new Date(year, m, 1);
         const me = new Date(year, m + 1, 1);
-        const txns = transactions.filter((t) => t.type === 'expense' && inRange(new Date(t.date), ms, me));
+        const txns = transactions.filter((t) => t.type === 'expense' && within(new Date(t.date), ms, me));
         list.push({
           label: `${m + 1}월`,
           total: txns.reduce((s, t) => s + t.amount, 0),

@@ -25,8 +25,10 @@ import {
   type Category,
   type TxnType,
 } from '@/data/categories';
+import { expenseByCategory, totals } from '@/lib/aggregate';
 import { startOfMonth } from '@/lib/format';
 import { splitPayment } from '@/lib/loan';
+import { migrate, SCHEMA_VERSION } from '@/lib/migrations';
 import { loadItem, saveItem } from '@/lib/storage';
 import {
   DEFAULT_SETTINGS,
@@ -138,6 +140,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     (async () => {
       const [
+        storedVersion,
         seenOnboarding,
         transactions,
         budgets,
@@ -150,6 +153,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         catOrder,
         settings,
       ] = await Promise.all([
+        loadItem('schemaVersion', 0),
         loadItem('seen', DEFAULT_STATE.seenOnboarding),
         loadItem('txns', DEFAULT_STATE.transactions),
         loadItem('budgets', DEFAULT_STATE.budgets),
@@ -163,7 +167,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         loadItem('settings', DEFAULT_STATE.settings),
       ]);
       if (cancelled) return;
-      setState({
+
+      const hydratedState: AppState = {
         seenOnboarding,
         transactions,
         budgets,
@@ -175,9 +180,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         customCats,
         catOrder,
         settings: { ...DEFAULT_SETTINGS, ...settings },
-      });
+      };
+
+      // Run any pending schema migrations before the app sees the data.
+      const { state: migratedState, from } = migrate(hydratedState, storedVersion);
+      setState(migratedState);
       hydratedRef.current = true;
       setHydrated(true);
+
+      // First launch after an update (or a fresh install): write the
+      // migrated slices back and stamp the current schema version.
+      if (from < SCHEMA_VERSION) {
+        for (const k of PERSIST_KEYS) void saveItem(storeKeyFor(k), migratedState[k]);
+        void saveItem('schemaVersion', SCHEMA_VERSION);
+      }
     })();
     return () => {
       cancelled = true;
@@ -589,9 +605,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const importData: StoreValue['importData'] = useCallback(
     (raw) => {
       try {
-        const parsed = JSON.parse(raw) as Partial<AppState>;
-        mutate(
-          (s) => ({
+        const parsed = JSON.parse(raw) as Partial<AppState> & { schemaVersion?: number };
+        mutate((s) => {
+          const merged: AppState = {
             ...s,
             transactions: parsed.transactions ?? s.transactions,
             budgets: parsed.budgets ?? s.budgets,
@@ -605,9 +621,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             settings: parsed.settings
               ? { ...DEFAULT_SETTINGS, ...parsed.settings }
               : s.settings,
-          }),
-          PERSIST_KEYS,
-        );
+          };
+          // Bring an older backup up to the current schema before it lands.
+          return migrate(merged, parsed.schemaVersion ?? 0).state;
+        }, PERSIST_KEYS);
+        void saveItem('schemaVersion', SCHEMA_VERSION);
         return true;
       } catch {
         return false;
@@ -721,17 +739,8 @@ export function useMonthlyTotals() {
   return useMemo(() => {
     const som = startOfMonth();
     const thisMonth = transactions.filter((t) => new Date(t.date) >= som);
-    const income = thisMonth
-      .filter((t) => t.type === 'income')
-      .reduce((sum, t) => sum + t.amount, 0);
-    const expense = thisMonth
-      .filter((t) => t.type === 'expense')
-      .reduce((sum, t) => sum + t.amount, 0);
-    const byCategory: Record<string, number> = {};
-    for (const t of thisMonth) {
-      if (t.type !== 'expense') continue;
-      byCategory[t.category] = (byCategory[t.category] ?? 0) + t.amount;
-    }
+    const { income, expense } = totals(thisMonth);
+    const byCategory = expenseByCategory(thisMonth);
     const totalBudget = Object.values(budgets).reduce((s, v) => s + (v || 0), 0);
     return {
       thisMonth,

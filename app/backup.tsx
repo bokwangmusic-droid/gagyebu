@@ -14,6 +14,7 @@ import { SegmentedTabs } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
+import { SCHEMA_VERSION } from '@/lib/migrations';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
@@ -32,6 +33,7 @@ export default function Backup() {
     () =>
       JSON.stringify(
         {
+          schemaVersion: SCHEMA_VERSION,
           transactions,
           budgets,
           goals,

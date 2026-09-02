@@ -1,5 +1,19 @@
 import type { CatOrderMap, CustomCatMap, TxnType } from '@/data/categories';
 
+/** How a transaction was paid. Optional — absent on legacy rows. */
+export type PaymentMethod = 'cash' | 'debit' | 'credit' | 'transfer' | 'other';
+
+/**
+ * One slice of a split transaction. `amount` is positive; the slices of a
+ * transaction are expected to sum to its `amount` (validation lives at the
+ * input layer, not here).
+ */
+export interface TransactionSplit {
+  category: string;
+  amount: number;
+  memo?: string;
+}
+
 export interface Transaction {
   id: string;
   type: TxnType;
@@ -9,6 +23,19 @@ export interface Transaction {
   date: string; // ISO
   fromRecurring?: string;
   fromPlanned?: string;
+
+  /* ---- extension fields — all optional; absent = current behaviour ---- */
+  /** Payment instrument. Foundation for card / 할부 tracking. */
+  paymentMethod?: PaymentMethod;
+  /**
+   * Per-category breakdown of a single payment. When present and non-empty,
+   * per-category aggregation uses these instead of `category` / `amount`.
+   */
+  splits?: TransactionSplit[];
+  /** Owner within a shared (부부/가족) ledger. Absent = the single local user. */
+  memberId?: string;
+  /** Free-form labels. */
+  tags?: string[];
 }
 
 /** Category id -> monthly budget won. */
