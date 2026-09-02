@@ -25,10 +25,10 @@ import {
   type Category,
   type TxnType,
 } from '@/data/categories';
-import { expenseByCategory, totals } from '@/lib/aggregate';
-import { startOfMonth } from '@/lib/format';
+import { expenseByCategory, inRange, totals } from '@/lib/aggregate';
 import { splitPayment } from '@/lib/loan';
 import { migrate, SCHEMA_VERSION } from '@/lib/migrations';
+import { monthRange } from '@/lib/period';
 import { loadItem, saveItem } from '@/lib/storage';
 import {
   DEFAULT_SETTINGS,
@@ -790,8 +790,10 @@ export function useStore(): StoreValue {
 export function useMonthlyTotals() {
   const { transactions, budgets } = useStore();
   return useMemo(() => {
-    const som = startOfMonth();
-    const thisMonth = transactions.filter((t) => new Date(t.date) >= som);
+    // Bound to [month start, next month start) — without the upper bound a
+    // transaction dated in a future month would leak into this month's totals.
+    const { start, end } = monthRange();
+    const thisMonth = inRange(transactions, start, end);
     const { income, expense } = totals(thisMonth);
     const byCategory = expenseByCategory(thisMonth);
     const totalBudget = Object.values(budgets).reduce((s, v) => s + (v || 0), 0);

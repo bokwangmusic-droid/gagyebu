@@ -9,15 +9,38 @@ import { Screen } from '@/components/ui/Screen';
 import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
 import { cardBillingForMonth } from '@/lib/card';
-import { fmt, formatMonthLabel, formatRelativeDateTime } from '@/lib/format';
+import { fmt, formatMonthLabel, formatRelativeDateTime, toDateKey } from '@/lib/format';
+import { buildInsights, type Insight } from '@/lib/insights';
 import { useMonthlyTotals, useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 
+/** Insight tone → { icon tile bg, icon/foreground } from design tokens. */
+function insightTone(tone: Insight['tone']): { bg: string; fg: string } {
+  switch (tone) {
+    case 'alert':
+      return { bg: colors.expenseLight, fg: colors.expenseText };
+    case 'warn':
+      return { bg: colors.warningLight, fg: colors.warningText };
+    case 'positive':
+      return { bg: colors.incomeLight, fg: colors.incomeStrong };
+    default:
+      return { bg: colors.primaryLighter, fg: colors.primaryStrong };
+  }
+}
+
 export default function HomeScreen() {
   const router = useRouter();
-  const { transactions, planned, customCats, cards } = useStore();
+  const { transactions, planned, customCats, cards, budgets } = useStore();
   const { income, expense, byCategory, totalBudget, remaining } = useMonthlyTotals();
+
+  // Recompute only when data changes or the calendar day rolls over.
+  const todayKey = toDateKey(new Date());
+  const insights = useMemo(
+    () => buildInsights({ transactions, budgets, customCats, now: new Date() }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [transactions, budgets, customCats, todayKey],
+  );
 
   const cardBill = useMemo(
     () => cardBillingForMonth(transactions, cards),
@@ -181,6 +204,55 @@ export default function HomeScreen() {
         <StatTile label="수입" value={income} tone="income" onPress={() => goToTxns('income')} />
         <StatTile label="지출" value={expense} tone="expense" onPress={() => goToTxns('expense')} />
       </View>
+
+      {/* 이번 달 인사이트 — rule-based, max 3, hidden when nothing to say */}
+      {insights.length > 0 && (
+        <Card>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginBottom: spacing.md }}>
+            이번 달 인사이트
+          </Text>
+          <View style={{ gap: 12 }}>
+            {insights.map((ins) => {
+              const t = insightTone(ins.tone);
+              return (
+                <Pressable
+                  key={`${ins.kind}:${ins.category ?? ''}`}
+                  onPress={() => router.push(ins.route)}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}
+                >
+                  <View
+                    style={{
+                      width: 32,
+                      height: 32,
+                      borderRadius: 10,
+                      backgroundColor: t.bg,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <AppIcon name={ins.icon} size={15} color={t.fg} strokeWidth={2.4} />
+                  </View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text
+                      numberOfLines={1}
+                      style={{ fontFamily: fontFamily.bold, fontSize: 12, lineHeight: 16, color: colors.text, ...noPad }}
+                    >
+                      {ins.title}
+                    </Text>
+                    <Text
+                      numberOfLines={1}
+                      style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 14, color: colors.textSub, marginTop: 1, ...noPad }}
+                    >
+                      {ins.body}
+                    </Text>
+                  </View>
+                  <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+                </Pressable>
+              );
+            })}
+          </View>
+        </Card>
+      )}
 
       {/* 사용월 기준 예상 카드값 — only when there's something to show */}
       {cardBillRows.length > 0 && (
