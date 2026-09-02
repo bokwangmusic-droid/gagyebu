@@ -1,0 +1,368 @@
+import { useRouter } from 'expo-router';
+import { useMemo } from 'react';
+import { Pressable, Text, View } from 'react-native';
+
+import { AppIcon } from '@/components/AppIcon';
+import { Card } from '@/components/ui/Card';
+import { ProgressBar } from '@/components/ui/ProgressBar';
+import { Screen } from '@/components/ui/Screen';
+import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
+import { getCat } from '@/data/categories';
+import { fmt, formatMonthLabel, formatRelativeDateTime } from '@/lib/format';
+import { useMonthlyTotals, useStore } from '@/store/store';
+import { colors, radii, spacing } from '@/theme/tokens';
+import { fontFamily, noPad, tabularNums } from '@/theme/typography';
+
+export default function HomeScreen() {
+  const router = useRouter();
+  const { transactions, planned, customCats } = useStore();
+  const { income, expense, byCategory, totalBudget, remaining } = useMonthlyTotals();
+
+  const percent = totalBudget > 0 ? Math.min(100, Math.round((expense / totalBudget) * 100)) : 0;
+  const recent = transactions.slice(0, 5);
+
+  const topCats = useMemo(
+    () =>
+      Object.entries(byCategory)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3),
+    [byCategory],
+  );
+  const maxCat = topCats[0]?.[1] ?? 1;
+
+  const upcoming = useMemo(() => {
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    return planned
+      .map((p) => ({
+        ...p,
+        diff: Math.round((+new Date(`${p.date}T00:00:00`) - +now) / 86_400_000),
+      }))
+      .filter((p) => p.diff <= 7)
+      .sort((a, b) => a.diff - b.diff);
+  }, [planned]);
+
+  const goToTxns = (filter: 'income' | 'expense') =>
+    router.push({ pathname: '/all-transactions', params: { filter, scope: 'thisMonth' } });
+
+  return (
+    <Screen>
+      <ScreenHeader
+        title={formatMonthLabel()}
+        right={
+          <View style={{ flexDirection: 'row', gap: spacing.sm }}>
+            <HeaderIconButton icon="calendar" onPress={() => router.push('/calendar')} />
+            <HeaderIconButton icon="refresh" onPress={() => router.push('/recurring')} />
+            <HeaderIconButton icon="target" onPress={() => router.push('/goals')} />
+          </View>
+        }
+      />
+
+      {/* Upcoming planned banner */}
+      {upcoming.length > 0 &&
+        (() => {
+          const first = upcoming[0];
+          const rest = upcoming.length - 1;
+          const label =
+            first.diff < 0
+              ? `${Math.abs(first.diff)}일 지남`
+              : first.diff === 0
+                ? '오늘'
+                : first.diff === 1
+                  ? '내일'
+                  : `${first.diff}일 후`;
+          const urgent = first.diff <= 1;
+          return (
+            <Pressable
+              onPress={() => router.push('/(tabs)/planned')}
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 10,
+                marginHorizontal: spacing.lg,
+                marginBottom: spacing.md,
+                paddingVertical: 12,
+                paddingHorizontal: spacing.lg,
+                borderRadius: radii.lg,
+                backgroundColor: urgent ? colors.warningLight : colors.primaryLighter,
+                borderWidth: 1,
+                borderColor: urgent ? '#FDE68A' : colors.primaryLight,
+              }}
+            >
+              <View
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 10,
+                  backgroundColor: urgent ? colors.warning : colors.primary,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <AppIcon name="bell" size={16} color={colors.white} />
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={{ fontFamily: fontFamily.bold, fontSize: 11, color: urgent ? colors.warningText : colors.primaryStrong }}>
+                  {label} 예정 지출
+                </Text>
+                <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.text, marginTop: 1 }}>
+                  「{first.name}」 <Text style={tabularNums}>{fmt(first.amount)}원</Text>
+                  {rest > 0 ? <Text style={{ fontFamily: fontFamily.regular, color: colors.textSub }}> · 외 {rest}건</Text> : null}
+                </Text>
+              </View>
+              <AppIcon name="chev-right" size={16} color={colors.textFaint} />
+            </Pressable>
+          );
+        })()}
+
+      {/* Balance card */}
+      <Pressable onPress={() => (totalBudget > 0 ? router.push('/(tabs)/budget') : router.push('/all-transactions'))}>
+        <Card>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Text style={{ fontFamily: fontFamily.medium, fontSize: 12, color: colors.textSub }}>
+              이번 달 {totalBudget > 0 ? '남은 예산' : '지출 합계'}
+            </Text>
+            <AppIcon name="chev-right" size={16} color={colors.textFaint} />
+          </View>
+          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, marginTop: 6 }}>
+            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 34, letterSpacing: -1, color: colors.text, ...tabularNums }}>
+              {fmt(totalBudget > 0 ? remaining : expense)}
+            </Text>
+            <Text style={{ fontFamily: fontFamily.medium, fontSize: 16, color: colors.textSub, marginBottom: 4 }}>원</Text>
+          </View>
+
+          {totalBudget > 0 ? (
+            <>
+              <ProgressBar
+                percent={percent}
+                style={{ marginTop: spacing.lg }}
+                fillColor={percent >= 100 ? colors.expenseSolid : percent >= 80 ? colors.warning : undefined}
+              />
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 }}>
+                <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, ...tabularNums }}>
+                  {fmt(expense)}원 사용 <Text style={{ color: colors.textFaint }}>/ {fmt(totalBudget)}원</Text>
+                </Text>
+                <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>{percent}%</Text>
+              </View>
+            </>
+          ) : (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: spacing.md }}>
+              <Text style={{ flex: 1, fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
+                탭해서 이번 달 전체 내역 보기 →
+              </Text>
+              <Pressable
+                onPress={() => router.push('/(tabs)/budget')}
+                style={{ paddingHorizontal: spacing.md, paddingVertical: 6, borderRadius: radii.pill, backgroundColor: colors.primaryLight }}
+              >
+                <Text style={{ fontFamily: fontFamily.bold, fontSize: 11, color: colors.primaryStrong }}>예산 설정하기</Text>
+              </Pressable>
+            </View>
+          )}
+        </Card>
+      </Pressable>
+
+      {/* Income / Expense pair */}
+      <View style={{ flexDirection: 'row', gap: 10, marginHorizontal: spacing.lg, marginBottom: spacing.lg }}>
+        <StatTile label="수입" value={income} tone="income" onPress={() => goToTxns('income')} />
+        <StatTile label="지출" value={expense} tone="expense" onPress={() => goToTxns('expense')} />
+      </View>
+
+      {/* Category breakdown */}
+      {topCats.length > 0 && (
+        <Pressable onPress={() => router.push('/(tabs)/stats')}>
+          <Card>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.lg }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>카테고리별 지출</Text>
+                <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+              </View>
+              <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>자세히 →</Text>
+            </View>
+            <View style={{ gap: spacing.md }}>
+              {topCats.map(([catId, amount]) => {
+                const cat = getCat(catId, 'expense', customCats);
+                const pct = Math.min(100, Math.round((amount / maxCat) * 100));
+                return (
+                  <View key={catId}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+                        <View
+                          style={{
+                            width: 24,
+                            height: 24,
+                            borderRadius: radii.sm,
+                            backgroundColor: cat.bg,
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                        >
+                          <AppIcon name={cat.icon} size={12} color={cat.color} strokeWidth={2.2} />
+                        </View>
+                        <Text style={{ fontFamily: fontFamily.medium, fontSize: 12, color: colors.text }}>{cat.name}</Text>
+                      </View>
+                      <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.text, ...tabularNums }}>
+                        {fmt(amount)}원
+                      </Text>
+                    </View>
+                    <ProgressBar percent={pct} size="sm" fillColor={cat.color} />
+                  </View>
+                );
+              })}
+            </View>
+          </Card>
+        </Pressable>
+      )}
+
+      {/* Recent */}
+      <Pressable
+        onPress={() => router.push('/all-transactions')}
+        style={{
+          flexDirection: 'row',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginHorizontal: spacing.xl,
+          marginBottom: spacing.sm,
+        }}
+      >
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>최근 내역</Text>
+          <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+        </View>
+        <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>전체보기 →</Text>
+      </Pressable>
+
+      {recent.length === 0 ? (
+        <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.xl, paddingBottom: 40 }}>
+          <Pressable
+            onPress={() => router.push('/input')}
+            style={{
+              width: 72,
+              height: 72,
+              borderRadius: radii.sheet,
+              backgroundColor: colors.primary,
+              alignItems: 'center',
+              justifyContent: 'center',
+              marginBottom: 18,
+            }}
+          >
+            <AppIcon name="plus" size={30} color={colors.white} strokeWidth={2.5} />
+          </Pressable>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 6 }}>아직 기록이 없어요</Text>
+          <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub, textAlign: 'center' }}>
+            첫 지출·수입을 기록해볼까요?
+          </Text>
+        </View>
+      ) : (
+        <Card variant="sm" style={{ paddingVertical: 4, paddingHorizontal: spacing.lg }}>
+          {recent.map((t, i) => {
+            const cat = getCat(t.category, t.type, customCats);
+            return (
+              <Pressable
+                key={t.id}
+                onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: spacing.md,
+                  paddingVertical: 10,
+                  borderTopWidth: i === 0 ? 0 : 1,
+                  borderTopColor: colors.track,
+                }}
+              >
+                <View
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 11,
+                    backgroundColor: cat.bg,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <AppIcon name={cat.icon} size={16} color={cat.color} />
+                </View>
+                <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+                  <Text
+                    numberOfLines={1}
+                    style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
+                  >
+                    {t.memo || cat.name}
+                  </Text>
+                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+                    {formatRelativeDateTime(t.date)} · {cat.name}
+                  </Text>
+                </View>
+                <Text
+                  style={{
+                    fontFamily: fontFamily.bold,
+                    fontSize: 13,
+                    color: t.type === 'income' ? colors.incomeStrong : colors.text,
+                    ...tabularNums,
+                  }}
+                >
+                  {t.type === 'income' ? '+' : '−'}
+                  {fmt(t.amount)}원
+                </Text>
+              </Pressable>
+            );
+          })}
+        </Card>
+      )}
+    </Screen>
+  );
+}
+
+function StatTile({
+  label,
+  value,
+  tone,
+  onPress,
+}: {
+  label: string;
+  value: number;
+  tone: 'income' | 'expense';
+  onPress: () => void;
+}) {
+  const isIncome = tone === 'income';
+  return (
+    <Pressable
+      onPress={onPress}
+      style={{
+        flex: 1,
+        paddingVertical: spacing.lg - 2,
+        paddingHorizontal: spacing.lg,
+        backgroundColor: colors.card,
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: radii.xxl,
+      }}
+    >
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View
+            style={{
+              width: 20,
+              height: 20,
+              borderRadius: radii.xs,
+              backgroundColor: isIncome ? colors.incomeLight : colors.expenseLight,
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <AppIcon
+              name={isIncome ? 'up' : 'down'}
+              size={10}
+              color={isIncome ? colors.incomeText : colors.expenseText}
+              strokeWidth={3}
+            />
+          </View>
+          <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>{label}</Text>
+        </View>
+        <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+      </View>
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 18, color: colors.text, marginTop: 6, letterSpacing: -0.4, ...tabularNums }}>
+        {fmt(value)}
+      </Text>
+    </Pressable>
+  );
+}
