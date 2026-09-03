@@ -1,0 +1,159 @@
+import { LinearGradient } from 'expo-linear-gradient';
+import {
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+  type StyleProp,
+  type ViewStyle,
+} from 'react-native';
+
+import { AppIcon } from '@/components/AppIcon';
+import { colors, gradients, radii, spacing } from '@/theme/tokens';
+import { fontFamily } from '@/theme/typography';
+
+/**
+ * The app's custom money keypad — 1–9 / 00 / 0 digit grid, a backspace key
+ * and a gradient "완료" key. Presentational only: the parent owns the amount
+ * string and decides when to show/hide the pad.
+ *
+ * `app/input.tsx` still has an equivalent grid inline (it also stacks its own
+ * 저장 button inside the same sheet). That copy is left untouched on purpose
+ * so extracting this component can't regress the primary expense-input
+ * screen — keep the two visually in sync if either changes.
+ */
+const KEY_HEIGHT = 52;
+const KEY_GAP = 6;
+
+export function NumPad({
+  onKey,
+  onBackspace,
+  onDone,
+  style,
+}: {
+  /** A pressed digit — '0'–'9' or '00'. */
+  onKey: (digit: string) => void;
+  onBackspace: () => void;
+  onDone: () => void;
+  /** Extra container style, e.g. safe-area bottom padding. */
+  style?: StyleProp<ViewStyle>;
+}) {
+  return (
+    <View style={[styles.numPad, style]}>
+      <View style={{ flexDirection: 'row', gap: KEY_GAP }}>
+        {/* digit block */}
+        <View style={{ flex: 3, gap: KEY_GAP }}>
+          {[
+            ['1', '2', '3'],
+            ['4', '5', '6'],
+            ['7', '8', '9'],
+          ].map((row) => (
+            <View key={row[0]} style={{ flexDirection: 'row', gap: KEY_GAP }}>
+              {row.map((n) => (
+                <NumKey key={n} label={n} onPress={() => onKey(n)} />
+              ))}
+            </View>
+          ))}
+          <View style={{ flexDirection: 'row', gap: KEY_GAP }}>
+            <NumKey label="00" ghost onPress={() => onKey('00')} />
+            <NumKey label="0" onPress={() => onKey('0')} />
+            <View style={{ flex: 1 }} />
+          </View>
+        </View>
+
+        {/* backspace + 완료 */}
+        <View style={{ flex: 1, gap: KEY_GAP }}>
+          <Pressable
+            onPress={onBackspace}
+            style={({ pressed }) => [
+              styles.key,
+              { height: KEY_HEIGHT },
+              pressed && styles.keyPressed,
+            ]}
+          >
+            <AppIcon name="backspace" size={22} color={colors.textSub} />
+          </Pressable>
+          <Pressable
+            onPress={onDone}
+            style={{ flex: 1, borderRadius: radii.lg, overflow: 'hidden' }}
+          >
+            <LinearGradient
+              colors={gradients.primary}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.doneKey}
+            >
+              <AppIcon name="down" size={18} color={colors.white} strokeWidth={2.5} />
+              <Text style={styles.doneKeyText}>완료</Text>
+            </LinearGradient>
+          </Pressable>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function NumKey({
+  label,
+  ghost,
+  onPress,
+}: {
+  label: string;
+  ghost?: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.key,
+        { flex: 1, height: KEY_HEIGHT },
+        ghost && styles.keyGhost,
+        pressed && !ghost && styles.keyPressed,
+        pressed && ghost && { opacity: 0.5 },
+      ]}
+    >
+      <Text
+        style={{
+          fontFamily: fontFamily.semibold,
+          fontSize: ghost ? 20 : 22,
+          color: ghost ? colors.textSub : colors.text,
+        }}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  numPad: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    backgroundColor: colors.border,
+    borderTopLeftRadius: radii.sheet,
+    borderTopRightRadius: radii.sheet,
+  },
+  key: {
+    backgroundColor: colors.white,
+    borderRadius: radii.lg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  keyGhost: { backgroundColor: 'transparent' },
+  keyPressed: { backgroundColor: colors.track },
+  doneKey: {
+    flex: 1,
+    borderRadius: radii.lg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+  },
+  doneKeyText: {
+    fontFamily: fontFamily.bold,
+    fontSize: 15,
+    color: colors.white,
+  },
+});
+
+export default NumPad;

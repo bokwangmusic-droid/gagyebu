@@ -15,6 +15,8 @@ interface ModalScreenProps {
   right?: ReactNode;
   children: ReactNode;
   scroll?: boolean;
+  /** Pinned below the scroll body, above the safe area (e.g. a custom keypad). */
+  footer?: ReactNode;
 }
 
 /**
@@ -29,6 +31,7 @@ export function ModalScreen({
   right,
   children,
   scroll = true,
+  footer,
 }: ModalScreenProps) {
   const insets = useSafeAreaInsets();
   const [kb, setKb] = useState(0);
@@ -92,6 +95,12 @@ export function ModalScreen({
         </ScrollView>
       ) : (
         body
+      )}
+
+      {footer != null && (
+        <View style={{ width: '100%', maxWidth: layout.maxContentWidth, alignSelf: 'center' }}>
+          {footer}
+        </View>
       )}
     </View>
   );

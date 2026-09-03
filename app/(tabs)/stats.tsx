@@ -11,7 +11,7 @@ import { Screen } from '@/components/ui/Screen';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
 import { inRange, sortedExpenseCategories, sumByType } from '@/lib/aggregate';
-import { fmt } from '@/lib/format';
+import { fmt, fmtShort } from '@/lib/format';
 import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -22,6 +22,17 @@ type Period = 'week' | 'month' | 'year';
 const DONUT_COLORS = ['#A78BFA', '#FDBA74', '#6EE7B7', '#93C5FD', '#F0A4B4', '#CBD5E1'];
 const R = 46;
 const CIRC = 2 * Math.PI * R;
+
+/**
+ * Per-bar amount label. Weekly/monthly bars are wide enough for the full
+ * "1,500원" form up to a point; past it (and always for the 12-bar year view)
+ * fall back to the compact formatter so nothing has to be clipped.
+ */
+function barAmountLabel(period: Period, total: number): string {
+  if (period === 'year') return fmtShort(total);
+  const cap = period === 'month' ? 1_000_000 : 100_000;
+  return total >= cap ? fmtShort(total) : `${fmt(total)}원`;
+}
 
 interface Bar {
   label: string;
@@ -291,7 +302,7 @@ export default function StatsScreen() {
               합계 <Text style={{ fontFamily: fontFamily.semibold, color: colors.text }}>{fmt(periodExpense)}원</Text>
             </Text>
           </View>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: period === 'year' ? 4 : 10, height: 108 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: period === 'year' ? 4 : 6, height: 134 }}>
             {bars.list.map((b, i) => {
               const h = Math.max(4, Math.round((b.total / bars.max) * 90));
               return (
@@ -319,6 +330,26 @@ export default function StatsScreen() {
                     }}
                   >
                     {b.label}
+                  </Text>
+                  {/* Per-bar amount so the chart is readable without tapping.
+                      `alignSelf:stretch` + a small negative margin lets the
+                      label borrow the inter-bar gap (meeting neighbours exactly
+                      at the gap centre — no overlap), and `clip` guarantees no
+                      "…" ever shows. Format falls back via barAmountLabel(). */}
+                  <Text
+                    numberOfLines={1}
+                    ellipsizeMode="clip"
+                    style={{
+                      alignSelf: 'stretch',
+                      marginHorizontal: period === 'year' ? -2 : -3,
+                      textAlign: 'center',
+                      fontFamily: b.isCurrent ? fontFamily.bold : fontFamily.medium,
+                      fontSize: period === 'year' ? 9 : 10,
+                      color: b.isCurrent ? colors.primaryStrong : colors.textSub,
+                      ...tabularNums,
+                    }}
+                  >
+                    {barAmountLabel(period, b.total)}
                   </Text>
                 </Pressable>
               );
