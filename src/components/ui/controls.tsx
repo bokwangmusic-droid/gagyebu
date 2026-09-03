@@ -80,10 +80,13 @@ export function Toggle({
   value,
   onChange,
   disabled,
+  activeColor = colors.primary,
 }: {
   value: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
+  /** Track colour when ON. Defaults to the lavender primary. */
+  activeColor?: string;
 }) {
   return (
     <Pressable
@@ -92,7 +95,7 @@ export function Toggle({
         width: 40,
         height: 22,
         borderRadius: radii.pill,
-        backgroundColor: value ? colors.primary : colors.borderStrong,
+        backgroundColor: value ? activeColor : colors.borderStrong,
         padding: 2,
         opacity: disabled ? 0.5 : 1,
       }}

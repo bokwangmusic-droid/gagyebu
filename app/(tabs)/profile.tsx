@@ -177,6 +177,7 @@ export default function ProfileScreen() {
             <Toggle
               value={settings.quickPaste}
               onChange={(v) => setSettings({ quickPaste: v })}
+              activeColor={colors.primaryStrong}
             />
           }
           last
@@ -209,8 +210,16 @@ export default function ProfileScreen() {
         />
       </SettingsCard>
 
-      <View style={{ paddingVertical: spacing.sm, paddingHorizontal: spacing.xl, paddingBottom: 40 }}>
-        <Pressable onPress={confirmReset} style={{ paddingVertical: 8, alignItems: 'center' }}>
+      <View style={{ paddingVertical: spacing.sm, paddingHorizontal: spacing.xl, paddingBottom: 40, alignItems: 'center' }}>
+        <Pressable
+          onPress={confirmReset}
+          style={{
+            paddingVertical: 9,
+            paddingHorizontal: 18,
+            borderRadius: radii.pill,
+            backgroundColor: colors.expenseLight,
+          }}
+        >
           <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.expenseText }}>
             모든 데이터 초기화
           </Text>
