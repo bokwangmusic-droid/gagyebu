@@ -1,5 +1,8 @@
 import * as Clipboard from 'expo-clipboard';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import { useRouter } from 'expo-router';
+import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
@@ -18,15 +21,19 @@ import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
 import {
+  backupFileName,
+  buildBackupFile,
   createBackup,
   listBackups,
+  parseBackupFile,
+  parseTextImport,
+  performDataRestore,
   performRestore,
   type BackupData,
   type BackupMeta,
   type BackupReason,
 } from '@/lib/backup';
 import { formatRelativeDateTime } from '@/lib/format';
-import { SCHEMA_VERSION } from '@/lib/migrations';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
@@ -39,6 +46,22 @@ const REASON_LABEL: Record<BackupReason, string> = {
   before_restore: '복원 전 백업',
   before_reset: '초기화 전 백업',
 };
+
+/** Best-effort sweep of any temp export files left in the cache dir. */
+async function cleanupExportFiles() {
+  try {
+    const dir = FileSystem.cacheDirectory;
+    if (!dir) return;
+    const names = await FileSystem.readDirectoryAsync(dir);
+    await Promise.all(
+      names
+        .filter((n) => n.startsWith('gagyebu-backup-') && n.endsWith('.json'))
+        .map((n) => FileSystem.deleteAsync(dir + n, { idempotent: true }).catch(() => {})),
+    );
+  } catch {
+    /* noop */
+  }
+}
 
 export default function Backup() {
   const router = useRouter();
@@ -61,6 +84,7 @@ export default function Backup() {
   const [mode, setMode] = useState<Mode>('snapshots');
   const [importText, setImportText] = useState('');
   const [copied, setCopied] = useState(false);
+  const [pickedFileName, setPickedFileName] = useState<string | null>(null);
 
   const [snapshots, setSnapshots] = useState<BackupMeta[]>([]);
   const [busy, setBusy] = useState(false);
@@ -89,26 +113,11 @@ export default function Backup() {
     [transactions, budgets, goals, recurring, planned, loans, cards, notes, customCats, catOrder, settings],
   );
 
+  // The text box and the exported file share one format (§9 — text export is
+  // now a complete 11-slice backup too).
   const payload = useMemo(
-    () =>
-      JSON.stringify(
-        {
-          schemaVersion: SCHEMA_VERSION,
-          transactions,
-          budgets,
-          goals,
-          recurring,
-          planned,
-          loans,
-          cards,
-          notes,
-          settings,
-          exportedAt: new Date().toISOString(),
-        },
-        null,
-        2,
-      ),
-    [transactions, budgets, goals, recurring, planned, loans, cards, notes, settings],
+    () => JSON.stringify(buildBackupFile(currentData), null, 2),
+    [currentData],
   );
 
   const copy = async () => {
@@ -118,14 +127,112 @@ export default function Backup() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  /** Apply an already-validated dataset through STEP 8-A's safe restore path. */
+  const runDataRestore = (
+    data: BackupData,
+    schemaVersion: number,
+    successMsg: string,
+  ) => {
+    setBusy(true);
+    void performDataRestore(data, schemaVersion, currentData, importData)
+      .then(async (res) => {
+        await refreshSnapshots(); // a before_restore snapshot was made either way
+        if (res.ok) {
+          toast.show(successMsg);
+          router.back();
+        } else {
+          toast.show(res.reason);
+        }
+      })
+      .finally(() => setBusy(false));
+  };
+
   const doImport = () => {
+    if (busy) return;
     if (!importText.trim()) {
       toast.show('붙여넣은 내용이 없어요');
       return;
     }
-    const ok = importData(importText);
-    toast.show(ok ? '데이터를 불러왔어요' : '올바른 백업 데이터가 아니에요');
-    if (ok) router.back();
+    const check = parseTextImport(importText, currentData);
+    if (!check.ok) {
+      toast.show(check.reason);
+      return;
+    }
+    runDataRestore(check.data, check.schemaVersion, '데이터를 불러왔어요');
+  };
+
+  const doExportFile = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (!(await Sharing.isAvailableAsync())) {
+        toast.show('이 기기에서는 파일 공유를 지원하지 않아요');
+        return;
+      }
+      const dir = FileSystem.cacheDirectory;
+      if (!dir) {
+        toast.show('임시 저장 공간을 열 수 없어요');
+        return;
+      }
+      await cleanupExportFiles();
+      const uri = dir + backupFileName();
+      await FileSystem.writeAsStringAsync(uri, JSON.stringify(buildBackupFile(currentData)));
+      await Sharing.shareAsync(uri, {
+        mimeType: 'application/json',
+        UTI: 'public.json',
+        dialogTitle: '가계부 백업 파일 저장',
+      });
+      // The temp file is left for the OS / the next export's sweep to clear —
+      // deleting it now can race the receiving app on Android.
+    } catch {
+      toast.show('백업 파일을 만들지 못했어요');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doPickFile = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const res = await DocumentPicker.getDocumentAsync({
+        // Galaxy file providers tag .json inconsistently; accept the common
+        // reports and let parseBackupFile() reject anything that isn't ours.
+        type: ['application/json', 'application/octet-stream', 'text/plain'],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (res.canceled) return;
+      const asset = res.assets[0];
+      setPickedFileName(asset.name);
+
+      const text = await FileSystem.readAsStringAsync(asset.uri);
+      const check = parseBackupFile(text);
+      if (!check.ok) {
+        toast.show(check.reason);
+        return;
+      }
+      const when = check.file.exportedAt
+        ? formatRelativeDateTime(check.file.exportedAt)
+        : asset.name;
+      Alert.alert(
+        '이 백업 파일로 복원할까요?',
+        `${when} · 거래 ${check.file.data.transactions.length}건\n\n지금 데이터는 복원 전에 자동으로 백업돼요.`,
+        [
+          { text: '취소', style: 'cancel' },
+          {
+            text: '복원',
+            style: 'destructive',
+            onPress: () =>
+              runDataRestore(check.file.data, check.file.schemaVersion, '백업 파일을 복원했어요'),
+          },
+        ],
+      );
+    } catch {
+      toast.show('백업 파일을 읽지 못했어요');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const doManualBackup = async () => {
@@ -230,8 +337,14 @@ export default function Backup() {
         ) : mode === 'export' ? (
           <>
             <Text style={styles.hint}>
-              아래 데이터를 메모장·카톡·이메일 등에 저장해두시면 폰 바꿀 때나 문제 생겼을 때 「불러오기」로 복원할 수 있어요.
+              백업 파일(.json)로 저장하면 파일 앱·드라이브·메신저 등으로 보내 다른 기기나 재설치 후 「불러오기」로 복원할 수 있어요. 아래 텍스트를 그대로 복사해 두어도 돼요.
             </Text>
+            <GradientButton
+              label={busy ? '처리 중…' : '백업 파일로 저장하기'}
+              onPress={doExportFile}
+              disabled={busy}
+              style={{ marginBottom: spacing.md }}
+            />
             <View
               style={{
                 flex: 1,
@@ -260,19 +373,31 @@ export default function Backup() {
             <GradientButton
               label={copied ? '✓ 복사됨' : '전체 복사'}
               onPress={copy}
+              disabled={busy}
               style={{ marginBottom: spacing.xxl }}
             />
           </>
         ) : (
           <>
             <Text style={styles.hint}>
-              이전에 저장해둔 백업 데이터(JSON)를 붙여넣고 「불러오기」를 누르면 현재 데이터를 모두 덮어써요.
+              백업 파일을 선택하거나, 이전에 복사해둔 백업 데이터(JSON)를 붙여넣고 불러오면 현재 데이터를 모두 덮어써요. 덮어쓰기 전에 지금 데이터가 자동으로 백업돼요.
             </Text>
+            <GradientButton
+              label={busy ? '처리 중…' : '백업 파일 선택하기'}
+              onPress={doPickFile}
+              disabled={busy}
+              style={{ marginBottom: pickedFileName ? spacing.sm : spacing.md }}
+            />
+            {pickedFileName ? (
+              <Text style={styles.fileName} numberOfLines={1}>
+                선택한 파일: {pickedFileName}
+              </Text>
+            ) : null}
             <TextInput
               value={importText}
               onChangeText={setImportText}
               multiline
-              placeholder={'{"transactions":[...],"budgets":{...}, ...}'}
+              placeholder={'{"app":"gagyebu","exportVersion":1, ...}'}
               placeholderTextColor={colors.textMuted}
               style={{
                 flex: 1,
@@ -304,7 +429,12 @@ export default function Backup() {
               >
                 <Text style={{ fontFamily: fontFamily.semibold, fontSize: 14, color: colors.textSub }}>취소</Text>
               </Pressable>
-              <GradientButton label="불러오기" onPress={doImport} disabled={!importText.trim()} style={{ flex: 2 }} />
+              <GradientButton
+                label="붙여넣기 불러오기"
+                onPress={doImport}
+                disabled={!importText.trim() || busy}
+                style={{ flex: 2 }}
+              />
             </View>
           </>
         )}
@@ -328,6 +458,12 @@ const styles = {
     color: colors.textMuted,
     textAlign: 'center' as const,
     marginTop: spacing.xl,
+  },
+  fileName: {
+    fontFamily: fontFamily.regular,
+    fontSize: 11,
+    color: colors.textSub,
+    marginBottom: spacing.md,
   },
   row: {
     flexDirection: 'row' as const,

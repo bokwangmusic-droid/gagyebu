@@ -215,6 +215,21 @@ const SLICE_ARRAYS = [
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
+type DataCheck = { ok: true } | { ok: false; reason: string };
+
+/** Slice-shape check shared by the snapshot, file and paste validators. */
+function validateBackupData(raw: unknown): DataCheck {
+  if (!isPlainObject(raw)) return { ok: false, reason: '백업 데이터가 비어 있어요' };
+  for (const k of SLICE_ARRAYS)
+    if (!Array.isArray(raw[k])) return { ok: false, reason: `백업 데이터가 손상됐어요 (${k})` };
+  if (!isPlainObject(raw.budgets)) return { ok: false, reason: '백업 데이터가 손상됐어요 (budgets)' };
+  if (!isPlainObject(raw.settings)) return { ok: false, reason: '백업 데이터가 손상됐어요 (settings)' };
+  if (!isPlainObject(raw.customCats)) return { ok: false, reason: '백업 데이터가 손상됐어요 (customCats)' };
+  if (!isPlainObject(raw.catOrder)) return { ok: false, reason: '백업 데이터가 손상됐어요 (catOrder)' };
+  if (typeof raw.notes !== 'string') return { ok: false, reason: '백업 데이터가 손상됐어요 (notes)' };
+  return { ok: true };
+}
+
 /**
  * Structural + version check run before a restore. Rejects a body that isn't a
  * snapshot, has no `schemaVersion`, was made by a NEWER app (unknown future
@@ -231,23 +246,138 @@ export function validateSnapshot(raw: unknown): SnapshotCheck {
   if (raw.schemaVersion > SCHEMA_VERSION)
     return { ok: false, reason: '더 최신 버전에서 만든 백업이라 이 앱에서는 복원할 수 없어요' };
 
-  if (!isPlainObject(raw.data)) return { ok: false, reason: '백업 데이터가 비어 있어요' };
-  const d = raw.data;
-
-  for (const k of SLICE_ARRAYS)
-    if (!Array.isArray(d[k])) return { ok: false, reason: `백업 데이터가 손상됐어요 (${k})` };
-  if (!isPlainObject(d.budgets)) return { ok: false, reason: '백업 데이터가 손상됐어요 (budgets)' };
-  if (!isPlainObject(d.settings)) return { ok: false, reason: '백업 데이터가 손상됐어요 (settings)' };
-  if (!isPlainObject(d.customCats)) return { ok: false, reason: '백업 데이터가 손상됐어요 (customCats)' };
-  if (!isPlainObject(d.catOrder)) return { ok: false, reason: '백업 데이터가 손상됐어요 (catOrder)' };
-  if (typeof d.notes !== 'string') return { ok: false, reason: '백업 데이터가 손상됐어요 (notes)' };
+  const dataCheck = validateBackupData(raw.data);
+  if (!dataCheck.ok) return dataCheck;
 
   return { ok: true, snapshot: raw as unknown as BackupSnapshot };
 }
 
-/** JSON shaped for `store.importData()` — reuses the existing merge + migrate path. */
-function toImportPayload(snap: BackupSnapshot): string {
-  return JSON.stringify({ schemaVersion: snap.schemaVersion, ...snap.data });
+/* ------------------------------------------------------------------ *
+ * Portable backup file (STEP 8-B) — export / import as a .json file
+ * ------------------------------------------------------------------ */
+
+export const EXPORT_APP_ID = 'gagyebu';
+/** Envelope version. Bump only if the *file wrapper* changes, never for data. */
+export const EXPORT_VERSION = 1;
+const SUPPORTED_EXPORT_VERSIONS: readonly number[] = [1];
+
+export interface BackupFile {
+  app: typeof EXPORT_APP_ID;
+  exportVersion: number;
+  /** Data-shape version — reused verbatim from lib/migrations, no parallel scheme. */
+  schemaVersion: number;
+  exportedAt: string;
+  data: BackupData;
+}
+
+/** Build the object that gets `JSON.stringify`d into the export file. */
+export function buildBackupFile(data: BackupData, now: Date = new Date()): BackupFile {
+  return {
+    app: EXPORT_APP_ID,
+    exportVersion: EXPORT_VERSION,
+    schemaVersion: SCHEMA_VERSION,
+    exportedAt: now.toISOString(),
+    data,
+  };
+}
+
+/** `gagyebu-backup-YYYY-MM-DD-HHmm.json` — only OS-safe characters, no user input. */
+export function backupFileName(now: Date = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return (
+    `gagyebu-backup-${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}` +
+    `-${p(now.getHours())}${p(now.getMinutes())}.json`
+  );
+}
+
+export type FileCheck = { ok: true; file: BackupFile } | { ok: false; reason: string };
+
+/** Strict validator for a picked `.json` backup file (§7). */
+export function parseBackupFile(text: string): FileCheck {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, reason: '백업 파일을 읽을 수 없어요 (JSON 형식이 아니에요)' };
+  }
+  if (!isPlainObject(raw) || raw.app !== EXPORT_APP_ID)
+    return { ok: false, reason: '가계부 백업 파일이 아니에요' };
+  if (
+    typeof raw.exportVersion !== 'number' ||
+    !SUPPORTED_EXPORT_VERSIONS.includes(raw.exportVersion)
+  )
+    return { ok: false, reason: '지원하지 않는 백업 파일 형식이에요' };
+  if (typeof raw.schemaVersion !== 'number' || !Number.isFinite(raw.schemaVersion))
+    return { ok: false, reason: '백업 파일이 손상됐어요 (버전 정보 없음)' };
+  if (raw.schemaVersion > SCHEMA_VERSION)
+    return { ok: false, reason: '더 최신 버전의 앱에서 만든 백업이에요' };
+
+  const dataCheck = validateBackupData(raw.data);
+  if (!dataCheck.ok) return { ok: false, reason: dataCheck.reason };
+
+  return {
+    ok: true,
+    file: {
+      app: EXPORT_APP_ID,
+      exportVersion: raw.exportVersion,
+      schemaVersion: raw.schemaVersion,
+      exportedAt: typeof raw.exportedAt === 'string' ? raw.exportedAt : '',
+      data: raw.data as unknown as BackupData,
+    },
+  };
+}
+
+export type TextImportCheck =
+  | { ok: true; data: BackupData; schemaVersion: number }
+  | { ok: false; reason: string };
+
+/**
+ * Lenient parser for the "불러오기" paste box. Accepts either the STEP 8-B file
+ * envelope (`{ app, data }`) or STEP 8-A's flat `{ schemaVersion, ...slices }`
+ * text payload, filling any slice missing from an old text export with the
+ * current value — same leniency `store.importData` always had, but now the
+ * result flows through the same safe restore path.
+ */
+export function parseTextImport(text: string, currentData: BackupData): TextImportCheck {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, reason: '올바른 백업 데이터가 아니에요 (JSON 형식이 아니에요)' };
+  }
+  if (!isPlainObject(raw)) return { ok: false, reason: '올바른 백업 데이터가 아니에요' };
+
+  const envelope = raw.app === EXPORT_APP_ID && isPlainObject(raw.data);
+  const src = envelope ? (raw.data as Record<string, unknown>) : raw;
+  const sv =
+    typeof raw.schemaVersion === 'number' && Number.isFinite(raw.schemaVersion)
+      ? raw.schemaVersion
+      : 0;
+  if (sv > SCHEMA_VERSION) return { ok: false, reason: '더 최신 버전의 앱에서 만든 백업이에요' };
+
+  const merged: BackupData = {
+    transactions: (src.transactions as BackupData['transactions']) ?? currentData.transactions,
+    budgets: (src.budgets as BackupData['budgets']) ?? currentData.budgets,
+    goals: (src.goals as BackupData['goals']) ?? currentData.goals,
+    recurring: (src.recurring as BackupData['recurring']) ?? currentData.recurring,
+    planned: (src.planned as BackupData['planned']) ?? currentData.planned,
+    loans: (src.loans as BackupData['loans']) ?? currentData.loans,
+    cards: (src.cards as BackupData['cards']) ?? currentData.cards,
+    notes: (src.notes as BackupData['notes']) ?? currentData.notes,
+    customCats: (src.customCats as BackupData['customCats']) ?? currentData.customCats,
+    catOrder: (src.catOrder as BackupData['catOrder']) ?? currentData.catOrder,
+    settings: (src.settings as BackupData['settings']) ?? currentData.settings,
+  };
+  const dataCheck = validateBackupData(merged);
+  if (!dataCheck.ok) return { ok: false, reason: dataCheck.reason };
+
+  return { ok: true, data: merged, schemaVersion: sv };
+}
+
+/** JSON shaped for `store.importData()` — a current-schema dataset, so
+ *  importData's internal migrate() is a no-op and it just persists + setState. */
+function dataToImportPayload(data: BackupData): string {
+  return JSON.stringify({ schemaVersion: SCHEMA_VERSION, ...data });
 }
 
 /* ------------------------------------------------------------------ *
@@ -322,56 +452,53 @@ async function writeDatasetDurably(data: BackupData, schemaVersion: number): Pro
 
 export type RestoreResult = { ok: true } | { ok: false; reason: string };
 
+function restoreFailReason(rolledBack: boolean): string {
+  return rolledBack
+    ? '복원에 실패해 복원 전 상태로 되돌렸어요'
+    : '복원에 실패했어요. 「백업」 탭의 「복원 전 백업」에서 다시 복원해 주세요';
+}
+
 /**
- * Restore the snapshot `id`, protecting the current dataset at every step:
+ * The single safe-restore core, shared by every entry point — a stored
+ * snapshot (`performRestore`), a picked backup file or a pasted payload
+ * (`performDataRestore`). Never called by UI directly.
  *
- *   1. read + validate the target snapshot                — no data touched on failure
- *   2. write a `before_restore` snapshot of `currentData` — abort if it can't be
- *      durably written (never overwrite without a safety net)
- *   3. migrate the snapshot to the current schema, then commit it to disk with
- *      `writeDatasetDurably` (multiSet + full read-back verify). If that fails,
- *      roll the disk back to `currentData` and report failure — the React
- *      store was never touched, so the UI still shows the pre-restore data.
- *   4. sync the in-memory store via `applyImport`, and REQUIRE it to succeed.
- *      If it returns false / throws, the store's single `setState` updater
- *      bailed before persisting, so in-memory is still the pre-restore data;
- *      we roll the disk back to `currentData` too so disk and memory can never
- *      disagree, and report failure.
+ *   1. write a `before_restore` snapshot of `currentData` — abort if it can't
+ *      be durably written (never overwrite without a safety net)
+ *   2. migrate the source data to the current schema (reuses lib/migrations)
+ *   3. commit it to disk with `writeDatasetDurably` (multiSet + full read-back
+ *      verify). On failure, roll the disk back to `currentData` and report — the
+ *      React store was never touched, so the UI still shows the pre-restore data
+ *   4. sync the in-memory store via `applyImport`, and REQUIRE it to succeed. A
+ *      false / throwing applyImport means the store's single `setState` updater
+ *      bailed before persisting, so in-memory is still pre-restore; roll the
+ *      disk back too so disk and memory can never disagree, and report
  *
- * The `before_restore` snapshot from step 2 is kept in every failure path.
- * `applyImport` is passed in so this stays UI/store-agnostic.
+ * The `before_restore` snapshot from step 1 is kept in every failure path.
  */
-export async function performRestore(
-  id: string,
+async function restoreDataset(
+  sourceData: BackupData,
+  sourceSchemaVersion: number,
   currentData: BackupData,
   applyImport: (payload: string) => boolean,
 ): Promise<RestoreResult> {
-  const check = validateSnapshot(await readSnapshot(id));
-  if (!check.ok) return check;
-
-  // 1) safety snapshot of the current dataset — never overwrite without it.
   const safety = await createBackup('before_restore', currentData);
   if (!safety) return { ok: false, reason: '안전 백업을 만들지 못해 복원을 취소했어요' };
 
-  // 2) bring the snapshot up to the current schema (reuses lib/migrations).
   const migrated = migrate(
-    { seenOnboarding: false, ...check.snapshot.data },
-    check.snapshot.schemaVersion,
+    { seenOnboarding: false, ...sourceData },
+    sourceSchemaVersion,
   ).state;
   const restored = pickSlices(migrated);
 
-  // 3) commit the restored dataset to disk + verify; roll back on any failure.
   if (!(await writeDatasetDurably(restored, SCHEMA_VERSION))) {
     const rolledBack = await writeDatasetDurably(currentData, SCHEMA_VERSION);
     return { ok: false, reason: restoreFailReason(rolledBack) };
   }
 
-  // 4) sync the in-memory store — and require it to succeed. A false / throwing
-  //    applyImport means the store never committed the restored data, so
-  //    in-memory is still pre-restore; roll the disk back to match and fail.
   let applied: boolean;
   try {
-    applied = applyImport(toImportPayload(check.snapshot));
+    applied = applyImport(dataToImportPayload(restored));
   } catch {
     applied = false;
   }
@@ -383,10 +510,29 @@ export async function performRestore(
   return { ok: true };
 }
 
-function restoreFailReason(rolledBack: boolean): string {
-  return rolledBack
-    ? '복원에 실패해 복원 전 상태로 되돌렸어요'
-    : '복원에 실패했어요. 「백업」 탭의 「복원 전 백업」에서 다시 복원해 주세요';
+/** Restore a stored local snapshot by id (STEP 8-A backup list). */
+export async function performRestore(
+  id: string,
+  currentData: BackupData,
+  applyImport: (payload: string) => boolean,
+): Promise<RestoreResult> {
+  const check = validateSnapshot(await readSnapshot(id));
+  if (!check.ok) return check;
+  return restoreDataset(check.snapshot.data, check.snapshot.schemaVersion, currentData, applyImport);
+}
+
+/**
+ * Restore an already-validated dataset — from a picked backup file
+ * (`parseBackupFile`) or the paste box (`parseTextImport`). Goes through the
+ * exact same safe path as a local-snapshot restore.
+ */
+export async function performDataRestore(
+  sourceData: BackupData,
+  sourceSchemaVersion: number,
+  currentData: BackupData,
+  applyImport: (payload: string) => boolean,
+): Promise<RestoreResult> {
+  return restoreDataset(sourceData, sourceSchemaVersion, currentData, applyImport);
 }
 
 /* ------------------------------------------------------------------ *

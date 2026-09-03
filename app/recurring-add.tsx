@@ -1,5 +1,5 @@
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { View } from 'react-native';
 
 import {
@@ -39,8 +39,13 @@ export default function RecurringAdd() {
 
   const canSave = name.trim().length > 0 && parseNum(amount) > 0;
 
+  // A double-tap here would create a duplicate rule (→ duplicate auto txns
+  // every period), so latch after the first valid submit.
+  const submitting = useRef(false);
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     addRecurring({
       type,
       name: name.trim(),

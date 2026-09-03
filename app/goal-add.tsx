@@ -1,16 +1,26 @@
 import { useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Keyboard, Pressable, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
 import { Field, HeaderTextButton, TextField } from '@/components/ui/controls';
 import { DateStepper } from '@/components/ui/DateStepper';
 import { ModalScreen } from '@/components/ui/ModalScreen';
+import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { fmt, parseNum, toDateKey } from '@/lib/format';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
-import { fontFamily } from '@/theme/typography';
+import { fontFamily, tabularNums } from '@/theme/typography';
+
+/** Digit-entry rules — identical to the main expense keypad (app/input.tsx). */
+function applyDigit(amount: string, k: string): string {
+  if (k === 'back') return amount.slice(0, -1);
+  if (k === '00') return amount === '' || amount === '0' || amount.length >= 9 ? amount : amount + '00';
+  if (k === '0') return amount === '' || amount === '0' || amount.length >= 10 ? amount : amount + '0';
+  return amount.length >= 10 ? amount : (amount === '0' ? '' : amount) + k;
+}
 
 const ICONS: { id: string; label: string }[] = [
   { id: 'target', label: '기본' },
@@ -24,6 +34,7 @@ const ICONS: { id: string; label: string }[] = [
 export default function GoalAdd() {
   const router = useRouter();
   const toast = useToast();
+  const insets = useSafeAreaInsets();
   const { addGoal } = useStore();
 
   const [name, setName] = useState('');
@@ -33,11 +44,22 @@ export default function GoalAdd() {
     toDateKey(new Date(Date.now() + 90 * 86_400_000)),
   );
   const [icon, setIcon] = useState('target');
+  // 목표 금액은 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)로 입력.
+  const [padVisible, setPadVisible] = useState(false);
+
+  const onKey = (k: string) => setTarget((a) => applyDigit(a, k));
+  const openPad = () => {
+    Keyboard.dismiss();
+    setPadVisible(true);
+  };
 
   const canSave = name.trim().length > 0 && parseNum(target) > 0;
 
+  const submitting = useRef(false); // no duplicate goal on a double-tap
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     addGoal({
       name: name.trim(),
       target: parseNum(target),
@@ -54,18 +76,64 @@ export default function GoalAdd() {
       closeIcon="x"
       onClose={() => router.back()}
       right={<HeaderTextButton label="저장" onPress={save} disabled={!canSave} />}
+      footer={
+        padVisible ? (
+          <NumPad
+            style={{ paddingBottom: insets.bottom + 16 }}
+            onKey={onKey}
+            onBackspace={() => onKey('back')}
+            onDone={() => setPadVisible(false)}
+          />
+        ) : undefined
+      }
     >
       <View style={{ paddingHorizontal: spacing.xl, paddingTop: spacing.xs }}>
         <Field label="이름">
-          <TextField value={name} onChangeText={setName} placeholder="예: 제주도 여행" maxLength={20} />
+          <TextField
+            value={name}
+            onChangeText={setName}
+            onFocus={() => setPadVisible(false)}
+            placeholder="예: 제주도 여행"
+            maxLength={20}
+          />
         </Field>
         <Field label="목표 금액">
-          <TextField
-            keyboardType="number-pad"
-            value={target ? fmt(Number(target)) : ''}
-            onChangeText={(t) => setTarget(String(parseNum(t)))}
-            placeholder="0"
-          />
+          <Pressable
+            onPress={openPad}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              width: '100%',
+              paddingVertical: 12,
+              paddingHorizontal: 14,
+              backgroundColor: padVisible ? colors.primaryLighter : colors.white,
+              borderWidth: 1,
+              borderColor: padVisible ? colors.primaryLight : colors.border,
+              borderRadius: radii.md,
+            }}
+          >
+            <Text
+              style={{
+                flex: 1,
+                fontFamily: fontFamily.semibold,
+                fontSize: 16,
+                color: target ? colors.text : padVisible ? colors.primaryStrong : colors.textMuted,
+                ...tabularNums,
+              }}
+            >
+              {target ? fmt(Number(target)) : '0'}
+            </Text>
+            <Text
+              style={{
+                fontFamily: fontFamily.medium,
+                fontSize: 14,
+                color: padVisible ? colors.primaryStrong : colors.textSub,
+                marginLeft: 6,
+              }}
+            >
+              원
+            </Text>
+          </Pressable>
         </Field>
         <Field label="목표 날짜 (선택)">
           <Pressable

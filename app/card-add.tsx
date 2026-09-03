@@ -1,5 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 
 import { Field, HeaderTextButton, TextField } from '@/components/ui/controls';
@@ -44,8 +44,11 @@ export default function CardAdd() {
 
   const canSave = name.trim().length > 0;
 
+  const submitting = useRef(false); // no duplicate card on a double-tap
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     const payload = {
       name: name.trim(),
       color: { ...CAT_COLOR_PALETTE[colorIdx] },

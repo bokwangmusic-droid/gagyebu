@@ -1,5 +1,5 @@
 import { useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Keyboard, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -55,8 +55,11 @@ export default function PlannedAdd() {
     setPadVisible(true);
   };
 
+  const submitting = useRef(false); // no duplicate planned item on a double-tap
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     addPlanned({
       name: name.trim(),
       amount: parseNum(amount),

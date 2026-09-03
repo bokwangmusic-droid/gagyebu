@@ -4,12 +4,25 @@
 
 import type { RecurringRule } from '@/store/types';
 
+/**
+ * Local date for `day` of (`year`, `month`), clamped to that month's last day.
+ * `new Date(year, month, day)` normalises month overflow (so a year boundary is
+ * exact), and `Math.min(day, lastDay)` keeps a "매월 31일" rule from spilling
+ * into the next month in February / 30-day months instead of firing on the
+ * 28th / 30th.
+ */
+function monthDateClamped(year: number, month: number, day: number): Date {
+  const lastDay = new Date(year, month + 1, 0).getDate();
+  return new Date(year, month, Math.min(Math.max(1, day), lastDay));
+}
+
 /** Next occurrence strictly at/after `from` for the given rule. */
 export function nextOccurrenceAfter(rule: RecurringRule, from: Date): Date | null {
   const f = new Date(from);
   if (rule.frequency === 'monthly') {
-    const target = new Date(f.getFullYear(), f.getMonth(), rule.dayOfMonth ?? 1);
-    if (target < f) target.setMonth(target.getMonth() + 1);
+    const day = rule.dayOfMonth ?? 1;
+    let target = monthDateClamped(f.getFullYear(), f.getMonth(), day);
+    if (target < f) target = monthDateClamped(f.getFullYear(), f.getMonth() + 1, day);
     return target;
   }
   if (rule.frequency === 'weekly') {

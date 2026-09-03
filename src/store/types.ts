@@ -137,6 +137,17 @@ export interface Loan {
   createdAt: string;
 }
 
+/**
+ * A person in a shared (부부/가족) ledger. STEP 10 roadmap skeleton only — the
+ * app is single-user, no UI creates or selects members, and nothing filters
+ * transactions by `Transaction.memberId`. Resolved to one default member at
+ * runtime (see `src/lib/members.ts`).
+ */
+export interface Member {
+  id: string;
+  name: string;
+}
+
 export interface Settings {
   budgetAlert: boolean;
   recurringAlert: boolean;
@@ -144,6 +155,12 @@ export interface Settings {
   quickPaste: boolean;
   profileName: string;
   profileEmail: string;
+  /**
+   * Shared-ledger roadmap field. Absent on every existing install and backup;
+   * kept out of `DEFAULT_SETTINGS` so nothing writes it yet. Read only through
+   * `resolveMembers()`, which supplies the default member when it is missing.
+   */
+  members?: Member[];
 }
 
 export interface AppState {

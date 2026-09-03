@@ -5,17 +5,38 @@ import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { BottomSheet } from '@/components/ui/BottomSheet';
-import { Field, TextField } from '@/components/ui/controls';
+import { Field } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
+import { NumPad } from '@/components/ui/NumPad';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { useToast } from '@/components/ui/Toast';
 import { fmt, formatShortDate, parseNum } from '@/lib/format';
+import { goalStats, type GoalPace } from '@/lib/goal';
 import { useStore } from '@/store/store';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { Goal } from '@/store/types';
+
+/** Digit-entry rules — identical to the main expense keypad (app/input.tsx). */
+function applyDigit(amount: string, k: string): string {
+  if (k === 'back') return amount.slice(0, -1);
+  if (k === '00') return amount === '' || amount === '0' || amount.length >= 9 ? amount : amount + '00';
+  if (k === '0') return amount === '' || amount === '0' || amount.length >= 10 ? amount : amount + '0';
+  return amount.length >= 10 ? amount : (amount === '0' ? '' : amount) + k;
+}
+
+const PACE_LABEL: Record<GoalPace, string> = {
+  ahead: '목표보다 빠른 페이스예요',
+  onTrack: '계획대로 진행 중이에요',
+  behind: '목표 달성을 위해 조금 더 모아야 해요',
+};
+const PACE_COLOR: Record<GoalPace, string> = {
+  ahead: colors.incomeStrong,
+  onTrack: colors.textSub,
+  behind: colors.warningText,
+};
 
 export default function GoalsList() {
   const router = useRouter();
@@ -33,6 +54,7 @@ export default function GoalsList() {
     return () => clearTimeout(t);
   }, [confirmDel]);
 
+  const now = new Date();
   const totalSaved = goals.reduce((s, g) => s + g.saved, 0);
 
   const handleDelete = (id: string) => {
@@ -48,6 +70,17 @@ export default function GoalsList() {
     setMoveFor(g);
     setMoveMode(mode);
     setMoveAmount('');
+  };
+
+  // Amount is entered with the app's custom keypad (NumPad), not the OS keyboard.
+  const onMoveKey = (k: string) => {
+    if (!moveFor) return;
+    setMoveAmount((a) => {
+      const next = applyDigit(a, k);
+      return moveMode === 'out' && parseNum(next) > moveFor.saved
+        ? String(moveFor.saved)
+        : next;
+    });
   };
 
   const doMove = () => {
@@ -121,8 +154,8 @@ export default function GoalsList() {
         />
       ) : (
         goals.map((g) => {
-          const pct = g.target > 0 ? Math.round((g.saved / g.target) * 100) : 0;
-          const done = pct >= 100;
+          const st = goalStats(g, now);
+          const dl = st.deadline;
           return (
             <View
               key={g.id}
@@ -158,11 +191,11 @@ export default function GoalsList() {
                       style={{
                         fontFamily: fontFamily.bold,
                         fontSize: 12,
-                        color: done ? colors.incomeText : colors.primaryStrong,
+                        color: st.achieved ? colors.incomeText : colors.primaryStrong,
                         ...tabularNums,
                       }}
                     >
-                      {pct}%
+                      {st.achieved ? '달성' : `${st.progressPct}%`}
                     </Text>
                   </View>
                   <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 14, color: colors.textMuted, ...noPad }}>
@@ -171,7 +204,31 @@ export default function GoalsList() {
                   </Text>
                 </View>
               </View>
-              <ProgressBar percent={pct} size="md" style={{ marginTop: spacing.md }} />
+              <ProgressBar percent={st.progressPct} size="md" style={{ marginTop: spacing.md }} />
+
+              {/* deadline-driven guidance: 월 필요 저축액 → 현재 페이스,
+                  or an 'achieved' / 'past deadline' fallback. Hidden entirely
+                  when the goal has no deadline. */}
+              {st.achieved ? (
+                <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.incomeText, marginTop: spacing.sm }}>
+                  목표 달성 🎉
+                </Text>
+              ) : dl?.past ? (
+                <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, marginTop: spacing.sm }}>
+                  목표일이 지났어요 · 현재 {st.progressPct}% 달성
+                </Text>
+              ) : dl && dl.requiredMonthlySaving != null ? (
+                <View style={{ marginTop: spacing.sm, gap: 2 }}>
+                  <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.primaryStrong, ...tabularNums }}>
+                    목표일까지 매월 약 {fmt(dl.requiredMonthlySaving)}원
+                  </Text>
+                  {dl.pace ? (
+                    <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: PACE_COLOR[dl.pace] }}>
+                      {PACE_LABEL[dl.pace]}
+                    </Text>
+                  ) : null}
+                </View>
+              ) : null}
               <View style={{ flexDirection: 'row', gap: 6, marginTop: spacing.md, justifyContent: 'flex-end' }}>
                 {g.saved > 0 && (
                   <Pressable
@@ -237,16 +294,41 @@ export default function GoalsList() {
             {moveMode === 'in' ? ` · 목표 ${fmt(moveFor.target)}원` : ' 에서 뺄 금액을 입력하세요'}
           </Text>
           <Field label={moveMode === 'in' ? '얼마 넣을까요?' : '얼마 뺄까요?'}>
-            <TextField
-              keyboardType="number-pad"
-              autoFocus
-              value={moveAmount ? fmt(Number(moveAmount)) : ''}
-              onChangeText={(t) => {
-                const n = parseNum(t);
-                setMoveAmount(String(moveMode === 'out' ? Math.min(n, moveFor.saved) : n));
+            <View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                width: '100%',
+                paddingVertical: 12,
+                paddingHorizontal: 14,
+                backgroundColor: colors.primaryLighter,
+                borderWidth: 1,
+                borderColor: colors.primaryLight,
+                borderRadius: radii.md,
               }}
-              placeholder="0"
-            />
+            >
+              <Text
+                style={{
+                  flex: 1,
+                  fontFamily: fontFamily.semibold,
+                  fontSize: 16,
+                  color: moveAmount ? colors.text : colors.primaryStrong,
+                  ...tabularNums,
+                }}
+              >
+                {moveAmount ? fmt(Number(moveAmount)) : '0'}
+              </Text>
+              <Text
+                style={{
+                  fontFamily: fontFamily.medium,
+                  fontSize: 14,
+                  color: colors.primaryStrong,
+                  marginLeft: 6,
+                }}
+              >
+                원
+              </Text>
+            </View>
           </Field>
           {moveMode === 'out' && (
             <Pressable
@@ -263,6 +345,12 @@ export default function GoalsList() {
             label={moveMode === 'in' ? '입금하기' : '출금하기'}
             onPress={doMove}
             disabled={!parseNum(moveAmount)}
+          />
+          <NumPad
+            style={{ marginHorizontal: -spacing.xl, marginTop: spacing.lg }}
+            onKey={onMoveKey}
+            onBackspace={() => onMoveKey('back')}
+            onDone={doMove}
           />
         </BottomSheet>
       )}

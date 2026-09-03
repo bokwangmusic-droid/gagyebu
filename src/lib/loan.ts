@@ -38,11 +38,18 @@ export function splitPayment(
   return { interestPart, principalPart };
 }
 
-/** Scheduled payoff date = startDate + termMonths. */
+/**
+ * Scheduled payoff date = startDate + termMonths. Uses the `Date(year, month,
+ * day)` constructor (which normalises month overflow) plus a last-day clamp,
+ * so a loan that starts on the 31st doesn't roll its estimated payoff into the
+ * wrong month via `setMonth`.
+ */
 export function payoffDate(startDate: string, termMonths: number): Date {
   const d = new Date(`${startDate}T00:00:00`);
-  d.setMonth(d.getMonth() + termMonths);
-  return d;
+  const year = d.getFullYear();
+  const month = d.getMonth() + termMonths;
+  const lastDay = new Date(year, month + 1, 0).getDate();
+  return new Date(year, month, Math.min(d.getDate(), lastDay));
 }
 
 /** "2029.03" */

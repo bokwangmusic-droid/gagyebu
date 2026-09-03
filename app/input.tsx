@@ -2,7 +2,7 @@ import * as Clipboard from 'expo-clipboard';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Keyboard,
@@ -230,8 +230,13 @@ export default function InputModal() {
     setAmount((a) => (a.length >= 10 ? a : (a === '0' ? '' : a) + k));
   };
 
+  // Guards against a fast double-tap on 저장 creating two transactions
+  // (router.back() is async, so the button stays live for a frame).
+  const submitting = useRef(false);
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     let dateISO: string;
     if (editing && toDateKey(editing.date) === selectedDate) {
       dateISO = editing.date; // date unchanged — keep original time of day

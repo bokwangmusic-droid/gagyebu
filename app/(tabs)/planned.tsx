@@ -1,5 +1,5 @@
 import { useRouter } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, Text, TextInput, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
@@ -28,6 +28,10 @@ export default function PlannedScreen() {
   const toast = useToast();
   const { planned, deletePlanned, markPlannedDone, notes, setNotes, customCats } = useStore();
   const [tab, setTab] = useState<'planned' | 'notes'>('planned');
+  // "✓ 지출 완료" prepends a new transaction each call and the row only
+  // disappears on re-render — latch per id so a fast double-tap can't create
+  // two transactions from one planned item.
+  const doneIds = useRef<Set<string>>(new Set());
 
   const now = new Date();
   now.setHours(0, 0, 0, 0);
@@ -154,6 +158,8 @@ export default function PlannedScreen() {
     ]);
   }
   function done(p: PlannedExpense) {
+    if (doneIds.current.has(p.id)) return;
+    doneIds.current.add(p.id);
     markPlannedDone(p);
     toast.show('지출로 옮겼어요');
   }

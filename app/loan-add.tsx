@@ -1,5 +1,5 @@
 import { useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Text, View } from 'react-native';
 
 import { ChipSelect, Field, HeaderTextButton, SegmentedTabs, TextField } from '@/components/ui/controls';
@@ -37,8 +37,11 @@ export default function LoanAdd() {
   const monthly = p > 0 && n > 0 ? scheduledPayment(p, r, n, repayType) : 0;
   const canSave = name.trim().length > 0 && p > 0 && n > 0;
 
+  const submitting = useRef(false); // no duplicate loan on a double-tap
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     addLoan({
       name: name.trim(),
       lender: lender.trim(),
