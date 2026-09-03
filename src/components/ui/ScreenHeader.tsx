@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Pressable, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -10,21 +10,27 @@ export function ScreenHeader({
   title,
   right,
   onBack,
+  containerStyle,
 }: {
   title: string;
   right?: ReactNode;
   onBack?: () => void;
+  /** Optional override for the header wrapper (e.g. tighter vertical padding). */
+  containerStyle?: StyleProp<ViewStyle>;
 }) {
   return (
     <View
-      style={{
-        flexDirection: 'row',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        paddingHorizontal: spacing.xl,
-        paddingTop: spacing.lg,
-        paddingBottom: spacing.md,
-      }}
+      style={[
+        {
+          flexDirection: 'row',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          paddingHorizontal: spacing.xl,
+          paddingTop: spacing.lg,
+          paddingBottom: spacing.md,
+        },
+        containerStyle,
+      ]}
     >
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1 }}>
         {onBack && (

@@ -87,6 +87,7 @@ export default function HomeScreen() {
     <Screen>
       <ScreenHeader
         title={formatMonthLabel()}
+        containerStyle={{ paddingTop: spacing.sm + 2, paddingBottom: spacing.sm }}
         right={
           <View style={{ flexDirection: 'row', gap: spacing.sm }}>
             <HeaderIconButton icon="calendar" onPress={() => router.push('/calendar')} />
@@ -155,28 +156,28 @@ export default function HomeScreen() {
 
       {/* Balance card */}
       <Pressable onPress={() => (totalBudget > 0 ? router.push('/(tabs)/budget') : router.push('/all-transactions'))}>
-        <Card>
+        <Card style={{ paddingVertical: 13, marginBottom: spacing.md }}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
             <Text style={{ fontFamily: fontFamily.medium, fontSize: 12, color: colors.textSub }}>
               이번 달 {totalBudget > 0 ? '남은 예산' : '지출 합계'}
             </Text>
             <AppIcon name="chev-right" size={16} color={colors.textFaint} />
           </View>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, marginTop: 6 }}>
-            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 34, letterSpacing: -1, color: colors.text, ...tabularNums }}>
+          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, marginTop: 2 }}>
+            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 34, lineHeight: 38, letterSpacing: -1, color: colors.text, ...noPad, ...tabularNums }}>
               {fmt(totalBudget > 0 ? remaining : expense)}
             </Text>
-            <Text style={{ fontFamily: fontFamily.medium, fontSize: 16, color: colors.textSub, marginBottom: 4 }}>원</Text>
+            <Text style={{ fontFamily: fontFamily.medium, fontSize: 16, color: colors.textSub, ...noPad }}>원</Text>
           </View>
 
           {totalBudget > 0 ? (
             <>
               <ProgressBar
                 percent={percent}
-                style={{ marginTop: spacing.lg }}
+                style={{ marginTop: 10 }}
                 fillColor={percent >= 100 ? colors.expenseSolid : percent >= 80 ? colors.warning : undefined}
               />
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 }}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 }}>
                 <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, ...tabularNums }}>
                   {fmt(expense)}원 사용 <Text style={{ color: colors.textFaint }}>/ {fmt(totalBudget)}원</Text>
                 </Text>
@@ -184,7 +185,7 @@ export default function HomeScreen() {
               </View>
             </>
           ) : (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: spacing.md }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: 6 }}>
               <Text style={{ flex: 1, fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
                 탭해서 이번 달 전체 내역 보기 →
               </Text>
@@ -200,18 +201,18 @@ export default function HomeScreen() {
       </Pressable>
 
       {/* Income / Expense pair */}
-      <View style={{ flexDirection: 'row', gap: 10, marginHorizontal: spacing.lg, marginBottom: spacing.lg }}>
+      <View style={{ flexDirection: 'row', gap: 10, marginHorizontal: spacing.lg, marginBottom: spacing.md }}>
         <StatTile label="수입" value={income} tone="income" onPress={() => goToTxns('income')} />
         <StatTile label="지출" value={expense} tone="expense" onPress={() => goToTxns('expense')} />
       </View>
 
       {/* 이번 달 인사이트 — rule-based, max 3, hidden when nothing to say */}
       {insights.length > 0 && (
-        <Card>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginBottom: spacing.md }}>
+        <Card style={{ paddingVertical: spacing.lg, marginBottom: spacing.md }}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginBottom: spacing.sm }}>
             이번 달 인사이트
           </Text>
-          <View style={{ gap: 12 }}>
+          <View style={{ gap: 10 }}>
             {insights.map((ins) => {
               const t = insightTone(ins.tone);
               return (
@@ -257,7 +258,7 @@ export default function HomeScreen() {
       {/* 사용월 기준 예상 카드값 — only when there's something to show */}
       {cardBillRows.length > 0 && (
         <Pressable onPress={() => router.push('/cards')}>
-          <Card>
+          <Card style={{ paddingVertical: spacing.lg, marginBottom: spacing.md }}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
                 <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>사용월 기준 예상 카드값</Text>
@@ -287,8 +288,8 @@ export default function HomeScreen() {
       {/* Category breakdown */}
       {topCats.length > 0 && (
         <Pressable onPress={() => router.push('/(tabs)/stats')}>
-          <Card>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.lg }}>
+          <Card style={{ paddingVertical: spacing.lg, marginBottom: spacing.md }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
                 <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>카테고리별 지출</Text>
                 <AppIcon name="chev-right" size={14} color={colors.textFaint} />
@@ -349,22 +350,22 @@ export default function HomeScreen() {
       </Pressable>
 
       {recent.length === 0 ? (
-        <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.xl, paddingBottom: 40 }}>
+        <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.md, paddingBottom: spacing.xxl }}>
           <Pressable
             onPress={() => router.push('/input')}
             style={{
-              width: 72,
-              height: 72,
+              width: 56,
+              height: 56,
               borderRadius: radii.sheet,
               backgroundColor: colors.primary,
               alignItems: 'center',
               justifyContent: 'center',
-              marginBottom: 18,
+              marginBottom: 12,
             }}
           >
-            <AppIcon name="plus" size={30} color={colors.white} strokeWidth={2.5} />
+            <AppIcon name="plus" size={24} color={colors.white} strokeWidth={2.5} />
           </Pressable>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 6 }}>아직 기록이 없어요</Text>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 4 }}>아직 기록이 없어요</Text>
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub, textAlign: 'center' }}>
             첫 지출·수입을 기록해볼까요?
           </Text>
@@ -446,7 +447,7 @@ function StatTile({
       onPress={onPress}
       style={{
         flex: 1,
-        paddingVertical: spacing.lg - 2,
+        paddingVertical: spacing.md - 1,
         paddingHorizontal: spacing.lg,
         backgroundColor: colors.card,
         borderWidth: 1,
@@ -477,7 +478,7 @@ function StatTile({
         </View>
         <AppIcon name="chev-right" size={14} color={colors.textFaint} />
       </View>
-      <Text style={{ fontFamily: fontFamily.bold, fontSize: 18, color: colors.text, marginTop: 6, letterSpacing: -0.4, ...tabularNums }}>
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 18, color: colors.text, marginTop: 4, letterSpacing: -0.4, ...tabularNums }}>
         {fmt(value)}
       </Text>
     </Pressable>

@@ -5,6 +5,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Keyboard,
   KeyboardAvoidingView,
   Pressable,
   ScrollView,
@@ -193,6 +194,26 @@ export default function InputModal() {
     void Haptics.selectionAsync().catch(() => {});
   };
 
+  /**
+   * Switch focus from a system-keyboard field (memo / 분할 금액 / 할부 개월)
+   * to the in-app amount keypad. Dismissing the soft keyboard first lets
+   * Android/Galaxy tear it down cleanly instead of stacking it under our
+   * custom pad; on iOS it's a graceful no-op when nothing is focused.
+   */
+  const openAmountPad = () => {
+    Keyboard.dismiss();
+    setPadVisible(true);
+  };
+
+  /**
+   * Called on touch-down of the memo field. Collapsing the custom keypad
+   * *before* the TextInput takes focus makes the pad → 일반 키보드 hand-off
+   * sequential rather than a jarring overlap on Galaxy.
+   */
+  const collapsePadForKeyboard = () => {
+    setPadVisible(false);
+  };
+
   const onKey = (k: string) => {
     if (k === 'back') {
       setAmount((a) => a.slice(0, -1));
@@ -331,6 +352,17 @@ export default function InputModal() {
         ? colors.expenseText
         : colors.incomeStrong;
 
+  // The main amount has no real caret, so `padVisible` (the custom keypad is
+  // open ⇔ nothing else is focused, since every TextInput's onFocus/onTouchStart
+  // and openAmountPad's Keyboard.dismiss() keep the two mutually exclusive) is
+  // the single source of truth for "amount is being edited right now".
+  const amountActive = padVisible;
+  // While active & still empty, tint the placeholder "0" purple so it reads as
+  // a ready input target; once a value exists keep the semantic expense/income
+  // colour untouched.
+  const amountTextColor =
+    amount === '' && amountActive ? colors.primaryStrong : amountColor;
+
   return (
     <View style={[styles.root, { paddingTop: insets.top + spacing.sm }]}>
       {/* Header: close · date pill */}
@@ -354,6 +386,14 @@ export default function InputModal() {
         )}
       </View>
 
+      {/* One vertical scroll for the whole form — only the header above and the
+          keypad below stay fixed. */}
+      <ScrollView
+        style={styles.formScroll}
+        contentContainerStyle={styles.formContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
       {/* Type tabs */}
       <View style={styles.typeTabs}>
         {(['expense', 'income'] as const).map((t) => {
@@ -451,26 +491,26 @@ export default function InputModal() {
         </>
       )}
 
-      {/* Flexible middle: amount · memo · categories */}
-      <View style={styles.middle}>
+      {/* amount · memo · split · categories · payment — all in the shared scroll */}
         <Pressable
-          style={styles.amountRow}
-          onPress={() => setPadVisible(true)}
+          style={[styles.amountRow, amountActive && styles.amountRowActive]}
+          onPress={openAmountPad}
         >
-          <Text style={[styles.amount, { color: amountColor }]}>
+          <Text style={[styles.amount, { color: amountTextColor }]}>
             {amount === ''
               ? '0'
               : `${type === 'expense' ? '− ' : '+ '}${displayAmount}`}
           </Text>
-          <Text style={styles.unit}>원</Text>
+          <Text style={[styles.unit, amountActive && styles.unitActive]}>원</Text>
         </Pressable>
 
-        <View style={styles.memoRow}>
+        <View style={styles.memoRow} onTouchStart={collapsePadForKeyboard}>
           <AppIcon name="edit" size={16} color={colors.textMuted} />
           <TextInput
             value={memo}
             onChangeText={setMemo}
             onFocus={() => setPadVisible(false)}
+            keyboardType="default"
             placeholder="메모 (선택)"
             placeholderTextColor={colors.textMuted}
             maxLength={40}
@@ -497,11 +537,6 @@ export default function InputModal() {
           </Pressable>
         )}
 
-        <ScrollView
-          style={styles.lowerScroll}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-        >
           {!splitOn ? (
             <>
               <Text style={styles.catLabel}>카테고리</Text>
@@ -782,8 +817,7 @@ export default function InputModal() {
               )}
             </View>
           )}
-        </ScrollView>
-      </View>
+      </ScrollView>
 
       {/* Keypad / collapsed bar */}
       {padVisible ? (
@@ -863,7 +897,7 @@ export default function InputModal() {
             { paddingBottom: insets.bottom + 12 },
           ]}
         >
-          <Pressable onPress={() => setPadVisible(true)} style={styles.reopenBtn}>
+          <Pressable onPress={openAmountPad} style={styles.reopenBtn}>
             <AppIcon name="chev-up" size={20} color={colors.textSub} />
           </Pressable>
           <Pressable
@@ -1175,15 +1209,32 @@ const styles = StyleSheet.create({
     color: colors.expenseText,
   },
 
-  middle: { flex: 1, justifyContent: 'flex-start', paddingTop: spacing.xs },
+  // The whole form scrolls as one; `formContent` reserves room at the bottom so
+  // the last field (결제수단 / 카드 / 할부) clears the fixed keypad and can be
+  // pulled fully into view, not just left half-hidden behind it.
+  formScroll: { flex: 1 },
+  formContent: { flexGrow: 1, paddingTop: spacing.xs, paddingBottom: 32 },
 
   amountRow: {
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'baseline',
-    paddingHorizontal: spacing.xxl,
+    marginHorizontal: spacing.lg,
+    paddingHorizontal: spacing.lg,
     paddingTop: 22,
     paddingBottom: spacing.sm,
+    // 1px transparent border kept in the base style so toggling the active
+    // state never shifts the layout by a pixel.
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  // Active = the custom keypad is open. Faint lavender wash + a very light
+  // lavender hairline — softer than a full primary border so it reads as a
+  // state change, not a second input card. The purple "0"/"원" carry the cue.
+  amountRowActive: {
+    backgroundColor: colors.primaryLighter,
+    borderColor: colors.primaryLight,
   },
   amount: {
     fontFamily: fontFamily.extrabold,
@@ -1196,6 +1247,9 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: colors.textSub,
     marginLeft: 8,
+  },
+  unitActive: {
+    color: colors.primaryStrong,
   },
 
   memoRow: {
@@ -1227,8 +1281,8 @@ const styles = StyleSheet.create({
     letterSpacing: 0.2,
     color: colors.textSub,
   },
-  // `flexGrow:0` keeps the horizontal strip at its content height inside the
-  // flex:1 `middle`; without it the row (and the active pill's fill) stretch.
+  // `flexGrow:0` keeps this horizontal strip at its content height inside the
+  // form scroll; without it the row (and the active pill's fill) stretch.
   catScroll: { flexGrow: 0, flexShrink: 0 },
   catPicker: {
     paddingHorizontal: spacing.lg,
@@ -1387,7 +1441,6 @@ const styles = StyleSheet.create({
   },
 
   /* ---- payment method / card / 할부 ---- */
-  lowerScroll: { flex: 1 },
   paySection: {
     marginTop: spacing.sm,
     paddingBottom: spacing.md,
