@@ -21,6 +21,11 @@ import { fontFamily } from '@/theme/typography';
  * 저장 button inside the same sheet). That copy is left untouched on purpose
  * so extracting this component can't regress the primary expense-input
  * screen — keep the two visually in sync if either changes.
+ *
+ * `decimal` is an opt-in that swaps the "00" key for a "." key (used by the
+ * 대출 추가 이자율 field). It only changes which key renders in that one slot
+ * and which string `onKey` emits there — every money screen that doesn't pass
+ * `decimal` gets the exact same pad as before.
  */
 const KEY_HEIGHT = 52;
 const KEY_GAP = 6;
@@ -30,13 +35,16 @@ export function NumPad({
   onBackspace,
   onDone,
   style,
+  decimal = false,
 }: {
-  /** A pressed digit — '0'–'9' or '00'. */
+  /** A pressed key — '0'–'9', '00', or '.' when `decimal` is set. */
   onKey: (digit: string) => void;
   onBackspace: () => void;
   onDone: () => void;
   /** Extra container style, e.g. safe-area bottom padding. */
   style?: StyleProp<ViewStyle>;
+  /** Opt-in: replace the "00" key with a "." key for decimal entry. */
+  decimal?: boolean;
 }) {
   return (
     <View style={[styles.numPad, style]}>
@@ -55,7 +63,11 @@ export function NumPad({
             </View>
           ))}
           <View style={{ flexDirection: 'row', gap: KEY_GAP }}>
-            <NumKey label="00" ghost onPress={() => onKey('00')} />
+            {decimal ? (
+              <NumKey label="." onPress={() => onKey('.')} />
+            ) : (
+              <NumKey label="00" ghost onPress={() => onKey('00')} />
+            )}
             <NumKey label="0" onPress={() => onKey('0')} />
             <View style={{ flex: 1 }} />
           </View>

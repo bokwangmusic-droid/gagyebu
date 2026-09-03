@@ -36,6 +36,8 @@ export function EmptyState({ title, sub, onPress, cta, icon }: EmptyStateProps) 
         <Pressable
           onPress={onPress}
           disabled={!onPress}
+          accessibilityRole="button"
+          accessibilityLabel={cta ?? title}
           style={[
             {
               width: 72,

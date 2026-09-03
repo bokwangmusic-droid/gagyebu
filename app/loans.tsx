@@ -1,6 +1,6 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
@@ -51,8 +51,13 @@ export default function LoansList() {
     }
   };
 
+  // A double-tap on "상환 기록" would append two payment records (and reduce
+  // 원금 twice) before the sheet closes — latch until the sheet reopens.
+  const submitting = useRef(false);
+
   const openPay = (ln: Loan) => {
     const v = viewLoan(ln);
+    submitting.current = false;
     setPayFor(ln);
     setPayAmount(v.remaining > 0 ? String(Math.min(v.scheduled, v.remaining)) : '');
     setPayDate(toDateKey(new Date()));
@@ -61,11 +66,11 @@ export default function LoansList() {
 
   const doPay = () => {
     const n = parseNum(payAmount);
-    if (n > 0 && payFor) {
-      addLoanPayment(payFor.id, { amount: n, date: payDate, memo: payMemo.trim() || undefined });
-      toast.show('상환 내역을 기록했어요');
-      setPayFor(null);
-    }
+    if (submitting.current || n <= 0 || !payFor) return;
+    submitting.current = true;
+    addLoanPayment(payFor.id, { amount: n, date: payDate, memo: payMemo.trim() || undefined });
+    toast.show('상환 내역을 기록했어요');
+    setPayFor(null);
   };
 
   const paySplit = useMemo(() => {

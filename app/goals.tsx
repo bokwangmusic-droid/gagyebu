@@ -1,6 +1,6 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
@@ -66,7 +66,11 @@ export default function GoalsList() {
     }
   };
 
+  // Latch so a fast double-tap on 입금/출금 하기 can't fire the move twice.
+  const submitting = useRef(false);
+
   const openMove = (g: Goal, mode: 'in' | 'out') => {
+    submitting.current = false;
     setMoveFor(g);
     setMoveMode(mode);
     setMoveAmount('');
@@ -85,7 +89,8 @@ export default function GoalsList() {
 
   const doMove = () => {
     const n = parseNum(moveAmount);
-    if (n <= 0 || !moveFor) return;
+    if (submitting.current || n <= 0 || !moveFor) return;
+    submitting.current = true;
     const next =
       moveMode === 'in' ? moveFor.saved + n : Math.max(0, moveFor.saved - n);
     updateGoal(moveFor.id, { saved: next });
@@ -184,11 +189,15 @@ export default function GoalsList() {
                 </View>
                 <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
                   <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                    <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, lineHeight: 18, color: colors.text, ...noPad }}>
+                    <Text
+                      numberOfLines={1}
+                      style={{ flex: 1, fontFamily: fontFamily.bold, fontSize: 15, lineHeight: 18, color: colors.text, ...noPad }}
+                    >
                       {g.name}
                     </Text>
                     <Text
                       style={{
+                        marginLeft: 8,
                         fontFamily: fontFamily.bold,
                         fontSize: 12,
                         color: st.achieved ? colors.incomeText : colors.primaryStrong,

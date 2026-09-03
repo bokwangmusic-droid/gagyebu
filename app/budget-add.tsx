@@ -77,8 +77,12 @@ export default function BudgetAdd() {
   const total = entries.reduce((sum, [, v]) => sum + v, 0);
   const canSave = entries.length > 0;
 
+  // No duplicate save / double router.back() on a fast double-tap.
+  const submitting = useRef(false);
+
   const save = () => {
-    if (!canSave) return;
+    if (submitting.current || !canSave) return;
+    submitting.current = true;
     entries.forEach(([catId, v]) => setBudget(catId, v));
     toast.show(`예산 ${entries.length}개를 저장했어요`);
     router.back();

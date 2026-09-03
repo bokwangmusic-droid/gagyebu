@@ -34,7 +34,12 @@ export function ScreenHeader({
     >
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1 }}>
         {onBack && (
-          <Pressable onPress={onBack} hitSlop={12}>
+          <Pressable
+            onPress={onBack}
+            hitSlop={12}
+            accessibilityRole="button"
+            accessibilityLabel="뒤로"
+          >
             <AppIcon name="chev-left" size={24} color={colors.text} />
           </Pressable>
         )}
@@ -48,18 +53,30 @@ export function ScreenHeader({
 }
 
 /** Round outline icon button used in tab-screen headers (web `.icon-btn`). */
+const HEADER_ICON_LABEL: Record<string, string> = {
+  calendar: '달력',
+  refresh: '반복 지출·수입',
+  target: '저축 목표',
+  plus: '추가',
+};
+
 export function HeaderIconButton({
   icon,
   onPress,
   primary,
+  label,
 }: {
   icon: string;
   onPress: () => void;
   primary?: boolean;
+  /** Screen-reader label; falls back to a per-icon default, then the icon name. */
+  label?: string;
 }) {
   return (
     <Pressable
       onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={label ?? HEADER_ICON_LABEL[icon] ?? icon}
       style={{
         width: 36,
         height: 36,

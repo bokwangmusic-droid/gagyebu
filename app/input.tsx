@@ -5,6 +5,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  BackHandler,
   Keyboard,
   KeyboardAvoidingView,
   Pressable,
@@ -18,6 +19,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
 import { CalendarSheet } from '@/components/ui/CalendarSheet';
+import { useToast } from '@/components/ui/Toast';
 import { getAllCats, getCat, type TxnType } from '@/data/categories';
 import { installmentPerMonth } from '@/lib/card';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
@@ -73,6 +75,7 @@ function dateLabel(key: string): string {
 export default function InputModal() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const toast = useToast();
   const params = useLocalSearchParams<{ id?: string }>();
   const {
     transactions,
@@ -230,6 +233,24 @@ export default function InputModal() {
     setAmount((a) => (a.length >= 10 ? a : (a === '0' ? '' : a) + k));
   };
 
+  // Android hardware back: close an open sub-sheet/panel first so a stray
+  // back-press doesn't drop the whole input screen (losing the draft amount).
+  useEffect(() => {
+    if (!showPaste && !showQuick) return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (showPaste) {
+        setShowPaste(false);
+        return true;
+      }
+      if (showQuick) {
+        setShowQuick(false);
+        return true;
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [showPaste, showQuick]);
+
   // Guards against a fast double-tap on 저장 creating two transactions
   // (router.back() is async, so the button stays live for a frame).
   const submitting = useRef(false);
@@ -277,6 +298,7 @@ export default function InputModal() {
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
       () => {},
     );
+    toast.show(isEdit ? '수정했어요' : '저장했어요');
     router.back();
   };
 
@@ -501,7 +523,12 @@ export default function InputModal() {
           style={[styles.amountRow, amountActive && styles.amountRowActive]}
           onPress={openAmountPad}
         >
-          <Text style={[styles.amount, { color: amountTextColor }]}>
+          <Text
+            style={[styles.amount, { color: amountTextColor }]}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.5}
+          >
             {amount === ''
               ? '0'
               : `${type === 'expense' ? '− ' : '+ '}${displayAmount}`}
@@ -1246,6 +1273,11 @@ const styles = StyleSheet.create({
     fontSize: 44,
     letterSpacing: -1,
     fontVariant: ['tabular-nums'],
+    // Let very large amounts (e.g. 1,000,000,000+) scale down instead of
+    // pushing "원" off-screen. `flexShrink` bounds the width so
+    // adjustsFontSizeToFit has room to work.
+    flexShrink: 1,
+    textAlign: 'center',
   },
   unit: {
     fontFamily: fontFamily.semibold,
