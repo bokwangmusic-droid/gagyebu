@@ -7,6 +7,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { ToastProvider, useToast } from '@/components/ui/Toast';
+import { maybeAutoBackup } from '@/lib/backup';
 import { computeMissedOccurrences } from '@/lib/recurring';
 import { StoreProvider, useStore } from '@/store/store';
 import { colors } from '@/theme/tokens';
@@ -84,6 +85,12 @@ function BootEffects() {
       const rest = due.length > 1 ? ` 외 ${due.length - 1}건` : '';
       setTimeout(() => toast.show(`📅 「${due[0].name}」 예정일이에요${rest}`), 900);
     }
+
+    // Daily local snapshot. Deferred well past first paint and fully
+    // self-contained (every failure is swallowed inside maybeAutoBackup), so
+    // it can neither slow down nor break app start. `ran` already guards it to
+    // once per session; the daily key inside guards it to once per calendar day.
+    setTimeout(() => void maybeAutoBackup(), 2500);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hydrated, seenOnboarding]);
 

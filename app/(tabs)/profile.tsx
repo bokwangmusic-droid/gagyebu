@@ -10,6 +10,7 @@ import { Screen } from '@/components/ui/Screen';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { useToast } from '@/components/ui/Toast';
 import { EXPENSE_CATS, INCOME_CATS } from '@/data/categories';
+import { createBackup } from '@/lib/backup';
 import { cardBillingForMonth } from '@/lib/card';
 import { fmt } from '@/lib/format';
 import { useStore } from '@/store/store';
@@ -19,8 +20,21 @@ import { fontFamily, noPad } from '@/theme/typography';
 export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
-  const { settings, setSettings, recurring, goals, loans, cards, customCats, transactions, budgets, resetAll } =
-    useStore();
+  const {
+    settings,
+    setSettings,
+    recurring,
+    goals,
+    loans,
+    cards,
+    customCats,
+    catOrder,
+    transactions,
+    budgets,
+    planned,
+    notes,
+    resetAll,
+  } = useStore();
   const cardBillTotal = cardBillingForMonth(transactions, cards).total;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -38,8 +52,30 @@ export default function ProfileScreen() {
           text: '전부 삭제',
           style: 'destructive',
           onPress: () => {
-            resetAll();
-            toast.show('모든 데이터를 초기화했어요');
+            void (async () => {
+              // Snapshot the whole dataset first; only wipe if it was durably
+              // saved. Reuses src/lib/backup.ts (createBackup returns null when
+              // the body write / read-back verify fails).
+              const safety = await createBackup('before_reset', {
+                transactions,
+                budgets,
+                goals,
+                recurring,
+                planned,
+                loans,
+                cards,
+                notes,
+                customCats,
+                catOrder,
+                settings,
+              });
+              if (!safety) {
+                toast.show('안전 백업을 만들지 못해 초기화를 취소했어요');
+                return;
+              }
+              resetAll();
+              toast.show('모든 데이터를 초기화했어요');
+            })();
           },
         },
       ],
