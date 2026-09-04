@@ -72,6 +72,39 @@ function dateLabel(key: string): string {
   return `${md} (${weekdayKo(dt)})`;
 }
 
+/**
+ * Which numeric field the one shared inline keypad is currently editing.
+ * `null` = keypad collapsed. The main amount, every 분할 금액 row and the
+ * 할부 "직접" box all route through this — no field ever opens the OS keyboard.
+ */
+type NumTarget =
+  | { kind: 'main' }
+  | { kind: 'split'; index: number }
+  | { kind: 'installment' };
+
+/**
+ * Main / 분할 금액 digit rules — 10-digit cap, one leading zero stripped,
+ * "00" shortcut. Lifted verbatim from the original inline `onKey`, so the main
+ * amount keypad behaves byte-for-byte as before.
+ */
+function applyAmountKey(cur: string, k: string): string {
+  if (k === 'back') return cur.slice(0, -1);
+  if (k === '00') return cur === '' || cur === '0' || cur.length >= 9 ? cur : cur + '00';
+  if (k === '0') return cur === '' || cur === '0' || cur.length >= 10 ? cur : cur + '0';
+  return cur.length >= 10 ? cur : (cur === '0' ? '' : cur) + k;
+}
+
+/**
+ * 할부 개월 digit rules — digits only, 2-digit cap. Same range the old text
+ * field allowed (`replace(/[^0-9]/g,'').slice(0,2)`); the "2개월 이상" check
+ * still lives at save, and no artificial maximum is introduced.
+ */
+function applyMonthsKey(cur: string, k: string): string {
+  if (k === 'back') return cur.slice(0, -1);
+  if (k === '00') return cur; // a month count is 1–2 digits — ignore "00"
+  return cur.length >= 2 ? cur : cur + k;
+}
+
 export default function InputModal() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -96,7 +129,13 @@ export default function InputModal() {
   const [category, setCategory] = useState(editing?.category ?? 'food');
   const [memo, setMemo] = useState(editing?.memo ?? '');
   const [selectedDate, setSelectedDate] = useState(() => toDateKey(editing?.date ?? new Date()));
-  const [padVisible, setPadVisible] = useState(true);
+
+  // One inline keypad, one active target. `padVisible`/`setPadVisible` are kept
+  // as a thin shim over it so every existing call site ("collapse the pad",
+  // "open the amount pad") keeps working unchanged.
+  const [numTarget, setNumTarget] = useState<NumTarget | null>({ kind: 'main' });
+  const padVisible = numTarget !== null;
+  const setPadVisible = (v: boolean) => setNumTarget(v ? { kind: 'main' } : null);
 
   // Split expense — off by default; a normal single-category entry is unchanged.
   const [splitOn, setSplitOn] = useState(!!editing?.splits?.length);
@@ -186,6 +225,20 @@ export default function InputModal() {
     (!installmentActive || instMonths >= 2);
   const today = toDateKey(new Date());
 
+  // Keep the active numeric target valid: a 분할 금액 row can disappear (split
+  // turned off, row removed, type→수입) and the 할부 "직접" box only exists
+  // while 할부 is on. Fall back to closing the pad, never editing a hidden field.
+  useEffect(() => {
+    if (
+      numTarget?.kind === 'split' &&
+      (!splitOn || numTarget.index >= splits.length)
+    ) {
+      setNumTarget(null);
+    } else if (numTarget?.kind === 'installment' && !installmentActive) {
+      setNumTarget(null);
+    }
+  }, [numTarget, splitOn, splits.length, installmentActive]);
+
   const setSplitRow = (i: number, patch: Partial<SplitDraft>) =>
     setSplits((rows) => rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   // New rows start with no category so the "카테고리를 선택" guard is real.
@@ -217,20 +270,19 @@ export default function InputModal() {
     setPadVisible(false);
   };
 
+  /** Every inline-keypad press is routed to whichever numeric field is active. */
   const onKey = (k: string) => {
-    if (k === 'back') {
-      setAmount((a) => a.slice(0, -1));
-      return;
+    if (!numTarget) return;
+    if (numTarget.kind === 'main') {
+      setAmount((a) => applyAmountKey(a, k));
+    } else if (numTarget.kind === 'split') {
+      const idx = numTarget.index;
+      setSplits((rows) =>
+        rows.map((r, i) => (i === idx ? { ...r, amount: applyAmountKey(r.amount, k) } : r)),
+      );
+    } else {
+      setInstallmentMonths((m) => applyMonthsKey(m, k));
     }
-    if (k === '00') {
-      setAmount((a) => (a === '' || a === '0' || a.length >= 9 ? a : a + '00'));
-      return;
-    }
-    if (k === '0') {
-      setAmount((a) => (a === '' || a === '0' || a.length >= 10 ? a : a + '0'));
-      return;
-    }
-    setAmount((a) => (a.length >= 10 ? a : (a === '0' ? '' : a) + k));
   };
 
   // Android hardware back: close an open sub-sheet/panel first so a stray
@@ -379,11 +431,11 @@ export default function InputModal() {
         ? colors.expenseText
         : colors.incomeStrong;
 
-  // The main amount has no real caret, so `padVisible` (the custom keypad is
-  // open ⇔ nothing else is focused, since every TextInput's onFocus/onTouchStart
-  // and openAmountPad's Keyboard.dismiss() keep the two mutually exclusive) is
-  // the single source of truth for "amount is being edited right now".
-  const amountActive = padVisible;
+  // The main amount has no real caret, so "the keypad is aimed at the main
+  // amount" (`numTarget.kind === 'main'`) is the single source of truth for
+  // "amount is being edited right now". Text fields clear `numTarget` on focus
+  // and 분할/할부 fields retarget it, so the states stay mutually exclusive.
+  const amountActive = numTarget?.kind === 'main';
   // While active & still empty, tint the placeholder "0" purple so it reads as
   // a ready input target; once a value exists keep the semantic expense/income
   // colour untouched.
@@ -624,8 +676,12 @@ export default function InputModal() {
                 <Text style={styles.splitTotalHint}>총 {fmt(total)}원</Text>
               </View>
 
-              {splits.map((row, i) => (
-                <View key={i} style={styles.splitRow}>
+              {splits.map((row, i) => {
+                const splitActive =
+                  numTarget?.kind === 'split' && numTarget.index === i;
+                const hasAmt = !!row.amount && Number(row.amount) > 0;
+                return (
+                <View key={i} style={[styles.splitRow, splitActive && styles.splitRowActive]}>
                   <View style={styles.splitRowTop}>
                     <ScrollView
                       horizontal
@@ -673,20 +729,34 @@ export default function InputModal() {
                       <AppIcon name="trash" size={16} color={colors.expenseText} />
                     </Pressable>
                   </View>
-                  <View style={styles.splitAmountRow}>
-                    <TextInput
-                      value={row.amount && Number(row.amount) > 0 ? fmt(Number(row.amount)) : ''}
-                      onChangeText={(t) => setSplitRow(i, { amount: String(parseNum(t)) })}
-                      onFocus={() => setPadVisible(false)}
-                      keyboardType="number-pad"
-                      placeholder="0"
-                      placeholderTextColor={colors.textMuted}
-                      style={styles.splitAmountInput}
-                    />
-                    <Text style={styles.splitAmountUnit}>원</Text>
-                  </View>
+                  <Pressable
+                    style={styles.splitAmountRow}
+                    onPress={() => {
+                      Keyboard.dismiss();
+                      setNumTarget({ kind: 'split', index: i });
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.splitAmountInput,
+                        !hasAmt && { color: colors.textMuted },
+                        splitActive && { color: colors.primaryStrong },
+                      ]}
+                    >
+                      {hasAmt ? fmt(Number(row.amount)) : '0'}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.splitAmountUnit,
+                        splitActive && { color: colors.primaryStrong },
+                      ]}
+                    >
+                      원
+                    </Text>
+                  </Pressable>
                 </View>
-              ))}
+                );
+              })}
 
               <Pressable onPress={addSplitRow} style={styles.splitAddBtn}>
                 <AppIcon name="plus" size={14} color={colors.primaryStrong} strokeWidth={2.6} />
@@ -821,17 +891,32 @@ export default function InputModal() {
                             </Pressable>
                           );
                         })}
-                        <TextInput
-                          value={installmentMonths}
-                          onChangeText={(t) =>
-                            setInstallmentMonths(t.replace(/[^0-9]/g, '').slice(0, 2))
-                          }
-                          onFocus={() => setPadVisible(false)}
-                          keyboardType="number-pad"
-                          placeholder="직접"
-                          placeholderTextColor={colors.textMuted}
-                          style={styles.instInput}
-                        />
+                        <Pressable
+                          onPress={() => {
+                            Keyboard.dismiss();
+                            setNumTarget({ kind: 'installment' });
+                          }}
+                          style={[
+                            styles.instInput,
+                            { alignItems: 'center', justifyContent: 'center' },
+                            numTarget?.kind === 'installment' && styles.instInputActive,
+                          ]}
+                        >
+                          <Text
+                            style={{
+                              fontFamily: fontFamily.semibold,
+                              fontSize: 12,
+                              color:
+                                numTarget?.kind === 'installment'
+                                  ? colors.primaryStrong
+                                  : installmentMonths
+                                    ? colors.text
+                                    : colors.textMuted,
+                            }}
+                          >
+                            {installmentMonths || '직접'}
+                          </Text>
+                        </Pressable>
                       </View>
                       {instPreview ? (
                         <Text style={styles.creditPreview}>
@@ -1397,6 +1482,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
   },
+  // Active = the inline keypad is aimed at this row's 금액. Same faint lavender
+  // cue as the main amount row's `amountRowActive`.
+  splitRowActive: {
+    backgroundColor: colors.primaryLighter,
+    borderColor: colors.primaryLight,
+  },
   splitRowTop: { flexDirection: 'row', alignItems: 'center' },
   splitCatChip: {
     flexDirection: 'row',
@@ -1576,10 +1667,11 @@ const styles = StyleSheet.create({
     backgroundColor: colors.white,
     borderWidth: 1,
     borderColor: colors.border,
-    fontFamily: fontFamily.semibold,
-    fontSize: 12,
-    color: colors.text,
-    textAlign: 'center',
+  },
+  // Active = the inline keypad is entering a custom 할부 개월 count.
+  instInputActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.primaryLighter,
   },
 
   numPad: {

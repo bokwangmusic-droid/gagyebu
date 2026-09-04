@@ -30,6 +30,17 @@ function applyDigit(amount: string, k: string): string {
   return amount.length >= 10 ? amount : (amount === '0' ? '' : amount) + k;
 }
 
+/**
+ * Day-of-month entry for the 매월 며칠 field: 1–2 digits, no leading zero.
+ * The 1–31 clamp still happens only at save (`save()` below is unchanged), so
+ * this only affects what you can type, not what gets stored.
+ */
+function applyDayDigit(cur: string, k: string): string {
+  if (k === 'back') return cur.slice(0, -1);
+  if (k === '00') return cur; // single day value — ignore the "00" key
+  return cur.length >= 2 ? cur : (cur === '0' ? '' : cur) + k;
+}
+
 export default function RecurringAdd() {
   const router = useRouter();
   const toast = useToast();
@@ -43,18 +54,22 @@ export default function RecurringAdd() {
   const [frequency, setFrequency] = useState<Frequency>('monthly');
   const [dayOfMonth, setDayOfMonth] = useState('1');
   const [dayOfWeek, setDayOfWeek] = useState('1');
-  // 금액은 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)로 입력.
-  const [padVisible, setPadVisible] = useState(false);
+  // 금액·매월 며칠은 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)를 공유해서 입력.
+  // (loan-add.tsx의 activeField 방식과 동일 — 하나의 NumPad를 전환하며 사용)
+  const [activeField, setActiveField] = useState<'amount' | 'day' | null>(null);
 
   const cats = useMemo(() => (type === 'income' ? INCOME_CATS : EXPENSE_CATS), [type]);
   useEffect(() => {
     if (!cats.some((c) => c.id === category)) setCategory(cats[0].id);
   }, [cats, category]);
 
-  const onKey = (k: string) => setAmount((a) => applyDigit(a, k));
-  const openPad = () => {
+  const onKey = (k: string) => {
+    if (activeField === 'amount') setAmount((a) => applyDigit(a, k));
+    else if (activeField === 'day') setDayOfMonth((d) => applyDayDigit(d, k));
+  };
+  const openField = (f: 'amount' | 'day') => {
     Keyboard.dismiss();
-    setPadVisible(true);
+    setActiveField(f);
   };
 
   const canSave = name.trim().length > 0 && parseNum(amount) > 0;
@@ -89,12 +104,12 @@ export default function RecurringAdd() {
       onClose={() => router.back()}
       right={<HeaderTextButton label="저장" onPress={save} disabled={!canSave} />}
       footer={
-        padVisible ? (
+        activeField ? (
           <NumPad
             style={{ paddingBottom: insets.bottom + 16 }}
             onKey={onKey}
             onBackspace={() => onKey('back')}
-            onDone={() => setPadVisible(false)}
+            onDone={() => setActiveField(null)}
           />
         ) : undefined
       }
@@ -114,48 +129,18 @@ export default function RecurringAdd() {
           <TextField
             value={name}
             onChangeText={setName}
-            onFocus={() => setPadVisible(false)}
+            onFocus={() => setActiveField(null)}
             placeholder="예: 넷플릭스, 월세, 8월 급여"
             maxLength={30}
           />
         </Field>
         <Field label="금액">
-          <Pressable
-            onPress={openPad}
-            style={{
-              flexDirection: 'row',
-              alignItems: 'center',
-              width: '100%',
-              paddingVertical: 12,
-              paddingHorizontal: 14,
-              backgroundColor: padVisible ? colors.primaryLighter : colors.white,
-              borderWidth: 1,
-              borderColor: padVisible ? colors.primaryLight : colors.border,
-              borderRadius: radii.md,
-            }}
-          >
-            <Text
-              style={{
-                flex: 1,
-                fontFamily: fontFamily.semibold,
-                fontSize: 16,
-                color: amount ? colors.text : padVisible ? colors.primaryStrong : colors.textMuted,
-                ...tabularNums,
-              }}
-            >
-              {amount ? fmt(Number(amount)) : '0'}
-            </Text>
-            <Text
-              style={{
-                fontFamily: fontFamily.medium,
-                fontSize: 14,
-                color: padVisible ? colors.primaryStrong : colors.textSub,
-                marginLeft: 6,
-              }}
-            >
-              원
-            </Text>
-          </Pressable>
+          <NumFieldRow
+            value={amount ? fmt(Number(amount)) : ''}
+            suffix="원"
+            active={activeField === 'amount'}
+            onPress={() => openField('amount')}
+          />
         </Field>
         <Field label="카테고리">
           <ChipSelect
@@ -167,7 +152,12 @@ export default function RecurringAdd() {
         <Field label="주기">
           <ChipSelect
             value={frequency}
-            onChange={setFrequency}
+            onChange={(f) => {
+              // '매주'로 바꾸면 '매월 며칠' 필드가 사라지므로 그 필드에 붙어
+              // 있던 키패드도 닫는다.
+              if (f === 'weekly' && activeField === 'day') setActiveField(null);
+              setFrequency(f);
+            }}
             options={[
               { value: 'monthly', label: '매월' },
               { value: 'weekly', label: '매주' },
@@ -175,13 +165,12 @@ export default function RecurringAdd() {
           />
         </Field>
         {frequency === 'monthly' ? (
-          <Field label="매월 며칠">
-            <TextField
-              keyboardType="number-pad"
+          <Field label="매월 며칠" hint="1~31 사이로 정해요">
+            <NumFieldRow
               value={dayOfMonth}
-              onChangeText={(t) => setDayOfMonth(t.replace(/[^0-9]/g, '').slice(0, 2))}
-              onFocus={() => setPadVisible(false)}
-              placeholder="1~31"
+              suffix="일"
+              active={activeField === 'day'}
+              onPress={() => openField('day')}
             />
           </Field>
         ) : (
@@ -195,5 +184,60 @@ export default function RecurringAdd() {
         )}
       </View>
     </ModalScreen>
+  );
+}
+
+/**
+ * Numeric tap-target that opens the shared NumPad — same visual language as
+ * loan-add.tsx / planned-add.tsx (lavender wash + hairline when active).
+ */
+function NumFieldRow({
+  value,
+  suffix,
+  active,
+  onPress,
+}: {
+  value: string;
+  suffix: string;
+  active: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        width: '100%',
+        paddingVertical: 12,
+        paddingHorizontal: 14,
+        backgroundColor: active ? colors.primaryLighter : colors.white,
+        borderWidth: 1,
+        borderColor: active ? colors.primaryLight : colors.border,
+        borderRadius: radii.md,
+      }}
+    >
+      <Text
+        style={{
+          flex: 1,
+          fontFamily: fontFamily.semibold,
+          fontSize: 16,
+          color: value ? colors.text : active ? colors.primaryStrong : colors.textMuted,
+          ...tabularNums,
+        }}
+      >
+        {value || '0'}
+      </Text>
+      <Text
+        style={{
+          fontFamily: fontFamily.medium,
+          fontSize: 14,
+          color: active ? colors.primaryStrong : colors.textSub,
+          marginLeft: 6,
+        }}
+      >
+        {suffix}
+      </Text>
+    </Pressable>
   );
 }

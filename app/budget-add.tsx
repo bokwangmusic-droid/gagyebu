@@ -1,17 +1,27 @@
 import { useRouter } from 'expo-router';
-import { useRef, useState } from 'react';
-import { Pressable, Text, TextInput, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { Keyboard, Pressable, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
-import { ChipSelect, Field, HeaderTextButton, TextField } from '@/components/ui/controls';
+import { ChipSelect, Field, HeaderTextButton } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
+import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { getAllCats, getCat } from '@/data/categories';
 import { fmt, parseNum } from '@/lib/format';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
+
+/** Digit-entry rules — identical to the main expense keypad (app/input.tsx). */
+function applyDigit(amount: string, k: string): string {
+  if (k === 'back') return amount.slice(0, -1);
+  if (k === '00') return amount === '' || amount === '0' || amount.length >= 9 ? amount : amount + '00';
+  if (k === '0') return amount === '' || amount === '0' || amount.length >= 10 ? amount : amount + '0';
+  return amount.length >= 10 ? amount : (amount === '0' ? '' : amount) + k;
+}
 
 export default function BudgetAdd() {
   const router = useRouter();
@@ -24,7 +34,9 @@ export default function BudgetAdd() {
   const [draft, setDraft] = useState<Record<string, number>>({});
   const [category, setCategory] = useState(cats[0]?.id ?? 'food');
   const [amount, setAmount] = useState('');
-  const amountRef = useRef<TextInput>(null);
+  // 금액은 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)로 입력.
+  const [padVisible, setPadVisible] = useState(false);
+  const insets = useSafeAreaInsets();
 
   const curCat = getCat(category, 'expense', customCats);
 
@@ -44,20 +56,29 @@ export default function BudgetAdd() {
     setAmount(draft[next] ? String(draft[next]) : '');
   };
 
-  const onAmount = (t: string) => {
-    const raw = String(parseNum(t));
-    setAmount(raw);
-    stash(category, raw); // live-update the cart as you type
+  const openPad = () => {
+    Keyboard.dismiss();
+    setPadVisible(true);
   };
 
-  /** Tap a cart row → jump the editor to that category and focus the field. */
+  const onKey = (k: string) => setAmount((a) => applyDigit(a, k));
+
+  // Keep the cart row for the active category in sync with the field as you
+  // type — same effect the old text field's `onChangeText` had, but driven off
+  // the state so it can't miss a fast keypress.
+  useEffect(() => {
+    stash(category, amount);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [amount]);
+
+  /** Tap a cart row → jump the editor to that category and open the keypad. */
   const editItem = (catId: string) => {
     if (catId !== category) {
       stash(category, amount);
       setCategory(catId);
       setAmount(draft[catId] ? String(draft[catId]) : '');
     }
-    requestAnimationFrame(() => amountRef.current?.focus());
+    openPad();
   };
 
   const removeFromCart = (catId: string) => {
@@ -94,6 +115,16 @@ export default function BudgetAdd() {
       closeIcon="x"
       onClose={() => router.back()}
       right={<HeaderTextButton label="저장" onPress={save} disabled={!canSave} />}
+      footer={
+        padVisible ? (
+          <NumPad
+            style={{ paddingBottom: insets.bottom + 16 }}
+            onKey={onKey}
+            onBackspace={() => onKey('back')}
+            onDone={() => setPadVisible(false)}
+          />
+        ) : undefined
+      }
     >
       <View style={{ paddingHorizontal: spacing.xl, paddingTop: spacing.xs }}>
         <Field label="카테고리" hint="여러 개를 담고 마지막에 한 번만 저장하면 돼요">
@@ -112,13 +143,42 @@ export default function BudgetAdd() {
               : '한 달 동안 이 카테고리에 얼마까지 쓸지 정해두세요'
           }
         >
-          <TextField
-            ref={amountRef}
-            keyboardType="number-pad"
-            value={amount ? fmt(Number(amount)) : ''}
-            onChangeText={onAmount}
-            placeholder={budgets[category] ? fmt(budgets[category]) : '0'}
-          />
+          <Pressable
+            onPress={openPad}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              width: '100%',
+              paddingVertical: 12,
+              paddingHorizontal: 14,
+              backgroundColor: padVisible ? colors.primaryLighter : colors.white,
+              borderWidth: 1,
+              borderColor: padVisible ? colors.primaryLight : colors.border,
+              borderRadius: radii.md,
+            }}
+          >
+            <Text
+              style={{
+                flex: 1,
+                fontFamily: fontFamily.semibold,
+                fontSize: 16,
+                color: amount ? colors.text : padVisible ? colors.primaryStrong : colors.textMuted,
+                ...tabularNums,
+              }}
+            >
+              {amount ? fmt(Number(amount)) : budgets[category] ? fmt(budgets[category]) : '0'}
+            </Text>
+            <Text
+              style={{
+                fontFamily: fontFamily.medium,
+                fontSize: 14,
+                color: padVisible ? colors.primaryStrong : colors.textSub,
+                marginLeft: 6,
+              }}
+            >
+              원
+            </Text>
+          </Pressable>
         </Field>
 
         {entries.length > 0 && (

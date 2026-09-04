@@ -10,6 +10,7 @@ import { DateStepper } from '@/components/ui/DateStepper';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
+import { NumPad } from '@/components/ui/NumPad';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { useToast } from '@/components/ui/Toast';
 import { fmt, formatShortDate, parseNum, toDateKey } from '@/lib/format';
@@ -18,6 +19,14 @@ import { useStore } from '@/store/store';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { Loan } from '@/store/types';
+
+/** 상환 금액 digit entry — identical to the main expense keypad (app/input.tsx). */
+function applyAmountDigit(amount: string, k: string): string {
+  if (k === 'back') return amount.slice(0, -1);
+  if (k === '00') return amount === '' || amount === '0' || amount.length >= 9 ? amount : amount + '00';
+  if (k === '0') return amount === '' || amount === '0' || amount.length >= 10 ? amount : amount + '0';
+  return amount.length >= 10 ? amount : (amount === '0' ? '' : amount) + k;
+}
 
 export default function LoansList() {
   const router = useRouter();
@@ -29,6 +38,9 @@ export default function LoansList() {
   const [payAmount, setPayAmount] = useState('');
   const [payDate, setPayDate] = useState(() => toDateKey(new Date()));
   const [payMemo, setPayMemo] = useState('');
+  // 상환 금액도 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)로 입력. 시트 안에
+  // 렌더되므로 ModalScreen의 footer 대신 시트 본문 하단에 붙인다.
+  const [payPadOpen, setPayPadOpen] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
 
   useEffect(() => {
@@ -62,7 +74,15 @@ export default function LoansList() {
     setPayAmount(v.remaining > 0 ? String(Math.min(v.scheduled, v.remaining)) : '');
     setPayDate(toDateKey(new Date()));
     setPayMemo('');
+    setPayPadOpen(true); // amount ready immediately (replaces the old autoFocus)
   };
+
+  const closePay = () => {
+    setPayFor(null);
+    setPayPadOpen(false);
+  };
+
+  const onPayKey = (k: string) => setPayAmount((a) => applyAmountDigit(a, k));
 
   const doPay = () => {
     const n = parseNum(payAmount);
@@ -70,7 +90,7 @@ export default function LoansList() {
     submitting.current = true;
     addLoanPayment(payFor.id, { amount: n, date: payDate, memo: payMemo.trim() || undefined });
     toast.show('상환 내역을 기록했어요');
-    setPayFor(null);
+    closePay();
   };
 
   const paySplit = useMemo(() => {
@@ -303,19 +323,48 @@ export default function LoansList() {
       )}
 
       {payFor && (
-        <BottomSheet visible onClose={() => setPayFor(null)} title={`「${payFor.name}」 상환`} scroll>
+        <BottomSheet visible onClose={closePay} title={`「${payFor.name}」 상환`} scroll>
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub, marginBottom: spacing.md }}>
             남은 원금 {fmt(Math.max(0, payFor.principal - payFor.paid))}원 · 예정 월 상환액{' '}
             {fmt(viewLoan(payFor).scheduled)}원
           </Text>
           <Field label="상환 금액">
-            <TextField
-              keyboardType="number-pad"
-              autoFocus
-              value={payAmount ? fmt(Number(payAmount)) : ''}
-              onChangeText={(t) => setPayAmount(String(parseNum(t)))}
-              placeholder="0"
-            />
+            <Pressable
+              onPress={() => setPayPadOpen(true)}
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                width: '100%',
+                paddingVertical: 12,
+                paddingHorizontal: 14,
+                backgroundColor: payPadOpen ? colors.primaryLighter : colors.white,
+                borderWidth: 1,
+                borderColor: payPadOpen ? colors.primaryLight : colors.border,
+                borderRadius: radii.md,
+              }}
+            >
+              <Text
+                style={{
+                  flex: 1,
+                  fontFamily: fontFamily.semibold,
+                  fontSize: 16,
+                  color: payAmount ? colors.text : payPadOpen ? colors.primaryStrong : colors.textMuted,
+                  ...tabularNums,
+                }}
+              >
+                {payAmount ? fmt(Number(payAmount)) : '0'}
+              </Text>
+              <Text
+                style={{
+                  fontFamily: fontFamily.medium,
+                  fontSize: 14,
+                  color: payPadOpen ? colors.primaryStrong : colors.textSub,
+                  marginLeft: 6,
+                }}
+              >
+                원
+              </Text>
+            </Pressable>
           </Field>
           {paySplit && parseNum(payAmount) > 0 && (
             <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, marginTop: -spacing.sm, marginBottom: spacing.md, ...tabularNums }}>
@@ -326,9 +375,23 @@ export default function LoansList() {
             <DateStepper value={payDate} onChange={setPayDate} max={toDateKey(new Date())} />
           </Field>
           <Field label="메모 (선택)">
-            <TextField value={payMemo} onChangeText={setPayMemo} placeholder="예: 중도상환 수수료 포함" maxLength={40} />
+            <TextField
+              value={payMemo}
+              onChangeText={setPayMemo}
+              onFocus={() => setPayPadOpen(false)}
+              placeholder="예: 중도상환 수수료 포함"
+              maxLength={40}
+            />
           </Field>
           <GradientButton label="상환 기록" onPress={doPay} disabled={!parseNum(payAmount)} />
+          {payPadOpen && (
+            <NumPad
+              style={{ marginTop: spacing.lg, marginHorizontal: -spacing.xl }}
+              onKey={onPayKey}
+              onBackspace={() => onPayKey('back')}
+              onDone={() => setPayPadOpen(false)}
+            />
+          )}
         </BottomSheet>
       )}
     </ModalScreen>
