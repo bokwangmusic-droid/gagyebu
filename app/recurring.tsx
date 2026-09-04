@@ -40,9 +40,12 @@ export default function RecurringList() {
     }
   };
 
+  // + 진입 시 현재 선택된 탭(expense/income)을 추가 화면 기본값으로 넘긴다.
+  const openAdd = () => router.push({ pathname: '/recurring-add', params: { type: tab } });
+
   const addBtn = (
     <Pressable
-      onPress={() => router.push('/recurring-add')}
+      onPress={openAdd}
       style={{
         width: 36,
         height: 36,
@@ -103,7 +106,7 @@ export default function RecurringList() {
 
       {filtered.length === 0 ? (
         <EmptyState
-          onPress={() => router.push('/recurring-add')}
+          onPress={openAdd}
           title="반복 항목이 없어요"
           sub={'넷플릭스, 월세, 급여처럼\n매달·매주 반복되는 항목을 등록하세요'}
           cta="반복 항목 추가하기"

@@ -1,4 +1,4 @@
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Keyboard, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -47,7 +47,10 @@ export default function RecurringAdd() {
   const insets = useSafeAreaInsets();
   const { addRecurring } = useStore();
 
-  const [type, setType] = useState<TxnType>('expense');
+  // 반복 목록에서 넘어온 현재 탭 타입을 신규 추가의 기본값으로만 사용.
+  // (param이 없으면 기존 기본값 expense 유지. 사용자는 화면 안에서 자유롭게 전환 가능.)
+  const params = useLocalSearchParams<{ type?: string }>();
+  const [type, setType] = useState<TxnType>(params.type === 'income' ? 'income' : 'expense');
   const [name, setName] = useState('');
   const [amount, setAmount] = useState('');
   const [category, setCategory] = useState('subscribe');
