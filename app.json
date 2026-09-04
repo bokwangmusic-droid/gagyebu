@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "가계부",
+    "name": "돈돈 가계부",
     "slug": "gagyebu",
     "scheme": "gagyebu",
     "version": "1.0.0",
@@ -17,6 +17,7 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.ijcompany.ledger",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FAF6EE"

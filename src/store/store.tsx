@@ -680,6 +680,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [mutate],
   );
 
+  // Wipes every user-owned slice back to its fresh-install default — including
+  // custom categories and category order, so "모든 데이터 초기화" leaves nothing
+  // behind. `seenOnboarding` is intentionally kept (no re-onboarding after a
+  // reset; "사용법 다시 보기" in 내정보 is the explicit way back in). Callers run
+  // a `before_reset` backup first, which snapshots all of these.
   const resetAll = useCallback(
     () =>
       mutate(
@@ -693,6 +698,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           loans: [],
           cards: [],
           notes: '',
+          customCats: DEFAULT_CUSTOM_CATS,
+          catOrder: DEFAULT_CAT_ORDER,
           settings: DEFAULT_SETTINGS,
         }),
         PERSIST_KEYS,

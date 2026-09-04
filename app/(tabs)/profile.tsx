@@ -1,3 +1,4 @@
+import Constants from 'expo-constants';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
@@ -23,6 +24,7 @@ export default function ProfileScreen() {
   const {
     settings,
     setSettings,
+    setSeenOnboarding,
     recurring,
     goals,
     loans,
@@ -42,10 +44,47 @@ export default function ProfileScreen() {
   const initial = (settings.profileName || '나').charAt(0);
   const customCount = customCats.expense.length + customCats.income.length;
 
+  // App metadata straight from the Expo config (app.json) — never hard-coded,
+  // so it can't drift from the real release. `nativeBuildVersion` is only set
+  // in a real native build; it's absent in Expo Go.
+  const appName = Constants.expoConfig?.name ?? '가계부';
+  const appVersion = Constants.expoConfig?.version ?? '1.0.0';
+  const buildVersion =
+    typeof Constants.nativeBuildVersion === 'string' && Constants.nativeBuildVersion
+      ? Constants.nativeBuildVersion
+      : null;
+  const appInfoSub = `버전 ${appVersion}${buildVersion ? ` (빌드 ${buildVersion})` : ''}`;
+
+  const showAppInfo = () =>
+    Alert.alert(
+      appName,
+      `버전 ${appVersion}${buildVersion ? `\n빌드 ${buildVersion}` : ''}\n\n` +
+        '뱅크샐러드의 시각화 + 편한가계부의 3초 입력을 합쳤어요.\n' +
+        '광고 없고, 데이터는 이 기기에만 저장돼요.',
+    );
+
+  const showPrivacyInfo = () =>
+    Alert.alert(
+      '개인정보 · 데이터 보관',
+      '• 모든 가계부 데이터는 이 기기 안에만 저장돼요.\n' +
+        '• 서버 전송이나 클라우드 동기화는 아직 없어요.\n' +
+        '• 앱을 삭제하거나 기기를 바꾸면 데이터가 사라져요.\n' +
+        '• 「데이터 백업 · 복원」에서 백업 파일을 저장해 두면 다른 기기에서 복원할 수 있어요.\n' +
+        '• 백업 파일은 직접 저장·공유할 때만 기기 밖으로 나가요.',
+    );
+
+  const reviewOnboarding = () => {
+    // Re-arm the onboarding gate, then jump to it. Finishing / skipping there
+    // flips `seenOnboarding` back on and returns home (app/onboarding.tsx).
+    setSeenOnboarding(false);
+    router.replace('/onboarding');
+  };
+
   const confirmReset = () =>
     Alert.alert(
       '모든 데이터를 삭제할까요?',
-      '지출·수입·예산·목표·반복·메모 등 앱의 모든 데이터가 지워져요. 되돌릴 수 없어요.',
+      '지출·수입·예산·목표·반복·대출·카드·메모·커스텀 카테고리·설정이 모두 지워져요.\n\n' +
+        '초기화 직전에 자동 백업이 만들어지지만, 안전을 위해 먼저 「데이터 백업 · 복원」에서 백업해 두세요.',
       [
         { text: '취소', style: 'cancel' },
         {
@@ -220,7 +259,7 @@ export default function ProfileScreen() {
         />
       </SettingsCard>
 
-      <SectionLabel>백업 &amp; 앱</SectionLabel>
+      <SectionLabel>개인정보 &amp; 앱</SectionLabel>
       <SettingsCard>
         <Row
           icon="download"
@@ -231,31 +270,68 @@ export default function ProfileScreen() {
           onPress={() => router.push('/backup')}
         />
         <Row
+          icon="shield"
+          iconBg={colors.infoLight}
+          iconColor={colors.infoText}
+          title="개인정보 · 데이터 보관"
+          sub="데이터는 이 기기에만 저장돼요"
+          onPress={showPrivacyInfo}
+        />
+        <Row
+          icon="help"
+          iconBg={colors.primaryLight}
+          iconColor={colors.primaryStrong}
+          title="사용법 다시 보기"
+          sub="시작 화면 안내를 다시 봐요"
+          onPress={reviewOnboarding}
+        />
+        <Row
           icon="info"
           iconBg={colors.neutralLight}
           iconColor={colors.neutralText}
           title="앱 정보"
-          sub="v0.1.0 · 초기 버전"
-          onPress={() =>
-            Alert.alert(
-              '가계부',
-              '버전 0.1.0 · 초기 베타\n\n뱅크샐러드의 시각화 + 편한가계부의 3초 입력을 합쳤어요. 광고 없고 프라이버시 우선.',
-            )
-          }
+          sub={appInfoSub}
+          onPress={showAppInfo}
           last
         />
       </SettingsCard>
 
-      <View style={{ paddingVertical: spacing.sm, paddingHorizontal: spacing.xl, paddingBottom: 40, alignItems: 'center' }}>
+      <View
+        style={{
+          paddingTop: spacing.lg,
+          paddingHorizontal: spacing.xl,
+          paddingBottom: 40,
+          alignItems: 'center',
+          gap: 10,
+        }}
+      >
+        <Text
+          style={{
+            fontFamily: fontFamily.regular,
+            fontSize: 11,
+            lineHeight: 16,
+            color: colors.textMuted,
+            textAlign: 'center',
+            ...noPad,
+          }}
+        >
+          초기화하면 이 기기의 모든 가계부 데이터가 지워져요.{'\n'}먼저 「데이터 백업 · 복원」에서 백업해 두는 것을 권장해요.
+        </Text>
         <Pressable
           onPress={confirmReset}
           style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 6,
             paddingVertical: 9,
             paddingHorizontal: 18,
             borderRadius: radii.pill,
             backgroundColor: colors.expenseLight,
+            borderWidth: 1,
+            borderColor: colors.expense,
           }}
         >
+          <AppIcon name="warn" size={14} color={colors.expenseText} />
           <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.expenseText }}>
             모든 데이터 초기화
           </Text>
