@@ -10,6 +10,7 @@ import { ToastProvider, useToast } from '@/components/ui/Toast';
 import { maybeAutoBackup } from '@/lib/backup';
 import { computeMissedOccurrences } from '@/lib/recurring';
 import { AuthProvider, useAuth } from '@/store/auth';
+import { HouseholdProvider, useHousehold } from '@/store/household';
 import { StoreProvider, useStore } from '@/store/store';
 import { colors } from '@/theme/tokens';
 import { fontMap } from '@/theme/typography';
@@ -17,42 +18,124 @@ import { fontMap } from '@/theme/typography';
 void SplashScreen.preventAutoHideAsync();
 
 /**
- * STEP 16-D: the existing local-first app (onboarding + (tabs) + every
- * modal screen below) is intentionally unreachable while true — no
- * household/local-migration policy exists yet for an authenticated user's
- * data to safely land in (see AuthReady, app/auth-ready.tsx). Nothing below
- * this flag is deleted or modified; a future STEP flips this (or replaces
- * it with a real "household connected" check) once that policy is decided.
+ * STEP 16-D/16-E: the existing local-first app (onboarding + (tabs) + every
+ * modal screen below) is intentionally unreachable while true — even once a
+ * user has a connected household (app/household-ready.tsx), no local->
+ * household data migration policy exists yet for their AsyncStorage
+ * financial data to safely land in. Nothing below this flag is deleted or
+ * modified; a future STEP flips this (or replaces it with a real check)
+ * once that migration policy is decided.
  */
 const LEGACY_APP_REACHABLE = false;
 
 // auth-callback (STEP 16-D1) is where Supabase's confirmation email
 // redirects the browser — it must be reachable with no session yet.
-const AUTH_SCREENS = ['sign-in', 'sign-up', 'auth-callback'];
+const SIGNED_OUT_SCREENS = ['sign-in', 'sign-up', 'auth-callback'];
+// STEP 16-E: reachable while signed in but not (yet, or no longer) member
+// of exactly one resolved household.
+const HOUSEHOLD_SETUP_SCREENS = ['household-setup', 'household-create', 'household-join'];
+const HOUSEHOLD_READY_SCREENS = ['household-ready', 'household-invite'];
 
 /**
- * Auth gate — runs before, and takes priority over, the onboarding Gate
- * below. No session -> sign-in/sign-up/auth-callback only. A session exists
- * -> the temporary auth-ready screen only (STEP 16-D never lets an
- * authenticated user reach onboarding/(tabs); see LEGACY_APP_REACHABLE
- * above).
+ * Auth + household gate — runs before, and takes priority over, the
+ * onboarding Gate below. Priority order:
+ *   1. no session            -> sign-in / sign-up / auth-callback only
+ *   2. household list loading -> stay put (nothing to redirect to yet)
+ *   3. zero households        -> household-setup / -create / -join only
+ *   4. 2+ households, none picked -> household-select only
+ *   5. otherwise (exactly one resolved household) -> household-ready /
+ *      household-invite only
+ * STEP 16-E never lets a signed-in user reach onboarding/(tabs) regardless
+ * of household state — see LEGACY_APP_REACHABLE above.
  */
 function AuthGate() {
-  const { loading, session } = useAuth();
+  const { loading: authLoading, session } = useAuth();
+  const {
+    loading: householdLoading,
+    households,
+    activeHousehold,
+    loadedForUserId,
+  } = useHousehold();
   const segments = useSegments();
   const router = useRouter();
 
+  // ---- guard 1: household data isn't trustworthy the instant a session
+  // appears (fixes the warning on login, not just the earlier sign-out
+  // one) ----
+  //
+  // `households`/`activeHousehold` can briefly still hold the previous
+  // (signed-out, or previous-user) values for a render or two after
+  // `session` changes — HouseholdProvider's own effect is what starts the
+  // real fetch and eventually updates them, and that doesn't happen in
+  // the same instant this component sees the new session. Checking only
+  // `householdLoading` isn't enough: it can also still read its old value
+  // for that same window. `loadedForUserId` (src/store/household.tsx) is
+  // an explicit, provider-owned marker set ONLY once a fetch for a
+  // specific user id has genuinely completed, so comparing it against the
+  // current session's user id — a plain derived value, no ref/state
+  // mutation here — is a precise, render-pure way to know the data is
+  // actually theirs before using it for a redirect decision.
+  const householdDataReady =
+    !householdLoading && loadedForUserId === (session?.user?.id ?? null);
+
+  // ---- guard 2: never dispatch the same redirect twice (the original
+  // sign-out fix, generalised) ----
+  //
+  // Even with guard 1, HouseholdProvider's own state can still settle
+  // across more than one render pass, and `useSegments()` only reflects a
+  // `router.replace()` once React Navigation finishes that transition —
+  // which can still be pending when a later pass re-runs this effect.
+  // `lastTargetRef` remembers the last path THIS effect itself dispatched;
+  // a later pass computing the SAME target is a no-op instead of a second
+  // `router.replace()` call (which is what produced the 'REPLACE' action
+  // warning). It's cleared as soon as `segments` genuinely confirms we've
+  // arrived somewhere the current target allows, so a later, different
+  // target still dispatches normally.
+  const lastTargetRef = useRef<string | null>(null);
+
   useEffect(() => {
-    if (loading) return;
+    if (authLoading) return;
     const seg0 = segments[0] as string | undefined;
 
+    // ---- single desired-target computation ----
+    // Exactly one of these three shapes per render: nothing to do yet
+    // (`target === null`), or a route + the screens that already satisfy
+    // it. This is the ONLY place a target is decided — every case below
+    // funnels through the same dispatch-once logic at the bottom.
+    let target: string | null;
+    let allowed: readonly string[];
     if (!session) {
-      if (!AUTH_SCREENS.includes(seg0 ?? '')) router.replace('/sign-in');
-      return;
+      target = '/sign-in';
+      allowed = SIGNED_OUT_SCREENS;
+    } else if (!householdDataReady) {
+      // Household state not confirmed for this user yet — hold position
+      // rather than guess. Covers the ordinary "still loading" case too.
+      target = null;
+      allowed = [];
+    } else if (households.length === 0) {
+      target = '/household-setup';
+      allowed = HOUSEHOLD_SETUP_SCREENS;
+    } else if (households.length > 1 && !activeHousehold) {
+      target = '/household-select';
+      allowed = ['household-select'];
+    } else {
+      target = '/household-ready';
+      allowed = HOUSEHOLD_READY_SCREENS;
     }
 
-    if (seg0 !== 'auth-ready') router.replace('/auth-ready');
-  }, [loading, session, segments, router]);
+    if (target === null) return;
+
+    if (allowed.includes(seg0 ?? '')) {
+      // Genuinely arrived — clear the pending marker so a future, distinct
+      // target (e.g. a later sign-out, or joining a second household) is
+      // free to dispatch again.
+      lastTargetRef.current = null;
+      return;
+    }
+    if (lastTargetRef.current === target) return; // already dispatched; segments just hasn't caught up
+    lastTargetRef.current = target;
+    router.replace(target as Parameters<typeof router.replace>[0]);
+  }, [authLoading, session, householdDataReady, households, activeHousehold, segments, router]);
 
   return null;
 }
@@ -149,15 +232,16 @@ const MODAL = {
 function RootNav() {
   const { hydrated } = useStore();
   const { loading: authLoading } = useAuth();
+  const { loading: householdLoading } = useHousehold();
   const [fontsLoaded, fontError] = useFonts(fontMap);
 
   useEffect(() => {
-    if (hydrated && !authLoading && (fontsLoaded || fontError)) {
+    if (hydrated && !authLoading && !householdLoading && (fontsLoaded || fontError)) {
       void SplashScreen.hideAsync();
     }
-  }, [hydrated, authLoading, fontsLoaded, fontError]);
+  }, [hydrated, authLoading, householdLoading, fontsLoaded, fontError]);
 
-  if (!hydrated || authLoading || (!fontsLoaded && !fontError)) return null;
+  if (!hydrated || authLoading || householdLoading || (!fontsLoaded && !fontError)) return null;
 
   return (
     <>
@@ -178,7 +262,12 @@ function RootNav() {
         <Stack.Screen name="sign-in" />
         <Stack.Screen name="sign-up" />
         <Stack.Screen name="auth-callback" />
-        <Stack.Screen name="auth-ready" />
+        <Stack.Screen name="household-setup" />
+        <Stack.Screen name="household-create" />
+        <Stack.Screen name="household-join" />
+        <Stack.Screen name="household-select" />
+        <Stack.Screen name="household-ready" />
+        <Stack.Screen name="household-invite" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="onboarding" />
         <Stack.Screen name="input" options={MODAL} />
@@ -206,12 +295,14 @@ export default function RootLayout() {
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
         <AuthProvider>
-          <StoreProvider>
-            <ToastProvider>
-              <StatusBar style="dark" />
-              <RootNav />
-            </ToastProvider>
-          </StoreProvider>
+          <HouseholdProvider>
+            <StoreProvider>
+              <ToastProvider>
+                <StatusBar style="dark" />
+                <RootNav />
+              </ToastProvider>
+            </StoreProvider>
+          </HouseholdProvider>
         </AuthProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>

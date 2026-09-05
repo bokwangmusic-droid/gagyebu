@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Pressable, Text, TextInput, View } from 'react-native';
 
 import { AuthShell } from '@/components/auth/AuthShell';
+import { PasswordField } from '@/components/auth/PasswordField';
 import { Field, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { useToast } from '@/components/ui/Toast';
@@ -19,6 +20,7 @@ export default function SignIn() {
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // guards against a double-tap racing the async call
+  const passwordRef = useRef<TextInput>(null);
 
   const canSubmit = email.trim().length > 0 && password.length > 0 && !submitting;
 
@@ -38,7 +40,7 @@ export default function SignIn() {
   };
 
   return (
-    <AuthShell title="로그인" subtitle={'둘이 함께 쓰면\n돈 관리가 더 쉬워져요.'}>
+    <AuthShell title="로그인" subtitle="내 돈부터 우리집 돈까지, 더 쉽게 관리해요">
       <View style={{ marginBottom: spacing.lg }}>
         <Field label="이메일">
           <TextField
@@ -51,14 +53,16 @@ export default function SignIn() {
             autoComplete="email"
             textContentType="emailAddress"
             returnKeyType="next"
+            onSubmitEditing={() => passwordRef.current?.focus()}
+            blurOnSubmit={false}
           />
         </Field>
         <Field label="비밀번호">
-          <TextField
+          <PasswordField
+            ref={passwordRef}
             value={password}
             onChangeText={setPassword}
             placeholder="비밀번호"
-            secureTextEntry
             autoCapitalize="none"
             autoComplete="password"
             textContentType="password"

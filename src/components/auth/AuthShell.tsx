@@ -33,7 +33,15 @@ export function AuthShell({
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: colors.bg }}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      // 'height' on Android: this app enables edgeToEdgeEnabled (app.json),
+      // under which the OS's automatic window-resize-for-keyboard behaviour
+      // isn't reliable, so leaving this `undefined` on Android (RN's
+      // typical default suggestion) left the focused field's screen space
+      // never actually shrinking — the keyboard just overlaid on top, with
+      // nothing for ScrollView's built-in scroll-focused-input-into-view
+      // behaviour to scroll into. 'height' makes this view genuinely
+      // shrink by the keyboard's height, same as 'padding' does on iOS.
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <ScrollView
         contentContainerStyle={{

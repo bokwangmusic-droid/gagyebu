@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Pressable, Text, TextInput, View } from 'react-native';
 
 import { AuthShell } from '@/components/auth/AuthShell';
+import { PasswordField } from '@/components/auth/PasswordField';
 import { Field, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { useToast } from '@/components/ui/Toast';
@@ -22,6 +23,9 @@ export default function SignUp() {
   const [submitting, setSubmitting] = useState(false);
   const [awaitingVerification, setAwaitingVerification] = useState(false);
   const submittingRef = useRef(false);
+  const emailRef = useRef<TextInput>(null);
+  const passwordRef = useRef<TextInput>(null);
+  const confirmRef = useRef<TextInput>(null);
 
   const canSubmit =
     name.trim().length > 0 &&
@@ -85,13 +89,22 @@ export default function SignUp() {
   }
 
   return (
-    <AuthShell title="회원가입" subtitle={'돈돈과 함께\n시작해봐요.'}>
+    <AuthShell title="회원가입" subtitle="내 돈부터 우리집 돈까지, 더 쉽게 관리해요">
       <View style={{ marginBottom: spacing.lg }}>
         <Field label="이름">
-          <TextField value={name} onChangeText={setName} placeholder="이름" maxLength={20} returnKeyType="next" />
+          <TextField
+            value={name}
+            onChangeText={setName}
+            placeholder="이름"
+            maxLength={20}
+            returnKeyType="next"
+            onSubmitEditing={() => emailRef.current?.focus()}
+            blurOnSubmit={false}
+          />
         </Field>
         <Field label="이메일">
           <TextField
+            ref={emailRef}
             value={email}
             onChangeText={setEmail}
             placeholder="you@example.com"
@@ -101,26 +114,30 @@ export default function SignUp() {
             autoComplete="email"
             textContentType="emailAddress"
             returnKeyType="next"
+            onSubmitEditing={() => passwordRef.current?.focus()}
+            blurOnSubmit={false}
           />
         </Field>
         <Field label="비밀번호" hint="6자 이상으로 설정해주세요">
-          <TextField
+          <PasswordField
+            ref={passwordRef}
             value={password}
             onChangeText={setPassword}
             placeholder="비밀번호"
-            secureTextEntry
             autoCapitalize="none"
             autoComplete="password-new"
             textContentType="newPassword"
             returnKeyType="next"
+            onSubmitEditing={() => confirmRef.current?.focus()}
+            blurOnSubmit={false}
           />
         </Field>
         <Field label="비밀번호 확인">
-          <TextField
+          <PasswordField
+            ref={confirmRef}
             value={confirm}
             onChangeText={setConfirm}
             placeholder="비밀번호 확인"
-            secureTextEntry
             autoCapitalize="none"
             autoComplete="password-new"
             textContentType="newPassword"

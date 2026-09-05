@@ -122,8 +122,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // ---- confirm the trigger-created profile row exists (§10) ----
   // Read-only, self-only (`.eq('id', ...)` — RLS also enforces this), and
-  // never blocks the auth-ready screen: a missing row surfaces as
-  // `profileError` instead of an infinite loading state.
+  // never blocks navigation (household-ready and others): a missing row
+  // surfaces as `profileError` instead of an infinite loading state.
   useEffect(() => {
     const uid = session?.user?.id;
     if (!uid) {
