@@ -9,13 +9,57 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { ToastProvider, useToast } from '@/components/ui/Toast';
 import { maybeAutoBackup } from '@/lib/backup';
 import { computeMissedOccurrences } from '@/lib/recurring';
+import { AuthProvider, useAuth } from '@/store/auth';
 import { StoreProvider, useStore } from '@/store/store';
 import { colors } from '@/theme/tokens';
 import { fontMap } from '@/theme/typography';
 
 void SplashScreen.preventAutoHideAsync();
 
-/** Redirects to onboarding until it's been seen. */
+/**
+ * STEP 16-D: the existing local-first app (onboarding + (tabs) + every
+ * modal screen below) is intentionally unreachable while true — no
+ * household/local-migration policy exists yet for an authenticated user's
+ * data to safely land in (see AuthReady, app/auth-ready.tsx). Nothing below
+ * this flag is deleted or modified; a future STEP flips this (or replaces
+ * it with a real "household connected" check) once that policy is decided.
+ */
+const LEGACY_APP_REACHABLE = false;
+
+// auth-callback (STEP 16-D1) is where Supabase's confirmation email
+// redirects the browser — it must be reachable with no session yet.
+const AUTH_SCREENS = ['sign-in', 'sign-up', 'auth-callback'];
+
+/**
+ * Auth gate — runs before, and takes priority over, the onboarding Gate
+ * below. No session -> sign-in/sign-up/auth-callback only. A session exists
+ * -> the temporary auth-ready screen only (STEP 16-D never lets an
+ * authenticated user reach onboarding/(tabs); see LEGACY_APP_REACHABLE
+ * above).
+ */
+function AuthGate() {
+  const { loading, session } = useAuth();
+  const segments = useSegments();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (loading) return;
+    const seg0 = segments[0] as string | undefined;
+
+    if (!session) {
+      if (!AUTH_SCREENS.includes(seg0 ?? '')) router.replace('/sign-in');
+      return;
+    }
+
+    if (seg0 !== 'auth-ready') router.replace('/auth-ready');
+  }, [loading, session, segments, router]);
+
+  return null;
+}
+
+/** Redirects to onboarding until it's been seen. Unreachable while
+ *  LEGACY_APP_REACHABLE is false (STEP 16-D) — kept as-is for the STEP that
+ *  re-enables it. */
 function Gate() {
   const { hydrated, seenOnboarding } = useStore();
   const segments = useSegments();
@@ -104,20 +148,26 @@ const MODAL = {
 
 function RootNav() {
   const { hydrated } = useStore();
+  const { loading: authLoading } = useAuth();
   const [fontsLoaded, fontError] = useFonts(fontMap);
 
   useEffect(() => {
-    if (hydrated && (fontsLoaded || fontError)) {
+    if (hydrated && !authLoading && (fontsLoaded || fontError)) {
       void SplashScreen.hideAsync();
     }
-  }, [hydrated, fontsLoaded, fontError]);
+  }, [hydrated, authLoading, fontsLoaded, fontError]);
 
-  if (!hydrated || (!fontsLoaded && !fontError)) return null;
+  if (!hydrated || authLoading || (!fontsLoaded && !fontError)) return null;
 
   return (
     <>
-      <Gate />
-      <BootEffects />
+      <AuthGate />
+      {LEGACY_APP_REACHABLE && (
+        <>
+          <Gate />
+          <BootEffects />
+        </>
+      )}
       <Stack
         screenOptions={{
           headerShown: false,
@@ -125,6 +175,10 @@ function RootNav() {
           animation: 'fade',
         }}
       >
+        <Stack.Screen name="sign-in" />
+        <Stack.Screen name="sign-up" />
+        <Stack.Screen name="auth-callback" />
+        <Stack.Screen name="auth-ready" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="onboarding" />
         <Stack.Screen name="input" options={MODAL} />
@@ -151,12 +205,14 @@ export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
-        <StoreProvider>
-          <ToastProvider>
-            <StatusBar style="dark" />
-            <RootNav />
-          </ToastProvider>
-        </StoreProvider>
+        <AuthProvider>
+          <StoreProvider>
+            <ToastProvider>
+              <StatusBar style="dark" />
+              <RootNav />
+            </ToastProvider>
+          </StoreProvider>
+        </AuthProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
