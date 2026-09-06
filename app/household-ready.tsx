@@ -143,6 +143,30 @@ export default function HouseholdReady() {
         </Pressable>
       )}
 
+      {/* STEP 16-G1A: read-only preview of this household's REMOTE
+          financial data — reachable by owner AND member alike (same RLS
+          predicate, same rows either way). Never writes anything, never
+          opens the legacy (tabs) finance UI. See app/remote-data-preview.tsx. */}
+      <Pressable
+        onPress={() => router.push('/remote-data-preview')}
+        style={{
+          width: '100%',
+          maxWidth: 430,
+          height: 48,
+          borderRadius: radii.xl,
+          borderWidth: 1.5,
+          borderColor: colors.primaryLight,
+          backgroundColor: colors.white,
+          alignItems: 'center',
+          justifyContent: 'center',
+          marginTop: spacing.md,
+        }}
+      >
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.primaryStrong }}>
+          우리집 데이터 확인
+        </Text>
+      </Pressable>
+
       <Text
         style={{
           fontFamily: fontFamily.regular,

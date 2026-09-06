@@ -1,0 +1,228 @@
+/**
+ * Remote household finance data -> local domain types — STEP 16-G1A.
+ *
+ * Pure transform, mirroring src/lib/householdMigration.ts's shape but in
+ * the OPPOSITE direction (that file goes local -> remote payload for the
+ * one-time import; this one goes remote -> local read model for display).
+ * Never touches Supabase, AsyncStorage, or React state — takes a
+ * `RemoteFinanceRaw` (src/services/remoteFinance.ts) and returns plain
+ * data reusing the app's EXISTING local domain types (Transaction,
+ * CreditCard, Goal, RecurringRule, PlannedExpense, Loan, LoanPayment,
+ * CustomCatMap, CatOrderMap, BudgetMap) — no new parallel type hierarchy.
+ *
+ * Deliberately excludes:
+ *   - `settings` (profileName/profileEmail/quickPaste/...) — per-device
+ *     local preferences, never household financial data. Not part of this
+ *     read model at all (STEP 16-G1A §6).
+ *   - household_id/created_by/created_at-for-tables-with-no-local-
+ *     equivalent/updated_at/deleted_at/goal_movements content — remote
+ *     sync/ownership metadata with no 1:1 local-domain field (STEP 16-G1A
+ *     §7). `created_at` IS mapped to `createdAt` for cards/recurring/
+ *     planned/goals/loans specifically, because those local types already
+ *     have a required `createdAt` field that means the same thing — that
+ *     is a genuine domain overlap, not sync-only bookkeeping.
+ *
+ * Dangling transaction.card_id (STEP 16-G1A, same reasoning as the F1.6
+ * outbound direction in householdMigration.ts): if a transaction's
+ * card_id doesn't resolve among the household's own (non-deleted) cards —
+ * e.g. the card was soft-deleted after the transaction was made — it is
+ * mapped to `undefined` ("카드 미지정"), matching src/store/store.tsx's
+ * deleteCard comment: this is already the app's own established local
+ * semantics for that state, not a new one invented here.
+ */
+import type { CatOrderMap, CustomCatMap, IconKey } from '@/data/categories';
+import type { RemoteFinanceRaw } from '@/services/remoteFinance';
+import type {
+  BudgetMap,
+  CreditCard,
+  Goal,
+  Loan,
+  LoanPayment,
+  PaymentMethod,
+  PlannedExpense,
+  RecurringRule,
+  Transaction,
+  TransactionSplit,
+} from '@/store/types';
+
+/**
+ * The read-only, household-financial subset of AppState this app can
+ * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
+ * (no `seenOnboarding`, no `settings`) — see the file header.
+ */
+export interface RemoteFinanceData {
+  transactions: Transaction[];
+  cards: CreditCard[];
+  budgets: BudgetMap;
+  recurring: RecurringRule[];
+  planned: PlannedExpense[];
+  goals: Goal[];
+  loans: Loan[];
+  customCats: CustomCatMap;
+  notes: string;
+  catOrder: CatOrderMap;
+}
+
+export interface RemoteFinanceCounts {
+  transactions: number;
+  cards: number;
+  budgets: number;
+  recurring: number;
+  planned: number;
+  goals: number;
+  loans: number;
+  customCategories: number;
+}
+
+/** Sum of every migratable-style slice — 0 means a genuinely empty household (STEP 16-G1A §9), not an error. */
+export function remoteFinanceCounts(data: RemoteFinanceData): RemoteFinanceCounts {
+  return {
+    transactions: data.transactions.length,
+    cards: data.cards.length,
+    budgets: Object.keys(data.budgets).length,
+    recurring: data.recurring.length,
+    planned: data.planned.length,
+    goals: data.goals.length,
+    loans: data.loans.length,
+    customCategories: data.customCats.expense.length + data.customCats.income.length,
+  };
+}
+
+export function totalRemoteFinanceCount(counts: RemoteFinanceCounts): number {
+  return (
+    counts.transactions +
+    counts.cards +
+    counts.budgets +
+    counts.recurring +
+    counts.planned +
+    counts.goals +
+    counts.loans +
+    counts.customCategories
+  );
+}
+
+/** Never mutates `raw`; builds entirely new arrays/objects. */
+export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanceData {
+  const cardIds = new Set(raw.cards.map((c) => c.id));
+
+  const cards: CreditCard[] = raw.cards.map((c) => ({
+    id: c.id,
+    name: c.name,
+    color: c.color_bg && c.color_fg ? { bg: c.color_bg, color: c.color_fg } : undefined,
+    paymentDay: c.payment_day ?? undefined,
+    closingDay: c.closing_day ?? undefined,
+    createdAt: c.created_at,
+  }));
+
+  const customCats: CustomCatMap = { expense: [], income: [] };
+  for (const c of raw.customCategories) {
+    customCats[c.type].push({
+      id: c.id,
+      name: c.name,
+      bg: c.bg,
+      color: c.color,
+      icon: c.icon as IconKey, // remote value was only ever written from a valid IconKey
+      custom: true,
+    });
+  }
+
+  const paymentsByLoan = new Map<string, LoanPayment[]>();
+  for (const p of raw.loanPayments) {
+    const list = paymentsByLoan.get(p.loan_id) ?? [];
+    list.push({
+      id: p.id,
+      date: p.date,
+      amount: p.amount,
+      principalPart: p.principal_part,
+      interestPart: p.interest_part,
+      memo: p.memo ?? undefined,
+    });
+    paymentsByLoan.set(p.loan_id, list);
+  }
+
+  const transactions: Transaction[] = raw.transactions.map((t) => ({
+    id: t.id,
+    type: t.type,
+    category: t.category,
+    amount: t.amount,
+    memo: t.memo,
+    date: t.date,
+    fromRecurring: t.from_recurring ?? undefined,
+    fromPlanned: t.from_planned ?? undefined,
+    paymentMethod: (t.payment_method as PaymentMethod | null) ?? undefined,
+    cardId: t.card_id && cardIds.has(t.card_id) ? t.card_id : undefined,
+    installment: t.installment_months != null ? { months: t.installment_months } : undefined,
+    splits: Array.isArray(t.splits) ? (t.splits as TransactionSplit[]) : undefined,
+    tags: t.tags ?? undefined,
+    memberId: t.member_id ?? undefined,
+  }));
+
+  const budgets: BudgetMap = {};
+  for (const b of raw.budgets) budgets[b.category_id] = b.amount;
+
+  const recurring: RecurringRule[] = raw.recurringRules.map((r) => ({
+    id: r.id,
+    type: r.type,
+    name: r.name,
+    amount: r.amount,
+    category: r.category,
+    frequency: r.frequency,
+    dayOfMonth: r.day_of_month ?? undefined,
+    dayOfWeek: r.day_of_week ?? undefined,
+    active: r.active,
+    createdAt: r.created_at,
+    lastRun: r.last_run ?? undefined,
+  }));
+
+  const planned: PlannedExpense[] = raw.plannedExpenses.map((p) => ({
+    id: p.id,
+    name: p.name,
+    amount: p.amount,
+    category: p.category,
+    date: p.date,
+    memo: p.memo,
+    type: p.type,
+    createdAt: p.created_at,
+  }));
+
+  const goals: Goal[] = raw.goals.map((g) => ({
+    id: g.id,
+    name: g.name,
+    target: g.target,
+    saved: g.saved,
+    deadline: g.deadline,
+    icon: g.icon as IconKey,
+    createdAt: g.created_at,
+  }));
+
+  const loans: Loan[] = raw.loans.map((l) => ({
+    id: l.id,
+    name: l.name,
+    lender: l.lender,
+    principal: l.principal,
+    annualRate: l.annual_rate,
+    termMonths: l.term_months,
+    startDate: l.start_date,
+    paymentDay: l.payment_day,
+    repayType: l.repay_type,
+    paid: l.paid,
+    payments: paymentsByLoan.get(l.id) ?? [],
+    createdAt: l.created_at,
+  }));
+
+  return {
+    transactions,
+    cards,
+    budgets,
+    recurring,
+    planned,
+    goals,
+    loans,
+    customCats,
+    notes: raw.householdSettings?.notes ?? '',
+    catOrder: {
+      expense: raw.householdSettings?.cat_order_expense ?? [],
+      income: raw.householdSettings?.cat_order_income ?? [],
+    },
+  };
+}

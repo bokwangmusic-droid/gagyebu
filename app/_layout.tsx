@@ -11,6 +11,7 @@ import { maybeAutoBackup } from '@/lib/backup';
 import { computeMissedOccurrences } from '@/lib/recurring';
 import { AuthProvider, useAuth } from '@/store/auth';
 import { HouseholdProvider, useHousehold } from '@/store/household';
+import { RemoteFinanceProvider } from '@/store/remoteFinance';
 import { StoreProvider, useStore } from '@/store/store';
 import { colors } from '@/theme/tokens';
 import { fontMap } from '@/theme/typography';
@@ -36,7 +37,15 @@ const SIGNED_OUT_SCREENS = ['sign-in', 'sign-up', 'auth-callback'];
 const HOUSEHOLD_SETUP_SCREENS = ['household-setup', 'household-create', 'household-join'];
 // STEP 16-F1: read-only local->household migration preview, reachable from
 // household-ready — see app/migration-preview.tsx.
-const HOUSEHOLD_READY_SCREENS = ['household-ready', 'household-invite', 'migration-preview'];
+// STEP 16-G1A: read-only remote household finance preview — see
+// app/remote-data-preview.tsx. Owner AND member reachable (unlike
+// migration-preview, which is owner-only local-data territory).
+const HOUSEHOLD_READY_SCREENS = [
+  'household-ready',
+  'household-invite',
+  'migration-preview',
+  'remote-data-preview',
+];
 
 /**
  * Auth + household gate — runs before, and takes priority over, the
@@ -271,6 +280,7 @@ function RootNav() {
         <Stack.Screen name="household-ready" />
         <Stack.Screen name="household-invite" />
         <Stack.Screen name="migration-preview" />
+        <Stack.Screen name="remote-data-preview" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="onboarding" />
         <Stack.Screen name="input" options={MODAL} />
@@ -299,12 +309,18 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <AuthProvider>
           <HouseholdProvider>
-            <StoreProvider>
-              <ToastProvider>
-                <StatusBar style="dark" />
-                <RootNav />
-              </ToastProvider>
-            </StoreProvider>
+            {/* STEP 16-G1A: read-only remote finance state — sibling to
+                StoreProvider, not nested inside it, so it can never be
+                touched by StoreProvider's persist-to-AsyncStorage effect.
+                See src/store/remoteFinance.tsx's header. */}
+            <RemoteFinanceProvider>
+              <StoreProvider>
+                <ToastProvider>
+                  <StatusBar style="dark" />
+                  <RootNav />
+                </ToastProvider>
+              </StoreProvider>
+            </RemoteFinanceProvider>
           </HouseholdProvider>
         </AuthProvider>
       </SafeAreaProvider>
