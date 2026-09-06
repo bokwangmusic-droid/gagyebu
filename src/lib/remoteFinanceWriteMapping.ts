@@ -99,3 +99,59 @@ export function buildTransactionInsert(
     tags: null,
   };
 }
+
+/* ================================================================== *
+ * UPDATE — STEP 16-G2-B
+ *
+ * The PATCH body for an existing transaction. ONLY the user-editable
+ * financial columns. Everything else is left out of the object entirely so
+ * PostgREST never touches it:
+ *   - id / household_id : addressed by `.eq(...)` filters, never the body
+ *   - created_by / created_at : server-locked by private.trg_lock_identity()
+ *   - updated_at : server-forced to now() by private.trg_touch_updated_at()
+ *   - deleted_at : soft-delete is its own service, never a plain edit
+ *   - from_recurring / from_planned / recurring_occurrence_date :
+ *     server-locked by private.trg_lock_transaction_provenance()
+ *   - member_id / tags : no editor in the UI — OMITTED (not null-ed) so the
+ *     stored value is preserved
+ *
+ * A feature turned OFF during an edit is sent as an explicit `null`
+ * (splits / card_id / installment_months), so the previous value is
+ * cleared rather than left behind.
+ * ================================================================== */
+
+export interface BuildTransactionUpdateContext {
+  knownCardIds: ReadonlySet<string>;
+}
+
+export interface TransactionUpdateRow {
+  type: TxnType;
+  category: string;
+  amount: number;
+  memo: string;
+  date: string;
+  payment_method: PaymentMethod | null;
+  card_id: string | null;
+  installment_months: number | null;
+  splits: TransactionSplit[] | null;
+}
+
+export function buildTransactionUpdate(
+  draft: NewTransactionDraft,
+  ctx: BuildTransactionUpdateContext,
+): TransactionUpdateRow {
+  const cardId =
+    draft.cardId && ctx.knownCardIds.has(draft.cardId) ? draft.cardId : null;
+
+  return {
+    type: draft.type,
+    category: draft.category,
+    amount: draft.amount,
+    memo: draft.memo,
+    date: draft.date,
+    payment_method: draft.paymentMethod ?? null,
+    card_id: cardId,
+    installment_months: draft.installment?.months ?? null,
+    splits: draft.splits && draft.splits.length > 0 ? draft.splits : null,
+  };
+}

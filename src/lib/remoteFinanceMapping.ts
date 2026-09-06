@@ -46,12 +46,29 @@ import type {
 } from '@/store/types';
 
 /**
+ * Remote-only bookkeeping for one transaction — STEP 16-G2-B.
+ *
+ * Kept OUT of the `Transaction` domain type on purpose (G1A §7): `updatedAt`
+ * / `createdBy` are sync/ownership metadata, not user-facing ledger data.
+ * `updatedAt` is the optimistic-concurrency token for edit / soft-delete —
+ * it is the RAW string PostgREST returned and MUST be passed straight back
+ * into `.eq('updated_at', …)` with no Date/toISOString round-trip, or the
+ * exact-match compare silently never matches.
+ */
+export interface RemoteTransactionMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
  */
 export interface RemoteFinanceData {
   transactions: Transaction[];
+  /** id -> remote-only metadata (write/concurrency only, never UI domain). */
+  transactionMeta: Record<string, RemoteTransactionMeta>;
   cards: CreditCard[];
   budgets: BudgetMap;
   recurring: RecurringRule[];
@@ -157,6 +174,14 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     memberId: t.member_id ?? undefined,
   }));
 
+  // Parallel to `transactions`, keyed by id. `updatedAt` is stored verbatim
+  // (the raw PostgREST timestamptz string) — it is an opaque concurrency
+  // token, never a value to format or re-parse (STEP 16-G2-B §4).
+  const transactionMeta: Record<string, RemoteTransactionMeta> = {};
+  for (const t of raw.transactions) {
+    transactionMeta[t.id] = { updatedAt: t.updated_at, createdBy: t.created_by };
+  }
+
   const budgets: BudgetMap = {};
   for (const b of raw.budgets) budgets[b.category_id] = b.amount;
 
@@ -212,6 +237,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
 
   return {
     transactions,
+    transactionMeta,
     cards,
     budgets,
     recurring,

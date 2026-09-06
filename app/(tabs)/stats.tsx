@@ -13,6 +13,7 @@ import { Screen } from '@/components/ui/Screen';
 import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
 import { inRange, sortedExpenseCategories, sumByType } from '@/lib/aggregate';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, fmtShort } from '@/lib/format';
 import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useFinanceRead } from '@/store/financeRead';
@@ -431,8 +432,13 @@ export default function StatsScreen() {
                       const md = `${d.getMonth() + 1}/${d.getDate()}`;
                       const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
                       return (
-                        <View
+                        <Pressable
                           key={t.id}
+                          onPress={() => {
+                            setSelectedBar(null);
+                            router.push({ pathname: '/input', params: { id: t.id } });
+                          }}
+                          disabled={!REMOTE_FINANCE_WRITE.transactionEdit}
                           style={{
                             flexDirection: 'row',
                             alignItems: 'center',
@@ -465,7 +471,7 @@ export default function StatsScreen() {
                           <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text, ...tabularNums }}>
                             −{fmt(t.amount)}원
                           </Text>
-                        </View>
+                        </Pressable>
                       );
                     })}
                 </View>

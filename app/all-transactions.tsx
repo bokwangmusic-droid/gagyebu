@@ -11,6 +11,7 @@ import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
 import { sumByType } from '@/lib/aggregate';
 import { fmt, toDateKey } from '@/lib/format';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { hasSplits } from '@/lib/splits';
 import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useFinanceRead } from '@/store/financeRead';
@@ -214,8 +215,10 @@ export default function AllTransactions() {
                       }`
                     : '';
                 return (
-                  <View
+                  <Pressable
                     key={t.id}
+                    onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
+                    disabled={!REMOTE_FINANCE_WRITE.transactionEdit}
                     style={{
                       flexDirection: 'row',
                       alignItems: 'center',
@@ -258,7 +261,7 @@ export default function AllTransactions() {
                       {t.type === 'income' ? '+' : '−'}
                       {fmt(t.amount)}원
                     </Text>
-                  </View>
+                  </Pressable>
                 );
               })}
             </View>

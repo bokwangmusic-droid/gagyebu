@@ -7,6 +7,7 @@ import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, toDateKey } from '@/lib/format';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -318,8 +319,10 @@ export default function CalendarScreen() {
                 const d = new Date(t.date);
                 const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
                 return (
-                  <View
+                  <Pressable
                     key={t.id}
+                    onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
+                    disabled={!REMOTE_FINANCE_WRITE.transactionEdit}
                     style={{
                       flexDirection: 'row',
                       alignItems: 'center',
@@ -360,7 +363,7 @@ export default function CalendarScreen() {
                       {t.type === 'income' ? '+' : '−'}
                       {fmt(t.amount)}원
                     </Text>
-                  </View>
+                  </Pressable>
                 );
               })}
           </View>

@@ -36,8 +36,10 @@ import type { PostgrestError } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
 import {
   buildTransactionInsert,
+  buildTransactionUpdate,
   type NewTransactionDraft,
   type TransactionInsertRow,
+  type TransactionUpdateRow,
 } from '@/lib/remoteFinanceWriteMapping';
 import type { TransactionSplit } from '@/store/types';
 
@@ -45,8 +47,21 @@ export type CreateTransactionResult =
   | { ok: true; id: string }
   | { ok: false; message: string };
 
+/** STEP 16-G2-B — every non-ok end state for an edit / soft delete. */
+export type WriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error';
+
+export type UpdateTransactionResult =
+  | { ok: true; updatedAt: string }
+  | { ok: false; reason: WriteConflictReason; message: string };
+
+export type SoftDeleteResult =
+  | { ok: true }
+  | { ok: false; reason: WriteConflictReason; message: string };
+
 const GENERIC_ERROR = '거래를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
+const EDIT_CONFLICT = '다른 곳에서 변경됐거나 삭제된 거래예요. 최신 내용을 다시 불러올게요.';
+const DELETE_CONFLICT = '다른 곳에서 이미 변경됐거나 삭제된 거래예요.';
 
 /** Never surfaces raw Postgres/PostgREST internals (mirrors src/services/remoteFinance.ts). */
 function describeWriteError(error: PostgrestError): string {
@@ -176,4 +191,143 @@ export async function createTransaction(args: {
 
   if (error) return { ok: false, message: describeWriteError(error) };
   return { ok: false, message: GENERIC_ERROR };
+}
+
+/* ================================================================== *
+ * UPDATE + SOFT DELETE — STEP 16-G2-B
+ *
+ * Shared-ledger policy: any household member may edit or soft-delete any of
+ * the household's transactions (the existing transactions_update RLS
+ * already permits exactly this — no created_by restriction, no migration).
+ * Both operations are optimistic-concurrency-guarded on `updated_at`: the
+ * edit screen captures the token it first saw and passes it back verbatim;
+ * a mismatch (someone else changed or deleted the row first) fails the
+ * write instead of silently overwriting.
+ *
+ * Hard DELETE is never used — there is no client DELETE grant/policy, and
+ * "delete" means `UPDATE ... SET deleted_at = <now>`.
+ * ================================================================== */
+
+/**
+ * Does the stored row already hold exactly what this edit would write?
+ * Used only on the 0-row path, to tell "my earlier UPDATE landed but its
+ * response was lost" (idempotent success) from a genuine concurrent change.
+ * `updated_at` is NOT part of this — it is the token, not desired content.
+ */
+function financialFieldsMatch(
+  existing: Record<string, unknown>,
+  row: TransactionUpdateRow,
+): boolean {
+  return (
+    existing.type === row.type &&
+    existing.category === row.category &&
+    Number(existing.amount) === Number(row.amount) &&
+    ((existing.memo as string | null) ?? '') === row.memo &&
+    new Date(existing.date as string).getTime() === new Date(row.date).getTime() &&
+    ((existing.payment_method as string | null) ?? null) === row.payment_method &&
+    ((existing.card_id as string | null) ?? null) === row.card_id &&
+    ((existing.installment_months as number | null) ?? null) === row.installment_months &&
+    splitsEqual(existing.splits, row.splits)
+  );
+}
+
+export async function updateTransaction(args: {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  /** RAW PostgREST timestamptz string the edit screen first saw — never re-parsed. */
+  expectedUpdatedAt: string;
+  draft: NewTransactionDraft;
+  knownCardIds: ReadonlySet<string>;
+}): Promise<UpdateTransactionResult> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  const liveUserId = sessionData.session?.user?.id ?? null;
+  if (!liveUserId) return { ok: false, reason: 'identity', message: '다시 로그인해 주세요.' };
+  if (liveUserId !== args.expectedUserId) {
+    return { ok: false, reason: 'identity', message: IDENTITY_CHANGED };
+  }
+
+  const row = buildTransactionUpdate(args.draft, { knownCardIds: args.knownCardIds });
+
+  const { data, error } = await supabase
+    .from('transactions')
+    .update(row)
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .eq('updated_at', args.expectedUpdatedAt)
+    .is('deleted_at', null)
+    .select('id, updated_at')
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
+
+  // 0 rows — reconcile against the current row (no updated_at / deleted_at filter).
+  const { data: existing, error: readErr } = await supabase
+    .from('transactions')
+    .select(
+      'id,type,category,amount,memo,date,payment_method,card_id,installment_months,splits,deleted_at,updated_at',
+    )
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .maybeSingle();
+
+  if (readErr || !existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
+
+  const existingRow = existing as Record<string, unknown>;
+  if (existingRow.deleted_at != null) {
+    return { ok: false, reason: 'deleted', message: EDIT_CONFLICT };
+  }
+  if (financialFieldsMatch(existingRow, row)) {
+    // Our earlier UPDATE already succeeded; only the response was lost.
+    return { ok: true, updatedAt: existingRow.updated_at as string };
+  }
+  return { ok: false, reason: 'conflict', message: EDIT_CONFLICT };
+}
+
+export async function softDeleteTransaction(args: {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  /** RAW PostgREST timestamptz string the edit screen first saw — never re-parsed. */
+  expectedUpdatedAt: string;
+}): Promise<SoftDeleteResult> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  const liveUserId = sessionData.session?.user?.id ?? null;
+  if (!liveUserId) return { ok: false, reason: 'identity', message: '다시 로그인해 주세요.' };
+  if (liveUserId !== args.expectedUserId) {
+    return { ok: false, reason: 'identity', message: IDENTITY_CHANGED };
+  }
+
+  // Soft delete = UPDATE deleted_at. `deleted_at` here is a client marker;
+  // the server's trg_touch_updated_at still stamps updated_at = now() on
+  // this same UPDATE. No hard DELETE, no migration.
+  const { data, error } = await supabase
+    .from('transactions')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .eq('updated_at', args.expectedUpdatedAt)
+    .is('deleted_at', null)
+    .select('id, deleted_at, updated_at')
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (data?.id) return { ok: true };
+
+  // 0 rows — reconcile (no updated_at / deleted_at filter).
+  const { data: existing, error: readErr } = await supabase
+    .from('transactions')
+    .select('id, deleted_at, updated_at')
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .maybeSingle();
+
+  if (readErr || !existing) return { ok: false, reason: 'gone', message: DELETE_CONFLICT };
+  if ((existing as Record<string, unknown>).deleted_at != null) {
+    // Already soft-deleted — our earlier delete landed, response was lost.
+    return { ok: true };
+  }
+  // Row is still active but our updated_at no longer matches: someone edited it first.
+  return { ok: false, reason: 'conflict', message: DELETE_CONFLICT };
 }

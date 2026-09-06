@@ -30,6 +30,7 @@ import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
 import { uid } from '@/lib/id';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
+import type { RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import { type NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
   checkSplits,
@@ -38,11 +39,15 @@ import {
   SPLIT_ERROR_TEXT,
   type SplitDraft,
 } from '@/lib/splits';
-import { createTransaction } from '@/services/remoteFinanceWrite';
+import {
+  createTransaction,
+  softDeleteTransaction,
+  updateTransaction,
+} from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
-import type { PaymentMethod } from '@/store/types';
+import type { PaymentMethod, Transaction } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
 
@@ -115,32 +120,127 @@ function applyMonthsKey(cur: string, k: string): string {
 }
 
 /**
- * Route entry for /input — STEP 16-G2-A.
+ * Route entry for /input — STEP 16-G2-A (create), extended in
+ * STEP 16-G2-B (edit + soft delete).
  *
- *   /input           -> the new-transaction form (the ONE financial write
- *                       now open, REMOTE_FINANCE_WRITE.transactionCreate).
- *   /input?id=<any>  -> ReadOnlyRouteNotice. Editing an existing
- *                       transaction stays closed this STEP; a deep link
- *                       that supplies an id can never mount the form.
+ *   /input            -> new-transaction form  (REMOTE_FINANCE_WRITE.transactionCreate)
+ *   /input?id=<txn>   -> edit form             (REMOTE_FINANCE_WRITE.transactionEdit)
  *
- * The param check lives in this thin wrapper so NewTransactionForm below
- * keeps an unconditional hook order — a runtime `if (params.id) return`
- * inside the form would sit above its hooks and break the rules of hooks.
- * Expo Router can hand back `string | string[]`, so both are handled.
+ * Either capability off -> ReadOnlyRouteNotice. The capability + param
+ * checks live in this thin wrapper so TransactionForm keeps an
+ * unconditional hook order. Expo Router can hand back `string | string[]`,
+ * so both are handled.
  */
 export default function InputRoute() {
   const params = useLocalSearchParams<{ id?: string | string[] }>();
   const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
 
-  if (idParam) return <ReadOnlyRouteNotice title="거래 수정" />;
-  if (!REMOTE_FINANCE_WRITE.transactionCreate) {
-    return <ReadOnlyRouteNotice title="거래 입력" />;
+  if (idParam) {
+    if (!REMOTE_FINANCE_WRITE.transactionEdit) return <ReadOnlyRouteNotice title="거래 수정" />;
+    return <TransactionFormRoute editId={idParam} />;
   }
-
-  return <NewTransactionForm />;
+  if (!REMOTE_FINANCE_WRITE.transactionCreate) return <ReadOnlyRouteNotice title="거래 입력" />;
+  return <TransactionFormRoute editId={null} />;
 }
 
-function NewTransactionForm() {
+type FormMode =
+  | { kind: 'create' }
+  | { kind: 'edit'; transaction: Transaction; meta: RemoteTransactionMeta };
+
+/**
+ * Resolves create vs edit. For edit, finds the target transaction and its
+ * concurrency metadata from useFinanceRead() — NEVER useStore(). The form
+ * itself only mounts once its `mode` is fully known, so its hooks stay
+ * unconditional; the `key` forces a clean remount when the target changes.
+ */
+function TransactionFormRoute({ editId }: { editId: string | null }) {
+  const router = useRouter();
+  const { status, error, transactions, transactionMeta, refresh } = useFinanceRead();
+
+  if (editId == null) {
+    return <TransactionForm key="create" mode={{ kind: 'create' }} />;
+  }
+
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="거래 수정" onClose={() => router.back()} scroll={false}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
+  const transaction = transactions.find((t) => t.id === editId) ?? null;
+  const meta = transactionMeta[editId] ?? null;
+
+  if (!transaction) {
+    return (
+      <EditUnavailable
+        body="이미 삭제됐거나 다른 우리집의 거래일 수 있어요."
+        title="거래를 찾을 수 없어요"
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+  if (!meta) {
+    // No concurrency token -> a safe edit is impossible. Never open the form.
+    return (
+      <EditUnavailable
+        body="잠시 후 다시 시도해 주세요."
+        title="거래 정보를 불러오지 못했어요"
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+
+  return <TransactionForm key={editId} mode={{ kind: 'edit', transaction, meta }} />;
+}
+
+function EditUnavailable({
+  title,
+  body,
+  onRetry,
+}: {
+  title: string;
+  body: string;
+  onRetry: () => void;
+}) {
+  const router = useRouter();
+  return (
+    <ModalScreen title="거래 수정" onClose={() => router.back()} scroll={false}>
+      <View
+        style={{
+          flex: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          paddingHorizontal: spacing.xl,
+          gap: spacing.md,
+        }}
+      >
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+          {title}
+        </Text>
+        <Text
+          style={{
+            fontFamily: fontFamily.regular,
+            fontSize: 13,
+            color: colors.textSub,
+            textAlign: 'center',
+            lineHeight: 19,
+          }}
+        >
+          {body}
+        </Text>
+        <Pressable onPress={onRetry} hitSlop={8}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+            다시 불러오기
+          </Text>
+        </Pressable>
+      </View>
+    </ModalScreen>
+  );
+}
+
+function TransactionForm({ mode }: { mode: FormMode }) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const toast = useToast();
@@ -153,13 +253,21 @@ function NewTransactionForm() {
   // catOrder are always trusted household data wherever they are used.
   const { status, error, cards, customCats, catOrder, refresh } = useFinanceRead();
 
-  const saveLabel = '저장하기';
+  // In edit mode, `editing` seeds every field; the concurrency token is
+  // captured ONCE here (useRef initial value) from the meta this form was
+  // mounted with — a later background refresh must never swap it out, or
+  // conflict detection becomes meaningless (STEP 16-G2-B §20).
+  const editing = mode.kind === 'edit' ? mode.transaction : null;
+  const isEdit = mode.kind === 'edit';
+  const expectedUpdatedAtRef = useRef(mode.kind === 'edit' ? mode.meta.updatedAt : null);
 
-  const [type, setType] = useState<TxnType>('expense');
-  const [amount, setAmount] = useState('');
-  const [category, setCategory] = useState('food');
-  const [memo, setMemo] = useState('');
-  const [selectedDate, setSelectedDate] = useState(() => toDateKey(new Date()));
+  const saveLabel = isEdit ? '수정하기' : '저장하기';
+
+  const [type, setType] = useState<TxnType>(editing?.type ?? 'expense');
+  const [amount, setAmount] = useState(editing ? String(editing.amount) : '');
+  const [category, setCategory] = useState(editing?.category ?? 'food');
+  const [memo, setMemo] = useState(editing?.memo ?? '');
+  const [selectedDate, setSelectedDate] = useState(() => toDateKey(editing?.date ?? new Date()));
 
   // One inline keypad, one active target. `padVisible`/`setPadVisible` are kept
   // as a thin shim over it so every existing call site ("collapse the pad",
@@ -168,18 +276,23 @@ function NewTransactionForm() {
   const padVisible = numTarget !== null;
   const setPadVisible = (v: boolean) => setNumTarget(v ? { kind: 'main' } : null);
 
-  // Split expense — off by default; a normal single-category entry is unchanged.
-  const [splitOn, setSplitOn] = useState(false);
-  const [splits, setSplits] = useState<SplitDraft[]>(() => [
-    makeSplitDraft('food'),
-    makeSplitDraft('transit'),
-  ]);
+  // Split expense — off unless the transaction being edited has splits.
+  const [splitOn, setSplitOn] = useState(!!editing?.splits?.length);
+  const [splits, setSplits] = useState<SplitDraft[]>(() =>
+    editing?.splits?.length
+      ? editing.splits.map((s) => ({ category: s.category, amount: String(s.amount) }))
+      : [makeSplitDraft('food'), makeSplitDraft('transit')],
+  );
 
   // Payment method / card / 할부 — all optional; absent = plain single entry.
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | undefined>(undefined);
-  const [cardId, setCardId] = useState<string | undefined>(undefined);
-  const [installmentOn, setInstallmentOn] = useState(false);
-  const [installmentMonths, setInstallmentMonths] = useState('3');
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | undefined>(
+    editing?.paymentMethod,
+  );
+  const [cardId, setCardId] = useState<string | undefined>(editing?.cardId);
+  const [installmentOn, setInstallmentOn] = useState(!!editing?.installment);
+  const [installmentMonths, setInstallmentMonths] = useState(
+    editing?.installment ? String(editing.installment.months) : '3',
+  );
 
   const [showDate, setShowDate] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
@@ -329,53 +442,49 @@ function NewTransactionForm() {
     return () => sub.remove();
   }, [showPaste, showQuick]);
 
-  // Double-submit defence (STEP 16-G2-A2 §9/§10):
-  //  - transactionIdRef: the client-generated transactions.id, minted ONCE
-  //    per form mount and reused on every retry. A retried save (or an
-  //    INSERT whose success response was lost) can never create a second
-  //    row — the DB rejects the duplicate PK and createTransaction()
-  //    verifies the existing row is our own request before reporting ok.
-  //  - submittingRef: synchronous re-entry guard (state updates are async).
-  //  - submitting (state): drives the disabled + "저장 중…" button UI.
+  // Double-submit defence.
+  //  - transactionIdRef: client-generated id for CREATE only, minted ONCE
+  //    per form mount and reused on every retry (PK 23505-hardened
+  //    idempotency in createTransaction()). Unused in edit mode.
+  //  - submittingRef / submitting: sync + UI re-entry guard for save
+  //    (create & edit).  deletingRef / deleting: same for soft delete.
   const transactionIdRef = useRef(uid('txn'));
   const submittingRef = useRef(false);
   const [submitting, setSubmitting] = useState(false);
+  const deletingRef = useRef(false);
+  const [deleting, setDeleting] = useState(false);
 
-  const save = async () => {
-    if (submittingRef.current || !canSave) return;
-
-    // Trusted-context gate (STEP 16-G2-A2 §11). status === 'ready' already
-    // means useFinanceRead() confirmed the remote data is for THIS
-    // user+household; still require an explicit session + activeHousehold,
-    // and always write against the CURRENT activeHousehold.id.
-    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
-    if (selectedDate > today) return;
-
+  /** Draft-state -> NewTransactionDraft, or null when the form isn't valid. */
+  const buildDraft = (): NewTransactionDraft | null => {
     // Defensive re-validation — the DB has CHECK/FK constraints but we do
     // not lean on them for UX (STEP 16-G2-A2 §12).
-    if (!(total > 0)) return;
-    if (type !== 'expense' && type !== 'income') return;
+    if (!(total > 0)) return null;
+    if (type !== 'expense' && type !== 'income') return null;
     const isCredit = type === 'expense' && paymentMethod === 'credit';
-    if (splitOn && !splitCheck.ok) return;
-    if (isCredit && installmentOn && !(instMonths >= 2)) return;
+    if (splitOn && !splitCheck.ok) return null;
+    if (isCredit && installmentOn && !(instMonths >= 2)) return null;
     const categoryToSave = splitOn ? splits[0].category : category;
-    if (!categoryToSave) return;
+    if (!categoryToSave) return null;
 
-    submittingRef.current = true;
-    setSubmitting(true);
+    // Edit + date unchanged -> keep the transaction's original instant
+    // (its time of day), matching the pre-G1B edit UX.
+    let dateISO: string;
+    if (editing && toDateKey(editing.date) === selectedDate) {
+      dateISO = editing.date;
+    } else {
+      const now = new Date();
+      const [y, m, d] = selectedDate.split('-').map(Number);
+      dateISO = new Date(
+        y,
+        m - 1,
+        d,
+        now.getHours(),
+        now.getMinutes(),
+        now.getSeconds(),
+      ).toISOString();
+    }
 
-    const now = new Date();
-    const [y, m, d] = selectedDate.split('-').map(Number);
-    const dateISO = new Date(
-      y,
-      m - 1,
-      d,
-      now.getHours(),
-      now.getMinutes(),
-      now.getSeconds(),
-    ).toISOString();
-
-    const draft: NewTransactionDraft = {
+    return {
       type,
       // A representative category so list rows still show an icon;
       // aggregation ignores it whenever `splits` is present.
@@ -389,36 +498,128 @@ function NewTransactionForm() {
         isCredit && installmentOn && instMonths >= 2 ? { months: instMonths } : undefined,
       splits: splitOn ? normSplits : undefined,
     };
+  };
 
-    const res = await createTransaction({
-      id: transactionIdRef.current,
-      householdId: activeHousehold.id,
-      // The session id this trusted screen was validated against — the
-      // service refuses to write (and refuses idempotent-success) if the
-      // live session has since switched accounts (STEP 16-G2-A2-HARDEN).
-      expectedUserId: session.user.id,
-      draft,
-      knownCardIds: new Set(cards.map((c) => c.id)),
-    });
+  const save = async () => {
+    if (submittingRef.current || deletingRef.current || !canSave) return;
+    // Trusted-context gate (STEP 16-G2-A2 §11 / 16-G2-B §20).
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+    if (selectedDate > today) return;
 
-    if (!res.ok) {
-      // transactionIdRef is unchanged — a retry reuses the same id.
-      submittingRef.current = false;
-      setSubmitting(false);
-      toast.show(res.message);
+    const draft = buildDraft();
+    if (!draft) return;
+    const knownCardIds = new Set(cards.map((c) => c.id));
+
+    submittingRef.current = true;
+    setSubmitting(true);
+
+    if (mode.kind === 'create') {
+      const res = await createTransaction({
+        id: transactionIdRef.current,
+        householdId: activeHousehold.id,
+        // Session id this trusted screen was validated against — the service
+        // refuses to write if the live session switched accounts (HARDEN).
+        expectedUserId: session.user.id,
+        draft,
+        knownCardIds,
+      });
+      if (!res.ok) {
+        // transactionIdRef is unchanged — a retry reuses the same id.
+        submittingRef.current = false;
+        setSubmitting(false);
+        toast.show(res.message);
+        return;
+      }
+      // Authoritative remote refresh, then leave — no optimistic local
+      // write, no stale-closure re-check (STEP 16-G2-A2 §13/§19).
+      await refresh();
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show('저장했어요');
+      router.back();
       return;
     }
 
-    // INSERT succeeded. Authoritative remote refresh, then leave — no
-    // optimistic local write, no stale-closure re-check of the result
-    // (STEP 16-G2-A2 §13/§19). Home renders the refreshed remote snapshot
-    // and its own FinanceLoadState handles any refresh error. Deliberately
-    // do NOT reset `submitting` — the screen is closing.
+    // ---- edit ---- expectedUpdatedAt is the token captured at MOUNT
+    // (expectedUpdatedAtRef), never re-fetched — that is what makes the
+    // conflict check meaningful (STEP 16-G2-B §20).
+    const token = expectedUpdatedAtRef.current;
+    if (!token) {
+      submittingRef.current = false;
+      setSubmitting(false);
+      toast.show('거래 정보를 다시 불러와 주세요.');
+      return;
+    }
+    const res = await updateTransaction({
+      id: mode.transaction.id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: token,
+      draft,
+      knownCardIds,
+    });
+    if (!res.ok) {
+      submittingRef.current = false;
+      setSubmitting(false);
+      if (res.reason === 'identity' || res.reason === 'error') {
+        toast.show(res.message);
+        return;
+      }
+      // conflict / deleted / gone — reload authoritative data and leave the
+      // stale form rather than let it overwrite (STEP 16-G2-B §11).
+      await refresh();
+      toast.show(res.message);
+      router.back();
+      return;
+    }
     await refresh();
-    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
-      () => {},
-    );
-    toast.show('저장했어요');
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    toast.show('수정했어요');
+    router.back();
+  };
+
+  const confirmDelete = () => {
+    if (mode.kind !== 'edit' || submittingRef.current || deletingRef.current) return;
+    Alert.alert('이 거래를 삭제할까요?', '함께 쓰는 가계부에서도 보이지 않게 돼요.', [
+      { text: '취소', style: 'cancel' },
+      { text: '삭제', style: 'destructive', onPress: () => void doDelete() },
+    ]);
+  };
+
+  const doDelete = async () => {
+    if (mode.kind !== 'edit' || submittingRef.current || deletingRef.current) return;
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+    const token = expectedUpdatedAtRef.current;
+    if (!token) {
+      toast.show('거래 정보를 다시 불러와 주세요.');
+      return;
+    }
+
+    deletingRef.current = true;
+    setDeleting(true);
+
+    const res = await softDeleteTransaction({
+      id: mode.transaction.id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: token,
+    });
+
+    if (res.ok) {
+      await refresh();
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show('삭제했어요');
+      router.back();
+      return;
+    }
+
+    deletingRef.current = false;
+    setDeleting(false);
+    if (res.reason === 'identity' || res.reason === 'error') {
+      toast.show(res.message);
+      return;
+    }
+    await refresh();
+    toast.show(res.message);
     router.back();
   };
 
@@ -501,7 +702,7 @@ function NewTransactionForm() {
   // fallback — same rule as every other finance screen (STEP 16-G1B).
   if (status !== 'ready') {
     return (
-      <ModalScreen title="거래 입력" onClose={() => router.back()} scroll={false}>
+      <ModalScreen title={isEdit ? '거래 수정' : '거래 입력'} onClose={() => router.back()} scroll={false}>
         <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
       </ModalScreen>
     );
@@ -521,8 +722,20 @@ function NewTransactionForm() {
           <AppIcon name="chevron" size={12} color={colors.textMuted} />
         </Pressable>
 
-        {/* New-transaction only — no edit/delete affordance this STEP. */}
-        <View style={{ width: 30 }} />
+        {isEdit ? (
+          <Pressable
+            onPress={confirmDelete}
+            disabled={submitting || deleting}
+            hitSlop={10}
+            style={{ paddingHorizontal: 6, paddingVertical: 4, opacity: submitting || deleting ? 0.4 : 1 }}
+          >
+            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.expenseText }}>
+              {deleting ? '삭제 중…' : '삭제'}
+            </Text>
+          </Pressable>
+        ) : (
+          <View style={{ width: 30 }} />
+        )}
       </View>
 
       {/* One vertical scroll for the whole form — only the header above and the
@@ -1051,10 +1264,10 @@ function NewTransactionForm() {
 
           <Pressable
             onPress={() => void save()}
-            disabled={!canSave || submitting}
+            disabled={!canSave || submitting || deleting}
             style={({ pressed }) => [
               styles.saveBtn,
-              { opacity: !canSave || submitting ? 0.4 : pressed ? 0.92 : 1, marginTop: 10 },
+              { opacity: !canSave || submitting || deleting ? 0.4 : pressed ? 0.92 : 1, marginTop: 10 },
             ]}
           >
             <LinearGradient
@@ -1079,10 +1292,10 @@ function NewTransactionForm() {
           </Pressable>
           <Pressable
             onPress={() => void save()}
-            disabled={!canSave || submitting}
+            disabled={!canSave || submitting || deleting}
             style={({ pressed }) => [
               styles.saveBtn,
-              { flex: 1, opacity: !canSave || submitting ? 0.4 : pressed ? 0.92 : 1 },
+              { flex: 1, opacity: !canSave || submitting || deleting ? 0.4 : pressed ? 0.92 : 1 },
             ]}
           >
             <LinearGradient

@@ -49,6 +49,14 @@ import { supabase } from '@/lib/supabase';
  * tables whose local type has a required `createdAt` field (cards/
  * recurring_rules/planned_expenses/goals/loans) — that one is a genuine
  * domain-field overlap, not sync-only metadata.
+ *
+ * STEP 16-G2-B: `transactions` additionally selects `created_by` and
+ * `updated_at`. These are NOT folded into the local `Transaction` domain
+ * type — src/lib/remoteFinanceMapping.ts routes them into a SEPARATE
+ * `transactionMeta` map. `updated_at` is the optimistic-concurrency token
+ * for edit/soft-delete (compared with an exact `.eq('updated_at', …)`), so
+ * it must travel as the RAW PostgREST string — never re-parsed through
+ * Date/toISOString anywhere.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -144,6 +152,10 @@ export interface RemoteTransaction {
   splits: unknown;
   tags: string[] | null;
   member_id: string | null;
+  /** STEP 16-G2-B — routed to transactionMeta, NOT the Transaction domain type. */
+  created_by: string | null;
+  /** Optimistic-concurrency token. RAW PostgREST timestamptz string; never re-serialize. */
+  updated_at: string;
 }
 
 export interface RemoteBudgetRow {
@@ -260,7 +272,7 @@ export async function fetchHouseholdFinanceSnapshot(
     supabase
       .from('transactions')
       .select(
-        'id,type,category,amount,memo,date,from_recurring,from_planned,payment_method,card_id,installment_months,splits,tags,member_id',
+        'id,type,category,amount,memo,date,from_recurring,from_planned,payment_method,card_id,installment_months,splits,tags,member_id,created_by,updated_at',
       )
       .eq('household_id', householdId)
       .is('deleted_at', null),

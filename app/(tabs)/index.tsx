@@ -13,6 +13,7 @@ import { getCat } from '@/data/categories';
 import { monthlyTotals } from '@/lib/aggregate';
 import { cardBillingForMonth } from '@/lib/card';
 import { fmt, formatMonthLabel, formatRelativeDateTime, toDateKey } from '@/lib/format';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { buildInsights, type Insight } from '@/lib/insights';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -387,12 +388,15 @@ export default function HomeScreen() {
         </View>
       ) : (
         <Card variant="sm" style={{ paddingVertical: 4, paddingHorizontal: spacing.lg }}>
-          {/* STEP 16-G1B: read-only — no onPress into /input for editing. */}
+          {/* STEP 16-G2-B: row opens the edit form; a plain (non-pressable)
+              row when transaction editing is off. */}
           {recent.map((t, i) => {
             const cat = getCat(t.category, t.type, customCats);
             return (
-              <View
+              <Pressable
                 key={t.id}
+                onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
+                disabled={!REMOTE_FINANCE_WRITE.transactionEdit}
                 style={{
                   flexDirection: 'row',
                   alignItems: 'center',
@@ -436,7 +440,7 @@ export default function HomeScreen() {
                   {t.type === 'income' ? '+' : '−'}
                   {fmt(t.amount)}원
                 </Text>
-              </View>
+              </Pressable>
             );
           })}
         </Card>

@@ -10,8 +10,10 @@
  */
 import {
   buildTransactionInsert,
+  buildTransactionUpdate,
   type NewTransactionDraft,
   type TransactionInsertRow,
+  type TransactionUpdateRow,
 } from '@/lib/remoteFinanceWriteMapping';
 
 const HID = 'hh-1111';
@@ -200,6 +202,174 @@ export function runMapperCases(cases: MapperCase[] = MAPPER_CASES): {
             forbidden.length ? `forbidden keys: ${forbidden.join(',')}` : '',
             unexpected.length ? `unexpected keys: ${unexpected.join(',')}` : '',
             memberIdOk ? '' : `member_id=${JSON.stringify(row.member_id)} (want null)`,
+            fieldMiss ?? '',
+          ]
+            .filter(Boolean)
+            .join(' · '),
+    };
+  });
+
+  const failed = results.filter((r) => !r.pass).length;
+  return { results, passed: results.length - failed, failed };
+}
+
+/* ================================================================== *
+ * UPDATE mapper — STEP 16-G2-B
+ * ================================================================== */
+
+/** Every column allowed in a transaction PATCH body. */
+const UPDATE_ALLOWED_KEYS: (keyof TransactionUpdateRow)[] = [
+  'type',
+  'category',
+  'amount',
+  'memo',
+  'date',
+  'payment_method',
+  'card_id',
+  'installment_months',
+  'splits',
+];
+
+/**
+ * Columns that must NEVER appear in a PATCH body: server-locked identity,
+ * server-forced timestamps, soft-delete marker, locked provenance, and the
+ * two fields the UI has no editor for (must be preserved, not null-ed).
+ */
+const UPDATE_FORBIDDEN_KEYS = [
+  'id',
+  'household_id',
+  'member_id',
+  'tags',
+  'created_by',
+  'created_at',
+  'updated_at',
+  'deleted_at',
+  'from_recurring',
+  'from_planned',
+  'recurring_occurrence_date',
+];
+
+export interface UpdateMapperCase {
+  name: string;
+  draft: NewTransactionDraft;
+  knownCardIds: string[];
+  expect: Partial<TransactionUpdateRow>;
+}
+
+export const UPDATE_MAPPER_CASES: UpdateMapperCase[] = [
+  {
+    name: 'normal expense update',
+    draft: { type: 'expense', category: 'food', amount: 12000, memo: '점심 변경', date: '2026-09-06T03:00:00.000Z' },
+    knownCardIds: [],
+    expect: {
+      type: 'expense',
+      category: 'food',
+      amount: 12000,
+      memo: '점심 변경',
+      date: '2026-09-06T03:00:00.000Z',
+      payment_method: null,
+      card_id: null,
+      installment_months: null,
+      splits: null,
+    },
+  },
+  {
+    name: 'income update',
+    draft: { type: 'income', category: 'salary', amount: 3300000, memo: '', date: '2026-09-01T00:00:00.000Z' },
+    knownCardIds: [],
+    expect: { type: 'income', category: 'salary', amount: 3300000, memo: '', payment_method: null, card_id: null },
+  },
+  {
+    name: 'known credit card',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 40000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit', cardId: 'card-A',
+    },
+    knownCardIds: ['card-A', 'card-B'],
+    expect: { payment_method: 'credit', card_id: 'card-A' },
+  },
+  {
+    name: 'unknown / dangling card -> null',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 40000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit', cardId: 'card-DELETED',
+    },
+    knownCardIds: ['card-A'],
+    expect: { payment_method: 'credit', card_id: null },
+  },
+  {
+    name: 'installment off -> null',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 40000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit', cardId: 'card-A',
+    },
+    knownCardIds: ['card-A'],
+    expect: { installment_months: null },
+  },
+  {
+    name: 'installment 6 kept',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 60000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit', cardId: 'card-A', installment: { months: 6 },
+    },
+    knownCardIds: ['card-A'],
+    expect: { installment_months: 6 },
+  },
+  {
+    name: 'splits off -> null',
+    draft: { type: 'expense', category: 'food', amount: 5000, memo: '', date: '2026-09-06T03:00:00.000Z', splits: [] },
+    knownCardIds: [],
+    expect: { splits: null },
+  },
+  {
+    name: 'splits kept (order preserved)',
+    draft: {
+      type: 'expense', category: 'food', amount: 50000, memo: '마트', date: '2026-09-06T03:00:00.000Z',
+      splits: [
+        { category: 'food', amount: 30000 },
+        { category: 'shopping', amount: 20000 },
+      ],
+    },
+    knownCardIds: [],
+    expect: {
+      splits: [
+        { category: 'food', amount: 30000 },
+        { category: 'shopping', amount: 20000 },
+      ],
+    },
+  },
+];
+
+export function runUpdateMapperCases(cases: UpdateMapperCase[] = UPDATE_MAPPER_CASES): {
+  results: MapperCaseResult[];
+  passed: number;
+  failed: number;
+} {
+  const results = cases.map((c) => {
+    const row = buildTransactionUpdate(c.draft, { knownCardIds: new Set(c.knownCardIds) });
+    const keys = Object.keys(row);
+
+    const forbidden = keys.filter((k) => UPDATE_FORBIDDEN_KEYS.includes(k));
+    const unexpected = keys.filter((k) => !UPDATE_ALLOWED_KEYS.includes(k as keyof TransactionUpdateRow));
+
+    let fieldMiss: string | null = null;
+    for (const [k, v] of Object.entries(c.expect)) {
+      const g = (row as unknown as Record<string, unknown>)[k];
+      if (JSON.stringify(g) !== JSON.stringify(v)) {
+        fieldMiss = `${k}: got ${JSON.stringify(g)}, want ${JSON.stringify(v)}`;
+        break;
+      }
+    }
+
+    const pass = forbidden.length === 0 && unexpected.length === 0 && fieldMiss === null;
+    return {
+      name: c.name,
+      pass,
+      detail: pass
+        ? 'ok'
+        : [
+            forbidden.length ? `forbidden keys: ${forbidden.join(',')}` : '',
+            unexpected.length ? `unexpected keys: ${unexpected.join(',')}` : '',
             fieldMiss ?? '',
           ]
             .filter(Boolean)
