@@ -300,6 +300,10 @@ export default function Backup() {
           style={{ marginBottom: spacing.lg }}
         />
 
+        <Text style={[styles.hint, { marginBottom: spacing.lg }]}>
+          이 화면은 이 기기의 로컬 데이터에만 적용돼요. 우리집 가계부 데이터에는 영향을 주지 않아요.
+        </Text>
+
         {mode === 'snapshots' ? (
           <View style={{ flex: 1 }}>
             <Text style={styles.hint}>

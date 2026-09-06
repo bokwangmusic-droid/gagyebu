@@ -19,13 +19,19 @@ import { fontMap } from '@/theme/typography';
 void SplashScreen.preventAutoHideAsync();
 
 /**
- * STEP 16-D/16-E: the existing local-first app (onboarding + (tabs) + every
- * modal screen below) is intentionally unreachable while true — even once a
- * user has a connected household (app/household-ready.tsx), no local->
- * household data migration policy exists yet for their AsyncStorage
- * financial data to safely land in. Nothing below this flag is deleted or
- * modified; a future STEP flips this (or replaces it with a real check)
- * once that migration policy is decided.
+ * STEP 16-D/16-E, narrowed by STEP 16-G1B: gates ONLY `Gate` (onboarding
+ * redirect) and `BootEffects` (recurring auto-transaction generation,
+ * planned-due alerts, local auto-backup) below — never route reachability.
+ * Route reachability for (tabs)/finance screens is governed entirely by
+ * `HOUSEHOLD_READY_SCREENS` (below), independent of this flag. This flag
+ * stays false: BootEffects' recurring-auto-generation mutates local
+ * financial data via `addTransaction`, which STEP 16-G1B's read-only mode
+ * must not allow to run against a household's remote data being displayed
+ * — and since it operates on `useStore()`'s LOCAL data regardless, running
+ * it while remote finance is on screen would only be confusing even if it
+ * were otherwise harmless. `onboarding` itself was never part of the
+ * household flow and stays unreachable too. See the completion report
+ * §10 for the full reasoning.
  */
 const LEGACY_APP_REACHABLE = false;
 
@@ -40,11 +46,49 @@ const HOUSEHOLD_SETUP_SCREENS = ['household-setup', 'household-create', 'househo
 // STEP 16-G1A: read-only remote household finance preview — see
 // app/remote-data-preview.tsx. Owner AND member reachable (unlike
 // migration-preview, which is owner-only local-data territory).
+//
+// STEP 16-G1B reopens the existing finance UI in READ-ONLY mode. This is
+// the actual reachability gate for it — NOT LEGACY_APP_REACHABLE, which
+// stays false and keeps meaning exactly what it always has (Gate/
+// BootEffects off). Two groups, both listed here so AuthGate stops
+// bouncing away from them, but with very different in-screen behaviour:
+//   - READ screens: '(tabs)' (home/stats/budget/planned/profile — all one
+//     route group, so one entry covers all five), all-transactions,
+//     calendar, cards, goals, loans, recurring. Each was rewired to read
+//     via src/store/financeRead.ts's useFinanceRead() instead of
+//     useStore(), with every inline add/edit/delete/toggle control
+//     removed from the screen itself (see the completion report's audit
+//     table) — reachable AND fully functional for viewing.
+//   - WRITE screens: input, card-add, budget-add, recurring-add,
+//     planned-add, goal-add, loan-add, categories. Reachable (so tapping
+//     into one doesn't bounce jarringly) but each renders
+//     <ReadOnlyRouteNotice/> instead of its real form — see the guard at
+//     the top of each of those files (src/lib/financeMode.ts's
+//     REMOTE_FINANCE_READ_ONLY).
+// 'backup' (STEP 8) stays reachable too — it only ever reads/writes this
+// device's LOCAL gagyebu.* backup snapshots, never remote household data,
+// so it isn't part of either group above.
 const HOUSEHOLD_READY_SCREENS = [
   'household-ready',
   'household-invite',
   'migration-preview',
   'remote-data-preview',
+  '(tabs)',
+  'all-transactions',
+  'calendar',
+  'cards',
+  'goals',
+  'loans',
+  'recurring',
+  'input',
+  'card-add',
+  'budget-add',
+  'recurring-add',
+  'planned-add',
+  'goal-add',
+  'loan-add',
+  'categories',
+  'backup',
 ];
 
 /**

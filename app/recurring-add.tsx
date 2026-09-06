@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Keyboard, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import {
   ChipSelect,
   Field,
@@ -14,6 +15,7 @@ import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { EXPENSE_CATS, INCOME_CATS, type TxnType } from '@/data/categories';
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt, parseNum } from '@/lib/format';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -42,6 +44,9 @@ function applyDayDigit(cur: string, k: string): string {
 }
 
 export default function RecurringAdd() {
+  // STEP 16-G1B: see app/input.tsx's identical guard comment.
+  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="반복 항목" />;
+
   const router = useRouter();
   const toast = useToast();
   const insets = useSafeAreaInsets();

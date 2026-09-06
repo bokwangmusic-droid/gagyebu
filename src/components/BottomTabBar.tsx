@@ -5,9 +5,10 @@ import { useRouter } from 'expo-router';
 import { Platform, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { colors, gradients, layout, radii, shadows } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { AppIcon } from './AppIcon';
 
 /**
@@ -27,7 +28,12 @@ const ADD_SIZE = 56;
 export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { planned } = useStore();
+  // STEP 16-G1B: this badge counts upcoming planned expenses for display —
+  // switched to the remote read-only source like every other finance
+  // figure in the app. Not gated on `status`: while loading/erroring,
+  // `planned` is simply the safe empty-array default, so the badge just
+  // shows nothing rather than a stale local count.
+  const { planned } = useFinanceRead();
 
   const upcomingCount = (() => {
     const now = new Date();
@@ -123,44 +129,49 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
       {renderItem(TABS[2])}
       {renderItem(TABS[3])}
 
-      {/* Docked add button */}
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel="지출·수입 추가"
-        onPress={openInput}
-        style={({ pressed }) => [
-          {
-            position: 'absolute',
-            left: '50%',
-            marginLeft: -ADD_SIZE / 2,
-            bottom: padBottom + 14,
-            width: ADD_SIZE,
-            height: ADD_SIZE,
-            borderRadius: radii.pill,
-            alignItems: 'center',
-            justifyContent: 'center',
-            transform: [{ scale: pressed ? 0.94 : 1 }],
-          },
-          shadows.fab,
-        ]}
-      >
-        <LinearGradient
-          colors={gradients.primary}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 1 }}
-          style={{
-            width: ADD_SIZE,
-            height: ADD_SIZE,
-            borderRadius: radii.pill,
-            alignItems: 'center',
-            justifyContent: 'center',
-            borderWidth: 4,
-            borderColor: colors.card,
-          }}
+      {/* Docked add button — STEP 16-G1B: hidden entirely in read-only mode
+          rather than left tappable-but-blocked, since this is the app's
+          single most prominent "add transaction" affordance (visible on
+          every tab, at all times). */}
+      {!REMOTE_FINANCE_READ_ONLY && (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="지출·수입 추가"
+          onPress={openInput}
+          style={({ pressed }) => [
+            {
+              position: 'absolute',
+              left: '50%',
+              marginLeft: -ADD_SIZE / 2,
+              bottom: padBottom + 14,
+              width: ADD_SIZE,
+              height: ADD_SIZE,
+              borderRadius: radii.pill,
+              alignItems: 'center',
+              justifyContent: 'center',
+              transform: [{ scale: pressed ? 0.94 : 1 }],
+            },
+            shadows.fab,
+          ]}
         >
-          <AppIcon name="plus" size={26} color={colors.white} strokeWidth={2.5} />
-        </LinearGradient>
-      </Pressable>
+          <LinearGradient
+            colors={gradients.primary}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            style={{
+              width: ADD_SIZE,
+              height: ADD_SIZE,
+              borderRadius: radii.pill,
+              alignItems: 'center',
+              justifyContent: 'center',
+              borderWidth: 4,
+              borderColor: colors.card,
+            }}
+          >
+            <AppIcon name="plus" size={26} color={colors.white} strokeWidth={2.5} />
+          </LinearGradient>
+        </Pressable>
+      )}
     </View>
   );
 }

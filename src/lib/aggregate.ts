@@ -13,7 +13,8 @@
  */
 
 import type { TxnType } from '@/data/categories';
-import type { Transaction } from '@/store/types';
+import { monthRange } from '@/lib/period';
+import type { BudgetMap, Transaction } from '@/store/types';
 
 /** Half-open `[start, end)` date-range filter. Null bounds are skipped. */
 export function inRange(
@@ -69,4 +70,31 @@ export function expenseByCategory(txns: Transaction[]): Record<string, number> {
 /** `expenseByCategory` as `[id, amount]` pairs, largest first. */
 export function sortedExpenseCategories(txns: Transaction[]): [string, number][] {
   return Object.entries(expenseByCategory(txns)).sort((a, b) => b[1] - a[1]);
+}
+
+/**
+ * Current-calendar-month figures — the same computation `useMonthlyTotals`
+ * (src/store/store.tsx) does, extracted as a plain function so a screen
+ * reading from a data source OTHER than `useStore()` (STEP 16-G1B's
+ * `useFinanceRead()`) can get the identical numbers without depending on
+ * StoreProvider. `useMonthlyTotals` itself is untouched — this is a new,
+ * parallel export, not a replacement.
+ */
+export function monthlyTotals(
+  transactions: Transaction[],
+  budgets: BudgetMap,
+): {
+  thisMonth: Transaction[];
+  income: number;
+  expense: number;
+  byCategory: Record<string, number>;
+  totalBudget: number;
+  remaining: number;
+} {
+  const { start, end } = monthRange();
+  const thisMonth = inRange(transactions, start, end);
+  const { income, expense } = totals(thisMonth);
+  const byCategory = expenseByCategory(thisMonth);
+  const totalBudget = Object.values(budgets).reduce((s, v) => s + (v || 0), 0);
+  return { thisMonth, income, expense, byCategory, totalBudget, remaining: totalBudget - expense };
 }

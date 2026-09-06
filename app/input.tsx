@@ -18,10 +18,12 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
+import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import { CalendarSheet } from '@/components/ui/CalendarSheet';
 import { useToast } from '@/components/ui/Toast';
 import { getAllCats, getCat, type TxnType } from '@/data/categories';
 import { installmentPerMonth } from '@/lib/card';
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
@@ -106,6 +108,13 @@ function applyMonthsKey(cur: string, k: string): string {
 }
 
 export default function InputModal() {
+  // STEP 16-G1B: financial write is not implemented yet — this screen adds/
+  // edits a transaction directly against useStore(), which read-only mode
+  // must never let happen while remote household data is on screen. Safe
+  // before any hook below: REMOTE_FINANCE_READ_ONLY is a module-level
+  // constant, so this branch is identical on every render.
+  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="거래 입력" />;
+
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const toast = useToast();

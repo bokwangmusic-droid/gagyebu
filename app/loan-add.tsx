@@ -3,11 +3,13 @@ import { useRef, useState } from 'react';
 import { Keyboard, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import { ChipSelect, Field, HeaderTextButton, SegmentedTabs, TextField } from '@/components/ui/controls';
 import { DateStepper } from '@/components/ui/DateStepper';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey } from '@/lib/format';
 import { describeRepayType, formatYearMonth, payoffDate, scheduledPayment } from '@/lib/loan';
 import { useStore } from '@/store/store';
@@ -48,6 +50,9 @@ function applyRateDigit(cur: string, k: string): string {
 }
 
 export default function LoanAdd() {
+  // STEP 16-G1B: see app/input.tsx's identical guard comment.
+  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="대출" />;
+
   const router = useRouter();
   const toast = useToast();
   const insets = useSafeAreaInsets();

@@ -1,9 +1,11 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { useMemo } from 'react';
+import { Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import {
@@ -13,7 +15,7 @@ import {
   UNASSIGNED_CARD_ID,
 } from '@/lib/card';
 import { fmt } from '@/lib/format';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { CreditCard, Transaction } from '@/store/types';
@@ -76,47 +78,24 @@ function buildRows(
 
 export default function CardsList() {
   const router = useRouter();
-  const { cards, transactions, deleteCard } = useStore();
-  const [confirmDel, setConfirmDel] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!confirmDel) return;
-    const t = setTimeout(() => setConfirmDel(null), 3000);
-    return () => clearTimeout(t);
-  }, [confirmDel]);
+  const { status, error, cards, transactions, refresh } = useFinanceRead();
 
   const { rows, unassigned, total } = useMemo(
     () => buildRows(transactions, cards, new Date()),
     [transactions, cards],
   );
 
-  const handleDelete = (id: string) => {
-    if (confirmDel === id) {
-      deleteCard(id);
-      setConfirmDel(null);
-    } else {
-      setConfirmDel(id);
-    }
-  };
-
-  const addBtn = (
-    <Pressable
-      onPress={() => router.push('/card-add')}
-      style={{
-        width: 36,
-        height: 36,
-        borderRadius: radii.pill,
-        backgroundColor: colors.primary,
-        alignItems: 'center',
-        justifyContent: 'center',
-      }}
-    >
-      <AppIcon name="plus" size={18} color={colors.white} strokeWidth={2.5} />
-    </Pressable>
-  );
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="카드 관리" onClose={() => router.back()}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
 
   return (
-    <ModalScreen title="카드 관리" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen title="카드 관리" onClose={() => router.back()}>
+      <FinanceReadOnlyBanner />
       <LinearGradient
         colors={gradients.primary}
         start={{ x: 0, y: 0 }}
@@ -147,21 +126,14 @@ export default function CardsList() {
 
       {cards.length === 0 && !unassigned ? (
         <EmptyState
-          onPress={() => router.push('/card-add')}
+          icon="card"
           title="등록된 카드가 없어요"
-          sub={'카드를 등록하고 지출을 「신용」으로 기록하면\n사용월 기준 예상 카드값을 계산해드려요'}
-          cta="카드 등록하기"
+          sub={'우리집 가계부에 등록된 카드가 없어요'}
         />
       ) : (
         <>
           {rows.map((row) => (
-            <CardItem
-              key={row.id}
-              row={row}
-              confirmDel={confirmDel === row.id}
-              onEdit={() => router.push({ pathname: '/card-add', params: { id: row.id } })}
-              onDelete={() => handleDelete(row.id)}
-            />
+            <CardItem key={row.id} row={row} />
           ))}
           {unassigned && <CardItem key="unassigned" row={unassigned} />}
         </>
@@ -170,17 +142,7 @@ export default function CardsList() {
   );
 }
 
-function CardItem({
-  row,
-  confirmDel,
-  onEdit,
-  onDelete,
-}: {
-  row: CardRow;
-  confirmDel?: boolean;
-  onEdit?: () => void;
-  onDelete?: () => void;
-}) {
+function CardItem({ row }: { row: CardRow }) {
   const isUnassigned = row.id === UNASSIGNED_CARD_ID;
   const accent = row.color?.color ?? colors.primaryStrong;
   const accentBg = row.color?.bg ?? colors.primaryLight;
@@ -246,55 +208,6 @@ function CardItem({
           <Chip label="남은 할부" value={`${fmt(row.remainingInstallment)}원`} />
         )}
       </View>
-
-      {!isUnassigned && (onEdit || onDelete) && (
-        <View style={{ flexDirection: 'row', gap: 6, marginTop: spacing.md, justifyContent: 'flex-end' }}>
-          {onEdit && (
-            <Pressable
-              onPress={onEdit}
-              style={{
-                paddingVertical: 10,
-                paddingHorizontal: 16,
-                borderRadius: radii.md,
-                backgroundColor: colors.white,
-                borderWidth: 1,
-                borderColor: colors.border,
-              }}
-            >
-              <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.textSub }}>수정</Text>
-            </Pressable>
-          )}
-          {onDelete && (
-            <Pressable
-              onPress={onDelete}
-              style={{
-                paddingVertical: 10,
-                paddingHorizontal: 16,
-                borderRadius: radii.md,
-                backgroundColor: confirmDel ? colors.expenseSolid : colors.white,
-                borderWidth: 1,
-                borderColor: confirmDel ? colors.expenseSolid : colors.border,
-              }}
-            >
-              <Text
-                style={{
-                  fontFamily: fontFamily.semibold,
-                  fontSize: 13,
-                  color: confirmDel ? colors.white : colors.expenseText,
-                }}
-              >
-                {confirmDel ? '삭제할래요' : '삭제'}
-              </Text>
-            </Pressable>
-          )}
-        </View>
-      )}
-
-      {!isUnassigned && confirmDel && (
-        <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, color: colors.textMuted, marginTop: 6, textAlign: 'right' }}>
-          거래 내역은 지워지지 않고 「카드 미지정」으로 남아요
-        </Text>
-      )}
     </View>
   );
 }

@@ -1,17 +1,18 @@
 import { useRouter } from 'expo-router';
-import { useMemo, useRef, useState } from 'react';
-import { Alert, Pressable, Text, TextInput, View } from 'react-native';
+import { useMemo, useState } from 'react';
+import { Text, TextInput, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { Card } from '@/components/ui/Card';
 import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Screen } from '@/components/ui/Screen';
-import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
-import { useToast } from '@/components/ui/Toast';
+import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
 import { fmt, weekdayKo } from '@/lib/format';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { PlannedExpense } from '@/store/types';
@@ -25,13 +26,8 @@ const TAG_STYLE = {
 
 export default function PlannedScreen() {
   const router = useRouter();
-  const toast = useToast();
-  const { planned, deletePlanned, markPlannedDone, notes, setNotes, customCats } = useStore();
+  const { status, error, planned, notes, customCats, refresh } = useFinanceRead();
   const [tab, setTab] = useState<'planned' | 'notes'>('planned');
-  // "✓ 지출 완료" prepends a new transaction each call and the row only
-  // disappears on re-render — latch per id so a fast double-tap can't create
-  // two transactions from one planned item.
-  const doneIds = useRef<Set<string>>(new Set());
 
   const now = new Date();
   now.setHours(0, 0, 0, 0);
@@ -58,14 +54,19 @@ export default function PlannedScreen() {
 
   const totalUpcoming = planned.reduce((s, p) => s + (p.amount || 0), 0);
 
-  const right =
-    tab === 'planned' ? (
-      <HeaderIconButton icon="plus" primary onPress={() => router.push('/planned-add')} />
-    ) : undefined;
+  if (status !== 'ready') {
+    return (
+      <Screen>
+        <ScreenHeader title="예정 · 메모" />
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </Screen>
+    );
+  }
 
   return (
     <Screen>
-      <ScreenHeader title="예정 · 메모" right={right} />
+      <ScreenHeader title="예정 · 메모" />
+      <FinanceReadOnlyBanner />
 
       <View style={{ paddingHorizontal: spacing.lg, marginBottom: spacing.lg }}>
         <SegmentedTabs
@@ -97,30 +98,29 @@ export default function PlannedScreen() {
 
           {planned.length === 0 ? (
             <EmptyState
-              onPress={() => router.push('/planned-add')}
+              icon="calendar"
               title="예정된 지출이 없어요"
-              sub={'결혼식 축의금, 생일선물, 병원비 등\n미리 예정된 지출을 등록해두면\n날짜에 맞춰 알려드려요'}
-              cta="예정 지출 추가하기"
+              sub={'우리집 가계부에 예정된 지출이 없어요'}
             />
           ) : (
             <>
-              <Group label="지난 예정" color={colors.expenseStrong} rows={groups.overdue} onDelete={remove} onDone={done} customCats={customCats} />
-              <Group label="오늘 · 임박" color={colors.warningText} rows={groups.today} onDelete={remove} onDone={done} customCats={customCats} />
-              <Group label="이번 주 (7일 이내)" rows={groups.week} onDelete={remove} onDone={done} customCats={customCats} />
-              <Group label="나중에" rows={groups.later} onDelete={remove} onDone={done} customCats={customCats} />
+              <Group label="지난 예정" color={colors.expenseStrong} rows={groups.overdue} customCats={customCats} />
+              <Group label="오늘 · 임박" color={colors.warningText} rows={groups.today} customCats={customCats} />
+              <Group label="이번 주 (7일 이내)" rows={groups.week} customCats={customCats} />
+              <Group label="나중에" rows={groups.later} customCats={customCats} />
             </>
           )}
         </>
       ) : (
         <View style={{ paddingHorizontal: spacing.lg }}>
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub, lineHeight: 18, marginBottom: spacing.md, paddingHorizontal: 4 }}>
-            가계 관련 아무거나 자유롭게. 예산 계획, 사고 싶은 것 리스트, 절약 목표 등.
+            우리집 메모예요. 지금은 조회만 할 수 있어요.
           </Text>
           <TextInput
             value={notes}
-            onChangeText={setNotes}
+            editable={false}
             multiline
-            placeholder={'예:\n- 이번 달 카페 지출 5만원 이하로 줄이기\n- 겨울 코트 예산 20만원까지'}
+            placeholder="아직 메모가 없어요"
             placeholderTextColor={colors.textMuted}
             style={{
               minHeight: 320,
@@ -128,7 +128,7 @@ export default function PlannedScreen() {
               borderWidth: 1,
               borderColor: colors.border,
               borderRadius: radii.xl,
-              backgroundColor: colors.white,
+              backgroundColor: colors.track,
               fontFamily: fontFamily.regular,
               fontSize: 14,
               lineHeight: 24,
@@ -137,32 +137,12 @@ export default function PlannedScreen() {
             }}
           />
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted, textAlign: 'right', marginTop: 6, ...tabularNums }}>
-            자동 저장 · {notes.length}자
+            {notes.length}자
           </Text>
         </View>
       )}
     </Screen>
   );
-
-  function remove(p: PlannedExpense) {
-    Alert.alert(`${p.name} 예정을 삭제할까요?`, undefined, [
-      { text: '취소', style: 'cancel' },
-      {
-        text: '삭제',
-        style: 'destructive',
-        onPress: () => {
-          deletePlanned(p.id);
-          toast.show('삭제했어요');
-        },
-      },
-    ]);
-  }
-  function done(p: PlannedExpense) {
-    if (doneIds.current.has(p.id)) return;
-    doneIds.current.add(p.id);
-    markPlannedDone(p);
-    toast.show('지출로 옮겼어요');
-  }
 }
 
 interface Row {
@@ -174,15 +154,11 @@ function Group({
   label,
   color,
   rows,
-  onDelete,
-  onDone,
   customCats,
 }: {
   label: string;
   color?: string;
   rows: Row[];
-  onDelete: (p: PlannedExpense) => void;
-  onDone: (p: PlannedExpense) => void;
   customCats: Parameters<typeof getCat>[2];
 }) {
   if (rows.length === 0) return null;
@@ -257,20 +233,6 @@ function Group({
               <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, ...tabularNums }}>
                 −{fmt(p.amount)}
               </Text>
-            </View>
-            <View style={{ flexDirection: 'row', gap: 6, marginTop: 10, justifyContent: 'flex-end' }}>
-              <Pressable
-                onPress={() => onDelete(p)}
-                style={{ paddingVertical: 6, paddingHorizontal: 12, borderWidth: 1, borderColor: colors.border, borderRadius: radii.sm }}
-              >
-                <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.textSub }}>삭제</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => onDone(p)}
-                style={{ paddingVertical: 6, paddingHorizontal: 14, backgroundColor: colors.primary, borderRadius: radii.sm }}
-              >
-                <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.white }}>✓ 지출 완료</Text>
-              </Pressable>
             </View>
           </View>
         );

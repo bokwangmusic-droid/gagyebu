@@ -1,66 +1,42 @@
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { useMemo, useState } from 'react';
+import { Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { Card } from '@/components/ui/Card';
-import { SegmentedTabs, Toggle } from '@/components/ui/controls';
+import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat, type TxnType } from '@/data/categories';
 import { fmt } from '@/lib/format';
 import { describeSchedule } from '@/lib/recurring';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 
 export default function RecurringList() {
   const router = useRouter();
-  const { recurring, toggleRecurring, deleteRecurring, customCats } = useStore();
+  const { status, error, recurring, customCats, refresh } = useFinanceRead();
   const [tab, setTab] = useState<TxnType>('expense');
-  const [confirmDel, setConfirmDel] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!confirmDel) return;
-    const t = setTimeout(() => setConfirmDel(null), 3000);
-    return () => clearTimeout(t);
-  }, [confirmDel]);
 
   const filtered = useMemo(() => recurring.filter((r) => r.type === tab), [recurring, tab]);
   const monthlyTotal = filtered.filter((r) => r.active).reduce((s, r) => s + r.amount, 0);
   const activeCount = recurring.filter((r) => r.active).length;
   const pausedCount = recurring.length - activeCount;
 
-  const handleDelete = (id: string) => {
-    if (confirmDel === id) {
-      deleteRecurring(id);
-      setConfirmDel(null);
-    } else {
-      setConfirmDel(id);
-    }
-  };
-
-  // + 진입 시 현재 선택된 탭(expense/income)을 추가 화면 기본값으로 넘긴다.
-  const openAdd = () => router.push({ pathname: '/recurring-add', params: { type: tab } });
-
-  const addBtn = (
-    <Pressable
-      onPress={openAdd}
-      style={{
-        width: 36,
-        height: 36,
-        borderRadius: radii.pill,
-        backgroundColor: colors.primary,
-        alignItems: 'center',
-        justifyContent: 'center',
-      }}
-    >
-      <AppIcon name="plus" size={18} color={colors.white} strokeWidth={2.5} />
-    </Pressable>
-  );
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="반복 지출·수입" onClose={() => router.back()}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
 
   return (
-    <ModalScreen title="반복 지출·수입" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen title="반복 지출·수입" onClose={() => router.back()}>
+      <FinanceReadOnlyBanner />
       <Card style={{ marginTop: spacing.xs }}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <View>
@@ -106,10 +82,9 @@ export default function RecurringList() {
 
       {filtered.length === 0 ? (
         <EmptyState
-          onPress={openAdd}
+          icon="refresh"
           title="반복 항목이 없어요"
-          sub={'넷플릭스, 월세, 급여처럼\n매달·매주 반복되는 항목을 등록하세요'}
-          cta="반복 항목 추가하기"
+          sub={'우리집 가계부에 등록된 반복 항목이 없어요'}
         />
       ) : (
         <View style={{ marginTop: spacing.md }}>
@@ -166,6 +141,7 @@ export default function RecurringList() {
                   </Text>
                   <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
                     {describeSchedule(r)}
+                    {!r.active ? ' · 정지됨' : ''}
                   </Text>
                 </View>
                 <Text
@@ -179,27 +155,6 @@ export default function RecurringList() {
                   {r.type === 'income' ? '+' : '−'}
                   {fmt(r.amount)}
                 </Text>
-                <Toggle value={r.active} onChange={() => toggleRecurring(r.id)} />
-                <Pressable
-                  onPress={() => handleDelete(r.id)}
-                  style={{
-                    height: 30,
-                    paddingHorizontal: confirmDel === r.id ? 10 : 0,
-                    width: confirmDel === r.id ? undefined : 30,
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: radii.sm,
-                    borderWidth: 1,
-                    borderColor: confirmDel === r.id ? colors.expenseSolid : colors.expenseLight,
-                    backgroundColor: confirmDel === r.id ? colors.expenseSolid : colors.white,
-                  }}
-                >
-                  {confirmDel === r.id ? (
-                    <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.white }}>삭제할래요</Text>
-                  ) : (
-                    <AppIcon name="trash" size={14} color={colors.expenseText} />
-                  )}
-                </Pressable>
               </View>
             );
           })}

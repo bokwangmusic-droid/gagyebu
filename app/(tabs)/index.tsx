@@ -3,15 +3,18 @@ import { useMemo } from 'react';
 import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { Card } from '@/components/ui/Card';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
 import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
+import { monthlyTotals } from '@/lib/aggregate';
 import { cardBillingForMonth } from '@/lib/card';
 import { fmt, formatMonthLabel, formatRelativeDateTime, toDateKey } from '@/lib/format';
 import { buildInsights, type Insight } from '@/lib/insights';
-import { useMonthlyTotals, useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 
@@ -31,8 +34,11 @@ function insightTone(tone: Insight['tone']): { bg: string; fg: string } {
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { transactions, planned, customCats, cards, budgets } = useStore();
-  const { income, expense, byCategory, totalBudget, remaining } = useMonthlyTotals();
+  const { status, error, transactions, planned, customCats, cards, budgets, refresh } = useFinanceRead();
+  const { income, expense, byCategory, totalBudget, remaining } = useMemo(
+    () => monthlyTotals(transactions, budgets),
+    [transactions, budgets],
+  );
 
   // Recompute only when data changes or the calendar day rolls over.
   const todayKey = toDateKey(new Date());
@@ -83,6 +89,15 @@ export default function HomeScreen() {
   const goToTxns = (filter: 'income' | 'expense') =>
     router.push({ pathname: '/all-transactions', params: { filter, scope: 'thisMonth' } });
 
+  if (status !== 'ready') {
+    return (
+      <Screen>
+        <ScreenHeader title={formatMonthLabel()} containerStyle={{ paddingTop: spacing.sm + 2, paddingBottom: spacing.sm }} />
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </Screen>
+    );
+  }
+
   return (
     <Screen>
       <ScreenHeader
@@ -96,6 +111,7 @@ export default function HomeScreen() {
           </View>
         }
       />
+      <FinanceReadOnlyBanner />
 
       {/* Upcoming planned banner */}
       {upcoming.length > 0 &&
@@ -185,16 +201,16 @@ export default function HomeScreen() {
               </View>
             </>
           ) : (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: 6 }}>
-              <Text style={{ flex: 1, fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
-                탭해서 이번 달 전체 내역 보기 →
+            // STEP 16-G1B HOME FIX: the old "예산 설정하기" pill navigated to
+            // /(tabs)/budget as a "go set one up" CTA — misleading in
+            // read-only mode (no write entry exists there any more either).
+            // Plain, non-interactive text now; the outer Card Pressable
+            // above still navigates to /all-transactions (pure read nav,
+            // untouched).
+            <View style={{ marginTop: 6 }}>
+              <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
+                설정된 예산이 없어요 · 탭해서 이번 달 전체 내역 보기 →
               </Text>
-              <Pressable
-                onPress={() => router.push('/(tabs)/budget')}
-                style={{ paddingHorizontal: spacing.md, paddingVertical: 6, borderRadius: radii.pill, backgroundColor: colors.primaryLight }}
-              >
-                <Text style={{ fontFamily: fontFamily.bold, fontSize: 11, color: colors.primaryStrong }}>예산 설정하기</Text>
-              </Pressable>
             </View>
           )}
         </Card>
@@ -351,33 +367,32 @@ export default function HomeScreen() {
 
       {recent.length === 0 ? (
         <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.md, paddingBottom: spacing.xxl }}>
-          <Pressable
-            onPress={() => router.push('/input')}
+          <View
             style={{
               width: 56,
               height: 56,
               borderRadius: radii.sheet,
-              backgroundColor: colors.primary,
+              backgroundColor: colors.track,
               alignItems: 'center',
               justifyContent: 'center',
               marginBottom: 12,
             }}
           >
-            <AppIcon name="plus" size={24} color={colors.white} strokeWidth={2.5} />
-          </Pressable>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 4 }}>아직 기록이 없어요</Text>
+            <AppIcon name="clipboard" size={24} color={colors.textMuted} strokeWidth={2.5} />
+          </View>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 4 }}>아직 거래가 없어요</Text>
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub, textAlign: 'center' }}>
-            첫 지출·수입을 기록해볼까요?
+            우리집 가계부에 기록된 거래가 없어요
           </Text>
         </View>
       ) : (
         <Card variant="sm" style={{ paddingVertical: 4, paddingHorizontal: spacing.lg }}>
+          {/* STEP 16-G1B: read-only — no onPress into /input for editing. */}
           {recent.map((t, i) => {
             const cat = getCat(t.category, t.type, customCats);
             return (
-              <Pressable
+              <View
                 key={t.id}
-                onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
                 style={{
                   flexDirection: 'row',
                   alignItems: 'center',
@@ -421,7 +436,7 @@ export default function HomeScreen() {
                   {t.type === 'income' ? '+' : '−'}
                   {fmt(t.amount)}원
                 </Text>
-              </Pressable>
+              </View>
             );
           })}
         </Card>

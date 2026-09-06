@@ -11,6 +11,7 @@ import Animated, {
 } from 'react-native-reanimated';
 
 import { AppIcon } from '@/components/AppIcon';
+import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import { BottomSheet } from '@/components/ui/BottomSheet';
 import { Field, SegmentedTabs, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
@@ -23,6 +24,7 @@ import {
   type IconKey,
   type TxnType,
 } from '@/data/categories';
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { useStore } from '@/store/store';
 import { useToast } from '@/components/ui/Toast';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -31,6 +33,12 @@ import { fontFamily, noPad } from '@/theme/typography';
 const ROW_H = 54;
 
 export default function CategoriesManager() {
+  // STEP 16-G1B: see app/input.tsx's identical guard comment. Category
+  // management (add/delete/reorder) is a financial-data mutation just like
+  // the other *-add screens, even though its route name doesn't end in
+  // "-add".
+  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="카테고리" />;
+
   const router = useRouter();
   const toast = useToast();
   const { customCats, catOrder, addCustomCat, deleteCustomCat, reorderCats } = useStore();

@@ -3,6 +3,8 @@ import { useMemo, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
@@ -11,7 +13,7 @@ import { sumByType } from '@/lib/aggregate';
 import { fmt, toDateKey } from '@/lib/format';
 import { hasSplits } from '@/lib/splits';
 import { periodRange, prevPeriodRange } from '@/lib/period';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 
@@ -23,7 +25,7 @@ const WD = ['일', '월', '화', '수', '목', '금', '토'];
 export default function AllTransactions() {
   const router = useRouter();
   const params = useLocalSearchParams<{ filter?: string; scope?: string }>();
-  const { transactions, customCats, cards } = useStore();
+  const { status, error, transactions, customCats, cards, refresh } = useFinanceRead();
 
   const [filter, setFilter] = useState<Filter>((params.filter as Filter) || 'all');
   const [scope, setScope] = useState<Scope>((params.scope as Scope) || 'all');
@@ -74,12 +76,21 @@ export default function AllTransactions() {
     return `${md} (${dow})`;
   };
 
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="전체 내역" onClose={() => router.back()}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
   return (
     <ModalScreen
       title="전체 내역"
       onClose={() => router.back()}
       right={<Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub }}>{filtered.length}건</Text>}
     >
+      <FinanceReadOnlyBanner />
       {/* Scope chips */}
       <View style={{ flexDirection: 'row', gap: 6, paddingHorizontal: spacing.lg, paddingBottom: spacing.sm }}>
         {([
@@ -203,9 +214,8 @@ export default function AllTransactions() {
                       }`
                     : '';
                 return (
-                  <Pressable
+                  <View
                     key={t.id}
-                    onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
                     style={{
                       flexDirection: 'row',
                       alignItems: 'center',
@@ -248,7 +258,7 @@ export default function AllTransactions() {
                       {t.type === 'income' ? '+' : '−'}
                       {fmt(t.amount)}원
                     </Text>
-                  </Pressable>
+                  </View>
                 );
               })}
             </View>

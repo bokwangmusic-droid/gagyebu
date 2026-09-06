@@ -1,104 +1,48 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useEffect, useState } from 'react';
-import { Alert, Pressable, Text, View } from 'react-native';
+import { useMemo } from 'react';
+import { Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
-import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
-import { useToast } from '@/components/ui/Toast';
+import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
+import { monthlyTotals } from '@/lib/aggregate';
 import { daysLeftInMonth, fmt } from '@/lib/format';
-import { useMonthlyTotals, useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
 
 export default function BudgetScreen() {
   const router = useRouter();
-  const toast = useToast();
-  const { budgets, deleteBudget, resetBudgets, customCats } = useStore();
-  const { byCategory, expense, totalBudget, remaining } = useMonthlyTotals();
+  const { status, error, transactions, budgets, customCats, refresh } = useFinanceRead();
+  const { byCategory, expense, totalBudget, remaining } = useMemo(
+    () => monthlyTotals(transactions, budgets),
+    [transactions, budgets],
+  );
 
   const entries = Object.entries(budgets).sort((a, b) => (b[1] || 0) - (a[1] || 0));
-  const [confirmReset, setConfirmReset] = useState(false);
 
-  useEffect(() => {
-    if (!confirmReset) return;
-    const t = setTimeout(() => setConfirmReset(false), 4000);
-    return () => clearTimeout(t);
-  }, [confirmReset]);
-
-  const right = (
-    <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
-      {entries.length > 0 && (
-        <Pressable
-          onPress={() => setConfirmReset(true)}
-          style={{
-            height: 36,
-            paddingHorizontal: 12,
-            borderRadius: radii.pill,
-            borderWidth: 1,
-            borderColor: colors.border,
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
-          <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.textSub }}>초기화</Text>
-        </Pressable>
-      )}
-      <HeaderIconButton icon="plus" onPress={() => router.push('/budget-add')} />
-    </View>
-  );
+  if (status !== 'ready') {
+    return (
+      <Screen>
+        <ScreenHeader title="예산 관리" onBack={router.canGoBack() ? () => router.back() : undefined} />
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </Screen>
+    );
+  }
 
   return (
     <Screen>
       <ScreenHeader
         title="예산 관리"
-        right={right}
         onBack={router.canGoBack() ? () => router.back() : undefined}
       />
-
-      {confirmReset && (
-        <View
-          style={{
-            marginHorizontal: spacing.lg,
-            marginBottom: spacing.md,
-            paddingVertical: 14,
-            paddingHorizontal: spacing.lg,
-            backgroundColor: colors.expenseLight,
-            borderWidth: 1,
-            borderColor: '#FBCFE8',
-            borderRadius: radii.lg,
-            flexDirection: 'row',
-            alignItems: 'center',
-            gap: spacing.sm,
-          }}
-        >
-          <AppIcon name="warn" size={18} color={colors.expenseStrong} />
-          <Text style={{ flex: 1, fontFamily: fontFamily.semibold, fontSize: 12, color: colors.expenseStrong, lineHeight: 17 }}>
-            모든 카테고리 예산을 삭제할까요?{'\n'}
-            <Text style={{ fontFamily: fontFamily.regular }}>지출 기록은 그대로 남아요</Text>
-          </Text>
-          <Pressable
-            onPress={() => setConfirmReset(false)}
-            style={{ paddingVertical: 6, paddingHorizontal: 10, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.border, borderRadius: radii.sm }}
-          >
-            <Text style={{ fontFamily: fontFamily.semibold, fontSize: 12, color: colors.textSub }}>취소</Text>
-          </Pressable>
-          <Pressable
-            onPress={() => {
-              resetBudgets();
-              setConfirmReset(false);
-              toast.show('예산을 모두 초기화했어요');
-            }}
-            style={{ paddingVertical: 6, paddingHorizontal: 12, backgroundColor: colors.expenseSolid, borderRadius: radii.sm }}
-          >
-            <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.white }}>초기화</Text>
-          </Pressable>
-        </View>
-      )}
+      <FinanceReadOnlyBanner />
 
       {/* Hero */}
       <LinearGradient
@@ -158,18 +102,13 @@ export default function BudgetScreen() {
         }}
       >
         <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>카테고리별 예산</Text>
-        <Pressable onPress={() => router.push('/budget-add')} style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-          <AppIcon name="plus" size={12} color={colors.primaryStrong} strokeWidth={2.5} />
-          <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>추가</Text>
-        </Pressable>
       </View>
 
       {entries.length === 0 ? (
         <EmptyState
-          onPress={() => router.push('/budget-add')}
+          icon="nav-budget"
           title="예산이 아직 없어요"
-          sub={'카테고리별로 한 달 예산을 정하면\n과소비를 미리 막을 수 있어요'}
-          cta="예산 설정하기"
+          sub={'우리집 가계부에 설정된 예산이 없어요'}
         />
       ) : (
         entries.map(([catId, amount]) => {
@@ -243,17 +182,6 @@ export default function BudgetScreen() {
                 >
                   {pct}%
                 </Text>
-                <Pressable
-                  onPress={() =>
-                    Alert.alert(`${cat.name} 예산을 삭제할까요?`, '지출 기록은 그대로 남아요.', [
-                      { text: '취소', style: 'cancel' },
-                      { text: '삭제', style: 'destructive', onPress: () => deleteBudget(catId) },
-                    ])
-                  }
-                  hitSlop={8}
-                >
-                  <AppIcon name="trash" size={14} color={colors.textFaint} />
-                </Pressable>
               </View>
               <ProgressBar
                 percent={Math.min(100, pct)}

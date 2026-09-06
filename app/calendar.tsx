@@ -3,10 +3,12 @@ import { useMemo, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
 import { fmt, toDateKey } from '@/lib/format';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { Transaction } from '@/store/types';
@@ -22,7 +24,7 @@ interface DayTotals {
 
 export default function CalendarScreen() {
   const router = useRouter();
-  const { transactions, customCats } = useStore();
+  const { status, error, transactions, customCats, refresh } = useFinanceRead();
 
   const now = new Date();
   const [view, setView] = useState({ year: now.getFullYear(), month: now.getMonth() });
@@ -111,8 +113,17 @@ export default function CalendarScreen() {
     </Pressable>
   );
 
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="달력" onClose={() => router.back()}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
   return (
     <ModalScreen title="달력" onClose={() => router.back()} right={todayBtn}>
+      <FinanceReadOnlyBanner />
       {/* Month nav */}
       <View
         style={{
@@ -307,9 +318,8 @@ export default function CalendarScreen() {
                 const d = new Date(t.date);
                 const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
                 return (
-                  <Pressable
+                  <View
                     key={t.id}
-                    onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
                     style={{
                       flexDirection: 'row',
                       alignItems: 'center',
@@ -350,7 +360,7 @@ export default function CalendarScreen() {
                       {t.type === 'income' ? '+' : '−'}
                       {fmt(t.amount)}원
                     </Text>
-                  </Pressable>
+                  </View>
                 );
               })}
           </View>

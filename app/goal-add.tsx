@@ -4,11 +4,13 @@ import { Keyboard, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
+import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import { Field, HeaderTextButton, TextField } from '@/components/ui/controls';
 import { DateStepper } from '@/components/ui/DateStepper';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey } from '@/lib/format';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -32,6 +34,9 @@ const ICONS: { id: string; label: string }[] = [
 ];
 
 export default function GoalAdd() {
+  // STEP 16-G1B: see app/input.tsx's identical guard comment.
+  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="저축 목표" />;
+
   const router = useRouter();
   const toast = useToast();
   const insets = useSafeAreaInsets();

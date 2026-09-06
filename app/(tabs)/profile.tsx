@@ -13,7 +13,9 @@ import { useToast } from '@/components/ui/Toast';
 import { EXPENSE_CATS, INCOME_CATS } from '@/data/categories';
 import { createBackup } from '@/lib/backup';
 import { cardBillingForMonth } from '@/lib/card';
+import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
+import { useFinanceRead } from '@/store/financeRead';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
@@ -21,28 +23,41 @@ import { fontFamily, noPad } from '@/theme/typography';
 export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
+  // LOCAL device data — used ONLY by the "데이터 백업 · 복원" / "모든 데이터
+  // 초기화" section below, which reads/writes this device's own gagyebu.*
+  // storage and never touches the household's remote data (STEP 16-G1B
+  // §6/§14). Named with a `local` prefix here specifically so it's never
+  // confused with the `remote` values right below, which is what actually
+  // drives the "데이터" section's counts.
   const {
     settings,
     setSettings,
     setSeenOnboarding,
-    recurring,
-    goals,
-    loans,
-    cards,
-    customCats,
-    catOrder,
-    transactions,
-    budgets,
-    planned,
-    notes,
+    recurring: localRecurring,
+    goals: localGoals,
+    loans: localLoans,
+    cards: localCards,
+    customCats: localCustomCats,
+    catOrder: localCatOrder,
+    transactions: localTransactions,
+    budgets: localBudgets,
+    planned: localPlanned,
+    notes: localNotes,
     resetAll,
   } = useStore();
-  const cardBillTotal = cardBillingForMonth(transactions, cards).total;
+
+  // REMOTE household data — drives every count shown in the "데이터"
+  // section, matching what app/(tabs)/index.tsx and the other finance
+  // screens actually display (STEP 16-G1B §20: finance figures always come
+  // from remote, never local).
+  const remote = useFinanceRead();
+  const cardBillTotal = cardBillingForMonth(remote.transactions, remote.cards).total;
+  const customCount = remote.customCats.expense.length + remote.customCats.income.length;
+
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState('');
 
   const initial = (settings.profileName || '나').charAt(0);
-  const customCount = customCats.expense.length + customCats.income.length;
 
   // App metadata straight from the Expo config (app.json) — never hard-coded,
   // so it can't drift from the real release. `nativeBuildVersion` is only set
@@ -63,14 +78,19 @@ export default function ProfileScreen() {
         '광고 없고, 데이터는 이 기기에만 저장돼요.',
     );
 
+  // STEP 16-G1B PROFILE FINAL FIX: with household finance now living in
+  // Supabase (STEP 16-G1A/G1B), the old copy here ("모든 가계부 데이터는 이
+  // 기기 안에만 저장돼요" / "클라우드 동기화는 아직 없어요") is no longer
+  // true and would wrongly imply the household's remote data lives only on
+  // this device. Rewritten to distinguish "우리집 가계부 데이터" (remote,
+  // Supabase) from "개인 설정" (local, this device only) explicitly.
   const showPrivacyInfo = () =>
     Alert.alert(
       '개인정보 · 데이터 보관',
-      '• 모든 가계부 데이터는 이 기기 안에만 저장돼요.\n' +
-        '• 서버 전송이나 클라우드 동기화는 아직 없어요.\n' +
-        '• 앱을 삭제하거나 기기를 바꾸면 데이터가 사라져요.\n' +
-        '• 「데이터 백업 · 복원」에서 백업 파일을 저장해 두면 다른 기기에서 복원할 수 있어요.\n' +
-        '• 백업 파일은 직접 저장·공유할 때만 기기 밖으로 나가요.',
+      '• 우리집 가계부 데이터(거래·예산·목표 등)는 Supabase에 안전하게 저장돼요.\n' +
+        '• 프로필 이름 같은 개인 설정은 이 기기에만 저장돼요.\n' +
+        '• 지금은 우리집 가계부 데이터를 조회만 할 수 있어요.\n' +
+        '• 이 기기의 로컬 백업 파일은 직접 저장·공유할 때만 기기 밖으로 나가요.',
     );
 
   const reviewOnboarding = () => {
@@ -96,16 +116,16 @@ export default function ProfileScreen() {
               // saved. Reuses src/lib/backup.ts (createBackup returns null when
               // the body write / read-back verify fails).
               const safety = await createBackup('before_reset', {
-                transactions,
-                budgets,
-                goals,
-                recurring,
-                planned,
-                loans,
-                cards,
-                notes,
-                customCats,
-                catOrder,
+                transactions: localTransactions,
+                budgets: localBudgets,
+                goals: localGoals,
+                recurring: localRecurring,
+                planned: localPlanned,
+                loans: localLoans,
+                cards: localCards,
+                notes: localNotes,
+                customCats: localCustomCats,
+                catOrder: localCatOrder,
                 settings,
               });
               if (!safety) {
@@ -171,7 +191,7 @@ export default function ProfileScreen() {
         </Pressable>
       </View>
 
-      <SectionLabel>데이터</SectionLabel>
+      <SectionLabel>데이터 · 우리집 가계부</SectionLabel>
       <SettingsCard>
         <Row
           icon="nav-budget"
@@ -179,8 +199,8 @@ export default function ProfileScreen() {
           iconColor={colors.incomeText}
           title="예산 관리"
           sub={
-            Object.keys(budgets).length > 0
-              ? `카테고리별 예산 ${Object.keys(budgets).length}개`
+            Object.keys(remote.budgets).length > 0
+              ? `카테고리별 예산 ${Object.keys(remote.budgets).length}개`
               : '카테고리별 한 달 한도 정하기'
           }
           onPress={() => router.push('/(tabs)/budget')}
@@ -190,8 +210,8 @@ export default function ProfileScreen() {
           iconBg={colors.primaryLight}
           iconColor={colors.primaryStrong}
           title="반복 지출·수입"
-          sub={`${recurring.filter((r) => r.active).length}개 활성 · ${
-            recurring.length - recurring.filter((r) => r.active).length
+          sub={`${remote.recurring.filter((r) => r.active).length}개 활성 · ${
+            remote.recurring.length - remote.recurring.filter((r) => r.active).length
           }개 정지`}
           onPress={() => router.push('/recurring')}
         />
@@ -200,7 +220,7 @@ export default function ProfileScreen() {
           iconBg="#FEE4E6"
           iconColor="#BE185D"
           title="저축 목표"
-          sub={`${goals.length}개 진행 중`}
+          sub={`${remote.goals.length}개 진행 중`}
           onPress={() => router.push('/goals')}
         />
         <Row
@@ -209,9 +229,9 @@ export default function ProfileScreen() {
           iconColor={colors.infoText}
           title="대출 관리"
           sub={
-            loans.length > 0
-              ? `${loans.length}건 · 남은 원금 ${fmt(
-                  loans.reduce((s, l) => s + Math.max(0, l.principal - l.paid), 0),
+            remote.loans.length > 0
+              ? `${remote.loans.length}건 · 남은 원금 ${fmt(
+                  remote.loans.reduce((s, l) => s + Math.max(0, l.principal - l.paid), 0),
                 )}원`
               : '원금·이자·상환일 한눈에 관리'
           }
@@ -223,8 +243,8 @@ export default function ProfileScreen() {
           iconColor={colors.primaryStrong}
           title="카드 관리"
           sub={
-            cards.length > 0
-              ? `${cards.length}장 · 사용월 기준 예상 ${fmt(cardBillTotal)}원`
+            remote.cards.length > 0
+              ? `${remote.cards.length}장 · 사용월 기준 예상 ${fmt(cardBillTotal)}원`
               : '카드 등록 · 일시불/할부 · 예상 카드값'
           }
           onPress={() => router.push('/cards')}
@@ -242,19 +262,50 @@ export default function ProfileScreen() {
 
       <SectionLabel>빠른 입력</SectionLabel>
       <SettingsCard>
+        {/* STEP 16-G1B PROFILE FINAL FIX: transaction input itself is
+            blocked behind <ReadOnlyRouteNotice/> (app/input.tsx) while
+            REMOTE_FINANCE_READ_ONLY is true, so a setting that only
+            affects that screen's behaviour must not be changeable either
+            — disabled at both the Toggle level (visual + tap no-ops) and
+            the onChange callback (setSettings never called), so a future
+            change to Toggle's own disabled-handling can't silently reopen
+            this. Existing quickPaste logic itself is untouched — STEP
+            16-G2 can simply stop passing `disabled` here once transaction
+            write is connected. */}
         <Row
           icon="clipboard"
           iconBg={colors.primaryLight}
           iconColor={colors.primaryStrong}
           title="빠른 지출 입력 모드"
-          sub="앱 열자마자 붙여넣기 화면이 바로 떠요"
+          sub={
+            REMOTE_FINANCE_READ_ONLY
+              ? '거래 입력 연결 후 사용할 수 있어요'
+              : '앱 열자마자 붙여넣기 화면이 바로 떠요'
+          }
           right={
             <Toggle
               value={settings.quickPaste}
-              onChange={(v) => setSettings({ quickPaste: v })}
+              onChange={(v) => {
+                if (REMOTE_FINANCE_READ_ONLY) return;
+                setSettings({ quickPaste: v });
+              }}
               activeColor={colors.primaryStrong}
+              disabled={REMOTE_FINANCE_READ_ONLY}
             />
           }
+          last
+        />
+      </SettingsCard>
+
+      <SectionLabel>우리집</SectionLabel>
+      <SettingsCard>
+        <Row
+          icon="home"
+          iconBg={colors.primaryLight}
+          iconColor={colors.primaryStrong}
+          title="우리집 가계부로 돌아가기"
+          sub="연결 상태 · 구성원 · 초대"
+          onPress={() => router.push('/household-ready')}
           last
         />
       </SettingsCard>
@@ -266,7 +317,7 @@ export default function ProfileScreen() {
           iconBg={colors.incomeLight}
           iconColor={colors.incomeText}
           title="데이터 백업 · 복원"
-          sub={`전체 데이터 텍스트로 복사 · ${transactions.length}건`}
+          sub={`이 기기의 로컬 데이터만 대상 · ${localTransactions.length}건`}
           onPress={() => router.push('/backup')}
         />
         <Row
@@ -274,7 +325,7 @@ export default function ProfileScreen() {
           iconBg={colors.infoLight}
           iconColor={colors.infoText}
           title="개인정보 · 데이터 보관"
-          sub="데이터는 이 기기에만 저장돼요"
+          sub="개인 설정은 이 기기에 저장돼요"
           onPress={showPrivacyInfo}
         />
         <Row
@@ -315,7 +366,8 @@ export default function ProfileScreen() {
             ...noPad,
           }}
         >
-          초기화하면 이 기기의 모든 가계부 데이터가 지워져요.{'\n'}먼저 「데이터 백업 · 복원」에서 백업해 두는 것을 권장해요.
+          초기화하면 이 기기의 로컬 가계부 데이터만 지워져요. 우리집 가계부 데이터에는 영향을 주지 않아요.{'\n'}
+          먼저 「데이터 백업 · 복원」에서 백업해 두는 것을 권장해요.
         </Text>
         <Pressable
           onPress={confirmReset}

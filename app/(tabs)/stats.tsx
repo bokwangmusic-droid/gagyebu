@@ -4,6 +4,8 @@ import { Modal, Pressable, ScrollView, Text, View } from 'react-native';
 import Svg, { Circle, G, Text as SvgText } from 'react-native-svg';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { Card } from '@/components/ui/Card';
 import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -13,7 +15,7 @@ import { getCat } from '@/data/categories';
 import { inRange, sortedExpenseCategories, sumByType } from '@/lib/aggregate';
 import { fmt, fmtShort } from '@/lib/format';
 import { periodRange, prevPeriodRange } from '@/lib/period';
-import { useStore } from '@/store/store';
+import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { Transaction } from '@/store/types';
@@ -44,7 +46,7 @@ interface Bar {
 
 export default function StatsScreen() {
   const router = useRouter();
-  const { transactions, customCats } = useStore();
+  const { status, error, transactions, customCats, refresh } = useFinanceRead();
   const [period, setPeriod] = useState<Period>('week');
   const [selectedBar, setSelectedBar] = useState<Bar | null>(null);
 
@@ -155,12 +157,22 @@ export default function StatsScreen() {
 
   let offset = 0;
 
+  if (status !== 'ready') {
+    return (
+      <Screen>
+        <ScreenHeader title="통계" />
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </Screen>
+    );
+  }
+
   return (
     <Screen>
       <ScreenHeader
         title="통계"
         right={<Text style={{ fontFamily: fontFamily.semibold, fontSize: 14, color: colors.text }}>{info.header}</Text>}
       />
+      <FinanceReadOnlyBanner />
 
       <View style={{ paddingHorizontal: spacing.lg, marginBottom: spacing.lg }}>
         <SegmentedTabs
@@ -224,12 +236,7 @@ export default function StatsScreen() {
           </View>
         </Card>
       ) : (
-        <EmptyState
-          onPress={() => router.push('/input')}
-          title="보여드릴 통계가 없어요"
-          sub={'지출을 몇 개 기록하면\n여기에 통계가 나타나요'}
-          cta="바로 기록하기"
-        />
+        <EmptyState icon="clipboard" title="보여드릴 통계가 없어요" sub={'아직 기록된 지출이 없어요'} />
       )}
 
       {prevExpense > 0 && (
@@ -424,12 +431,8 @@ export default function StatsScreen() {
                       const md = `${d.getMonth() + 1}/${d.getDate()}`;
                       const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
                       return (
-                        <Pressable
+                        <View
                           key={t.id}
-                          onPress={() => {
-                            setSelectedBar(null);
-                            router.push({ pathname: '/input', params: { id: t.id } });
-                          }}
                           style={{
                             flexDirection: 'row',
                             alignItems: 'center',
@@ -462,7 +465,7 @@ export default function StatsScreen() {
                           <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text, ...tabularNums }}>
                             −{fmt(t.amount)}원
                           </Text>
-                        </Pressable>
+                        </View>
                       );
                     })}
                 </View>
