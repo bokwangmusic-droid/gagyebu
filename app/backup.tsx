@@ -45,6 +45,7 @@ const REASON_LABEL: Record<BackupReason, string> = {
   manual: '수동 백업',
   before_restore: '복원 전 백업',
   before_reset: '초기화 전 백업',
+  before_import: '가져오기 전 백업',
 };
 
 /** Best-effort sweep of any temp export files left in the cache dir. */

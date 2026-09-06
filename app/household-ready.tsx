@@ -117,6 +117,32 @@ export default function HouseholdReady() {
         />
       )}
 
+      {/* STEP 16-F1: owner-only, read-only preview of whether this
+          device's existing local financial data could later be migrated
+          into this household — never uploads anything. Not shown to
+          members: see app/migration-preview.tsx header for why. */}
+      {activeHousehold?.role === 'owner' && (
+        <Pressable
+          onPress={() => router.push('/migration-preview')}
+          style={{
+            width: '100%',
+            maxWidth: 430,
+            height: 48,
+            borderRadius: radii.xl,
+            borderWidth: 1.5,
+            borderColor: colors.primaryLight,
+            backgroundColor: colors.white,
+            alignItems: 'center',
+            justifyContent: 'center',
+            marginTop: spacing.md,
+          }}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.primaryStrong }}>
+            기존 데이터 연결 준비
+          </Text>
+        </Pressable>
+      )}
+
       <Text
         style={{
           fontFamily: fontFamily.regular,

@@ -25,10 +25,15 @@ import { migrate, SCHEMA_VERSION } from '@/lib/migrations';
 import { loadItem, saveItem, storageKey } from '@/lib/storage';
 import { DEFAULT_SETTINGS, type AppState } from '@/store/types';
 
-export type BackupReason = 'auto' | 'manual' | 'before_restore' | 'before_reset';
+export type BackupReason = 'auto' | 'manual' | 'before_restore' | 'before_reset' | 'before_import';
 
-/** `before_restore` + `before_reset` — one-tap-recovery snapshots. */
-const RECOVERY_REASONS: readonly BackupReason[] = ['before_restore', 'before_reset'];
+/**
+ * `before_restore` + `before_reset` + `before_import` (STEP 16-F2 §5, added
+ * for the local->household one-time import) — one-tap-recovery snapshots
+ * taken right before a risky operation, kept in their own capped pool so
+ * ordinary auto/manual backups can never evict them.
+ */
+const RECOVERY_REASONS: readonly BackupReason[] = ['before_restore', 'before_reset', 'before_import'];
 const isRecoveryReason = (r: BackupReason) => RECOVERY_REASONS.includes(r);
 
 /**
@@ -99,7 +104,8 @@ export async function listBackups(): Promise<BackupMeta[]> {
         (m.reason === 'auto' ||
           m.reason === 'manual' ||
           m.reason === 'before_restore' ||
-          m.reason === 'before_reset'),
+          m.reason === 'before_reset' ||
+          m.reason === 'before_import'),
     )
     .sort(newestFirst);
 }

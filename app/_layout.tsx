@@ -34,7 +34,9 @@ const SIGNED_OUT_SCREENS = ['sign-in', 'sign-up', 'auth-callback'];
 // STEP 16-E: reachable while signed in but not (yet, or no longer) member
 // of exactly one resolved household.
 const HOUSEHOLD_SETUP_SCREENS = ['household-setup', 'household-create', 'household-join'];
-const HOUSEHOLD_READY_SCREENS = ['household-ready', 'household-invite'];
+// STEP 16-F1: read-only local->household migration preview, reachable from
+// household-ready — see app/migration-preview.tsx.
+const HOUSEHOLD_READY_SCREENS = ['household-ready', 'household-invite', 'migration-preview'];
 
 /**
  * Auth + household gate — runs before, and takes priority over, the
@@ -268,6 +270,7 @@ function RootNav() {
         <Stack.Screen name="household-select" />
         <Stack.Screen name="household-ready" />
         <Stack.Screen name="household-invite" />
+        <Stack.Screen name="migration-preview" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="onboarding" />
         <Stack.Screen name="input" options={MODAL} />
