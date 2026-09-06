@@ -18,15 +18,19 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import { CalendarSheet } from '@/components/ui/CalendarSheet';
+import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
 import { getAllCats, getCat, type TxnType } from '@/data/categories';
 import { installmentPerMonth } from '@/lib/card';
-import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
+import { uid } from '@/lib/id';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
+import { type NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
   checkSplits,
   makeSplitDraft,
@@ -34,7 +38,10 @@ import {
   SPLIT_ERROR_TEXT,
   type SplitDraft,
 } from '@/lib/splits';
-import { useStore } from '@/store/store';
+import { createTransaction } from '@/services/remoteFinanceWrite';
+import { useAuth } from '@/store/auth';
+import { useFinanceRead } from '@/store/financeRead';
+import { useHousehold } from '@/store/household';
 import type { PaymentMethod } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
@@ -107,37 +114,52 @@ function applyMonthsKey(cur: string, k: string): string {
   return cur.length >= 2 ? cur : cur + k;
 }
 
-export default function InputModal() {
-  // STEP 16-G1B: financial write is not implemented yet — this screen adds/
-  // edits a transaction directly against useStore(), which read-only mode
-  // must never let happen while remote household data is on screen. Safe
-  // before any hook below: REMOTE_FINANCE_READ_ONLY is a module-level
-  // constant, so this branch is identical on every render.
-  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="거래 입력" />;
+/**
+ * Route entry for /input — STEP 16-G2-A.
+ *
+ *   /input           -> the new-transaction form (the ONE financial write
+ *                       now open, REMOTE_FINANCE_WRITE.transactionCreate).
+ *   /input?id=<any>  -> ReadOnlyRouteNotice. Editing an existing
+ *                       transaction stays closed this STEP; a deep link
+ *                       that supplies an id can never mount the form.
+ *
+ * The param check lives in this thin wrapper so NewTransactionForm below
+ * keeps an unconditional hook order — a runtime `if (params.id) return`
+ * inside the form would sit above its hooks and break the rules of hooks.
+ * Expo Router can hand back `string | string[]`, so both are handled.
+ */
+export default function InputRoute() {
+  const params = useLocalSearchParams<{ id?: string | string[] }>();
+  const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
 
+  if (idParam) return <ReadOnlyRouteNotice title="거래 수정" />;
+  if (!REMOTE_FINANCE_WRITE.transactionCreate) {
+    return <ReadOnlyRouteNotice title="거래 입력" />;
+  }
+
+  return <NewTransactionForm />;
+}
+
+function NewTransactionForm() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const toast = useToast();
-  const params = useLocalSearchParams<{ id?: string }>();
-  const {
-    transactions,
-    addTransaction,
-    updateTransaction,
-    deleteTransaction,
-    customCats,
-    catOrder,
-    cards,
-  } = useStore();
 
-  const editing = params.id ? transactions.find((t) => t.id === params.id) ?? null : null;
-  const isEdit = !!editing;
-  const saveLabel = isEdit ? '수정하기' : '저장하기';
+  const { session } = useAuth();
+  const { activeHousehold } = useHousehold();
+  // Household finance READ values come ONLY from the remote read-only
+  // source — never useStore(). While status !== 'ready' the form is not
+  // rendered at all (FinanceLoadState gate below), so cards/customCats/
+  // catOrder are always trusted household data wherever they are used.
+  const { status, error, cards, customCats, catOrder, refresh } = useFinanceRead();
 
-  const [type, setType] = useState<TxnType>(editing?.type ?? 'expense');
-  const [amount, setAmount] = useState(editing ? String(editing.amount) : '');
-  const [category, setCategory] = useState(editing?.category ?? 'food');
-  const [memo, setMemo] = useState(editing?.memo ?? '');
-  const [selectedDate, setSelectedDate] = useState(() => toDateKey(editing?.date ?? new Date()));
+  const saveLabel = '저장하기';
+
+  const [type, setType] = useState<TxnType>('expense');
+  const [amount, setAmount] = useState('');
+  const [category, setCategory] = useState('food');
+  const [memo, setMemo] = useState('');
+  const [selectedDate, setSelectedDate] = useState(() => toDateKey(new Date()));
 
   // One inline keypad, one active target. `padVisible`/`setPadVisible` are kept
   // as a thin shim over it so every existing call site ("collapse the pad",
@@ -147,22 +169,17 @@ export default function InputModal() {
   const setPadVisible = (v: boolean) => setNumTarget(v ? { kind: 'main' } : null);
 
   // Split expense — off by default; a normal single-category entry is unchanged.
-  const [splitOn, setSplitOn] = useState(!!editing?.splits?.length);
-  const [splits, setSplits] = useState<SplitDraft[]>(() =>
-    editing?.splits?.length
-      ? editing.splits.map((s) => ({ category: s.category, amount: String(s.amount) }))
-      : [makeSplitDraft('food'), makeSplitDraft('transit')],
-  );
+  const [splitOn, setSplitOn] = useState(false);
+  const [splits, setSplits] = useState<SplitDraft[]>(() => [
+    makeSplitDraft('food'),
+    makeSplitDraft('transit'),
+  ]);
 
-  // Payment method / card / 할부 — all optional; absent = legacy behaviour.
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | undefined>(
-    editing?.paymentMethod,
-  );
-  const [cardId, setCardId] = useState<string | undefined>(editing?.cardId);
-  const [installmentOn, setInstallmentOn] = useState(!!editing?.installment);
-  const [installmentMonths, setInstallmentMonths] = useState(
-    editing?.installment ? String(editing.installment.months) : '3',
-  );
+  // Payment method / card / 할부 — all optional; absent = plain single entry.
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | undefined>(undefined);
+  const [cardId, setCardId] = useState<string | undefined>(undefined);
+  const [installmentOn, setInstallmentOn] = useState(false);
+  const [installmentMonths, setInstallmentMonths] = useState('3');
 
   const [showDate, setShowDate] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
@@ -312,70 +329,97 @@ export default function InputModal() {
     return () => sub.remove();
   }, [showPaste, showQuick]);
 
-  // Guards against a fast double-tap on 저장 creating two transactions
-  // (router.back() is async, so the button stays live for a frame).
-  const submitting = useRef(false);
+  // Double-submit defence (STEP 16-G2-A2 §9/§10):
+  //  - transactionIdRef: the client-generated transactions.id, minted ONCE
+  //    per form mount and reused on every retry. A retried save (or an
+  //    INSERT whose success response was lost) can never create a second
+  //    row — the DB rejects the duplicate PK and createTransaction()
+  //    verifies the existing row is our own request before reporting ok.
+  //  - submittingRef: synchronous re-entry guard (state updates are async).
+  //  - submitting (state): drives the disabled + "저장 중…" button UI.
+  const transactionIdRef = useRef(uid('txn'));
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
 
-  const save = () => {
-    if (submitting.current || !canSave) return;
-    submitting.current = true;
-    let dateISO: string;
-    if (editing && toDateKey(editing.date) === selectedDate) {
-      dateISO = editing.date; // date unchanged — keep original time of day
-    } else {
-      const now = new Date();
-      const [y, m, d] = selectedDate.split('-').map(Number);
-      dateISO = new Date(
-        y,
-        m - 1,
-        d,
-        now.getHours(),
-        now.getMinutes(),
-        now.getSeconds(),
-      ).toISOString();
-    }
-    const isCredit = paymentMethod === 'credit';
-    // Every optional field is written explicitly (value or `undefined`) so an
-    // edit that turns a feature OFF clears the stored field — same pattern as
-    // STEP 5's `splits: undefined`. `undefined` keys are dropped on persist.
-    const payload = {
+  const save = async () => {
+    if (submittingRef.current || !canSave) return;
+
+    // Trusted-context gate (STEP 16-G2-A2 §11). status === 'ready' already
+    // means useFinanceRead() confirmed the remote data is for THIS
+    // user+household; still require an explicit session + activeHousehold,
+    // and always write against the CURRENT activeHousehold.id.
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+    if (selectedDate > today) return;
+
+    // Defensive re-validation — the DB has CHECK/FK constraints but we do
+    // not lean on them for UX (STEP 16-G2-A2 §12).
+    if (!(total > 0)) return;
+    if (type !== 'expense' && type !== 'income') return;
+    const isCredit = type === 'expense' && paymentMethod === 'credit';
+    if (splitOn && !splitCheck.ok) return;
+    if (isCredit && installmentOn && !(instMonths >= 2)) return;
+    const categoryToSave = splitOn ? splits[0].category : category;
+    if (!categoryToSave) return;
+
+    submittingRef.current = true;
+    setSubmitting(true);
+
+    const now = new Date();
+    const [y, m, d] = selectedDate.split('-').map(Number);
+    const dateISO = new Date(
+      y,
+      m - 1,
+      d,
+      now.getHours(),
+      now.getMinutes(),
+      now.getSeconds(),
+    ).toISOString();
+
+    const draft: NewTransactionDraft = {
       type,
-      // Keep a representative category so list rows still show an icon;
+      // A representative category so list rows still show an icon;
       // aggregation ignores it whenever `splits` is present.
-      category: splitOn ? splits[0].category : category,
+      category: categoryToSave,
       amount: total,
       memo: memo.trim(),
       date: dateISO,
-      splits: splitOn ? normSplits : undefined,
-      paymentMethod: paymentMethod ?? undefined,
+      paymentMethod: type === 'expense' ? paymentMethod ?? undefined : undefined,
       cardId: isCredit ? cardId ?? undefined : undefined,
       installment:
-        isCredit && installmentOn && instMonths >= 2
-          ? { months: instMonths }
-          : undefined,
+        isCredit && installmentOn && instMonths >= 2 ? { months: instMonths } : undefined,
+      splits: splitOn ? normSplits : undefined,
     };
-    if (editing) updateTransaction(editing.id, payload);
-    else addTransaction(payload);
+
+    const res = await createTransaction({
+      id: transactionIdRef.current,
+      householdId: activeHousehold.id,
+      // The session id this trusted screen was validated against — the
+      // service refuses to write (and refuses idempotent-success) if the
+      // live session has since switched accounts (STEP 16-G2-A2-HARDEN).
+      expectedUserId: session.user.id,
+      draft,
+      knownCardIds: new Set(cards.map((c) => c.id)),
+    });
+
+    if (!res.ok) {
+      // transactionIdRef is unchanged — a retry reuses the same id.
+      submittingRef.current = false;
+      setSubmitting(false);
+      toast.show(res.message);
+      return;
+    }
+
+    // INSERT succeeded. Authoritative remote refresh, then leave — no
+    // optimistic local write, no stale-closure re-check of the result
+    // (STEP 16-G2-A2 §13/§19). Home renders the refreshed remote snapshot
+    // and its own FinanceLoadState handles any refresh error. Deliberately
+    // do NOT reset `submitting` — the screen is closing.
+    await refresh();
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
       () => {},
     );
-    toast.show(isEdit ? '수정했어요' : '저장했어요');
+    toast.show('저장했어요');
     router.back();
-  };
-
-  const remove = () => {
-    if (!editing) return;
-    Alert.alert('이 내역을 삭제할까요?', undefined, [
-      { text: '취소', style: 'cancel' },
-      {
-        text: '삭제',
-        style: 'destructive',
-        onPress: () => {
-          deleteTransaction(editing.id);
-          router.back();
-        },
-      },
-    ]);
   };
 
   const openPaste = async () => {
@@ -451,6 +495,18 @@ export default function InputModal() {
   const amountTextColor =
     amount === '' && amountActive ? colors.primaryStrong : amountColor;
 
+  // Household finance data must be confirmed for the current user+household
+  // before the form (which reads cards/customCats/catOrder and writes a
+  // transaction into that household) can be used. Never a silent local
+  // fallback — same rule as every other finance screen (STEP 16-G1B).
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="거래 입력" onClose={() => router.back()} scroll={false}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
   return (
     <View style={[styles.root, { paddingTop: insets.top + spacing.sm }]}>
       {/* Header: close · date pill */}
@@ -465,13 +521,8 @@ export default function InputModal() {
           <AppIcon name="chevron" size={12} color={colors.textMuted} />
         </Pressable>
 
-        {isEdit ? (
-          <Pressable onPress={remove} hitSlop={10} style={{ paddingHorizontal: 6, paddingVertical: 4 }}>
-            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.expenseText }}>삭제</Text>
-          </Pressable>
-        ) : (
-          <View style={{ width: 30 }} />
-        )}
+        {/* New-transaction only — no edit/delete affordance this STEP. */}
+        <View style={{ width: 30 }} />
       </View>
 
       {/* One vertical scroll for the whole form — only the header above and the
@@ -999,11 +1050,11 @@ export default function InputModal() {
           </View>
 
           <Pressable
-            onPress={save}
-            disabled={!canSave}
+            onPress={() => void save()}
+            disabled={!canSave || submitting}
             style={({ pressed }) => [
               styles.saveBtn,
-              { opacity: !canSave ? 0.4 : pressed ? 0.92 : 1, marginTop: 10 },
+              { opacity: !canSave || submitting ? 0.4 : pressed ? 0.92 : 1, marginTop: 10 },
             ]}
           >
             <LinearGradient
@@ -1012,7 +1063,7 @@ export default function InputModal() {
               end={{ x: 1, y: 1 }}
               style={styles.saveBtnFill}
             >
-              <Text style={styles.saveBtnText}>{saveLabel}</Text>
+              <Text style={styles.saveBtnText}>{submitting ? '저장 중…' : saveLabel}</Text>
             </LinearGradient>
           </Pressable>
         </View>
@@ -1027,11 +1078,11 @@ export default function InputModal() {
             <AppIcon name="chev-up" size={20} color={colors.textSub} />
           </Pressable>
           <Pressable
-            onPress={save}
-            disabled={!canSave}
+            onPress={() => void save()}
+            disabled={!canSave || submitting}
             style={({ pressed }) => [
               styles.saveBtn,
-              { flex: 1, opacity: !canSave ? 0.4 : pressed ? 0.92 : 1 },
+              { flex: 1, opacity: !canSave || submitting ? 0.4 : pressed ? 0.92 : 1 },
             ]}
           >
             <LinearGradient
@@ -1040,7 +1091,7 @@ export default function InputModal() {
               end={{ x: 1, y: 1 }}
               style={styles.saveBtnFill}
             >
-              <Text style={styles.saveBtnText}>{saveLabel}</Text>
+              <Text style={styles.saveBtnText}>{submitting ? '저장 중…' : saveLabel}</Text>
             </LinearGradient>
           </Pressable>
         </View>

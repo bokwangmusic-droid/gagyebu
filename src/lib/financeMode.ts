@@ -1,16 +1,24 @@
 /**
- * STEP 16-G1B — central "is household finance currently read-only" switch.
+ * STEP 16-G1B / STEP 16-G2-A — household finance write gating.
  *
- * Always `true` for this STEP: no Supabase financial write path exists yet
- * (STEP 16-G2 is where that gets built). Every screen that could mutate
- * financial data checks this single constant before rendering its real
- * form — see src/components/ReadOnlyRouteNotice.tsx, and the guard at the
- * top of app/input.tsx, app/card-add.tsx, app/budget-add.tsx,
- * app/recurring-add.tsx, app/planned-add.tsx, app/goal-add.tsx,
- * app/loan-add.tsx, app/categories.tsx.
+ * `REMOTE_FINANCE_READ_ONLY` stays `true` and keeps its exact original
+ * meaning: every mutation screen EXCEPT new-transaction-create still renders
+ * <ReadOnlyRouteNotice/> instead of its real form — card-add, budget-add,
+ * recurring-add, planned-add, goal-add, loan-add, categories, and
+ * transaction EDIT/DELETE. See src/components/ReadOnlyRouteNotice.tsx and
+ * the guard at the top of each of those files.
  *
- * Deliberately a plain boolean, not an env var or settings toggle — this
- * STEP doesn't need per-user/per-build configurability, only a single,
- * greppable source of truth.
+ * `REMOTE_FINANCE_WRITE` is the STEP 16-G2-A addition: the one, greppable
+ * place that says which financial writes are actually open. For this STEP
+ * that is exactly `transactionCreate` — a single new `public.transactions`
+ * row via src/services/remoteFinanceWrite.ts. Editing and deleting a
+ * transaction remain closed (`false`), as does everything still governed by
+ * `REMOTE_FINANCE_READ_ONLY`.
  */
 export const REMOTE_FINANCE_READ_ONLY = true as const;
+
+export const REMOTE_FINANCE_WRITE = {
+  transactionCreate: true,
+  transactionEdit: false,
+  transactionDelete: false,
+} as const;

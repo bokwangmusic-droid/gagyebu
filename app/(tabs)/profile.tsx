@@ -15,6 +15,7 @@ import { createBackup } from '@/lib/backup';
 import { cardBillingForMonth } from '@/lib/card';
 import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
+import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -23,6 +24,7 @@ import { fontFamily, noPad } from '@/theme/typography';
 export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
+  const { signOut } = useAuth();
   // LOCAL device data — used ONLY by the "데이터 백업 · 복원" / "모든 데이터
   // 초기화" section below, which reads/writes this device's own gagyebu.*
   // storage and never touches the household's remote data (STEP 16-G1B
@@ -351,7 +353,7 @@ export default function ProfileScreen() {
         style={{
           paddingTop: spacing.lg,
           paddingHorizontal: spacing.xl,
-          paddingBottom: 40,
+          paddingBottom: spacing.xl,
           alignItems: 'center',
           gap: 10,
         }}
@@ -386,6 +388,45 @@ export default function ProfileScreen() {
           <AppIcon name="warn" size={14} color={colors.expenseText} />
           <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.expenseText }}>
             모든 데이터 초기화
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* PROFILE UX FIX: signing out previously lived only on
+          household-ready (내정보 → 우리집 가계부로 돌아가기 → 로그아웃). This
+          is a plain red text link at the very bottom of 내정보 —
+          deliberately NOT the pill + border + warn-icon treatment the
+          destructive "모든 데이터 초기화" above uses — so it reads as "end
+          session", never "delete data". A hairline separator and its own
+          footer block keep the two visually distinct. Reuses
+          useAuth().signOut(); AuthGate (app/_layout.tsx) redirects to
+          sign-in once the session clears. household-ready's own 로그아웃 is
+          left untouched. */}
+      <View
+        style={{
+          borderTopWidth: 1,
+          borderTopColor: colors.border,
+          marginHorizontal: spacing.lg,
+          paddingTop: spacing.lg,
+          paddingBottom: 40,
+          alignItems: 'center',
+        }}
+      >
+        <Pressable
+          onPress={() => void signOut()}
+          hitSlop={8}
+          accessibilityRole="button"
+          style={{ paddingVertical: 8, paddingHorizontal: 16 }}
+        >
+          <Text
+            style={{
+              fontFamily: fontFamily.semibold,
+              fontSize: 13,
+              color: colors.expenseText,
+              ...noPad,
+            }}
+          >
+            로그아웃
           </Text>
         </Pressable>
       </View>

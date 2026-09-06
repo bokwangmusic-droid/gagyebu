@@ -5,7 +5,7 @@ import { useRouter } from 'expo-router';
 import { Platform, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { colors, gradients, layout, radii, shadows } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
 import { useFinanceRead } from '@/store/financeRead';
@@ -24,6 +24,9 @@ const TABS: { name: string; label: string; icon: string }[] = [
 ];
 
 const ADD_SIZE = 56;
+/** The bar's own horizontal padding. Shared so the centred "+" overlay can
+ *  cancel it exactly (see the FAB wrapper below) instead of guessing. */
+const BAR_PAD_X = 12;
 
 export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
   const insets = useSafeAreaInsets();
@@ -117,7 +120,7 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
           borderTopWidth: 1,
           borderTopColor: colors.border,
           paddingTop: 8,
-          paddingHorizontal: 12,
+          paddingHorizontal: BAR_PAD_X,
           paddingBottom: padBottom,
         },
         shadows.md,
@@ -129,48 +132,68 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
       {renderItem(TABS[2])}
       {renderItem(TABS[3])}
 
-      {/* Docked add button — STEP 16-G1B: hidden entirely in read-only mode
-          rather than left tappable-but-blocked, since this is the app's
-          single most prominent "add transaction" affordance (visible on
-          every tab, at all times). */}
-      {!REMOTE_FINANCE_READ_ONLY && (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="지출·수입 추가"
-          onPress={openInput}
-          style={({ pressed }) => [
-            {
-              position: 'absolute',
-              left: '50%',
-              marginLeft: -ADD_SIZE / 2,
-              bottom: padBottom + 14,
-              width: ADD_SIZE,
-              height: ADD_SIZE,
-              borderRadius: radii.pill,
-              alignItems: 'center',
-              justifyContent: 'center',
-              transform: [{ scale: pressed ? 0.94 : 1 }],
-            },
-            shadows.fab,
-          ]}
+      {/* Docked add button — STEP 16-G1B hid it entirely in read-only mode
+          (this is the app's single most prominent "add transaction"
+          affordance, on every tab at all times). STEP 16-G2-A brings it
+          back, but ONLY for new-transaction-create: it opens /input, which
+          is the one financial write now allowed. No other mutation CTA is
+          restored.
+
+          STEP 16-G2-A2 UI FIX: the FAB used `left: '50%'` + a negative
+          `marginLeft`, which Yoga resolves against the bar's *content* box
+          while applying the inset from its *padding* box — so the bar's
+          `paddingHorizontal` (BAR_PAD_X) pushed the button that many px
+          left of the true centre. Instead it now lives in a full-width
+          overlay: `left/right` cancel BAR_PAD_X exactly so the overlay
+          spans the bar edge-to-edge, and `alignItems: 'center'` puts the
+          FAB's centre at precisely 50% of the bar width — independent of
+          the tab items' flex/label widths. `box-none` keeps the overlay
+          from stealing taps meant for the tabs underneath. */}
+      {REMOTE_FINANCE_WRITE.transactionCreate && (
+        <View
+          pointerEvents="box-none"
+          style={{
+            position: 'absolute',
+            left: -BAR_PAD_X,
+            right: -BAR_PAD_X,
+            bottom: padBottom + 14,
+            alignItems: 'center',
+          }}
         >
-          <LinearGradient
-            colors={gradients.primary}
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 1 }}
-            style={{
-              width: ADD_SIZE,
-              height: ADD_SIZE,
-              borderRadius: radii.pill,
-              alignItems: 'center',
-              justifyContent: 'center',
-              borderWidth: 4,
-              borderColor: colors.card,
-            }}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="지출·수입 추가"
+            onPress={openInput}
+            style={({ pressed }) => [
+              {
+                width: ADD_SIZE,
+                height: ADD_SIZE,
+                borderRadius: radii.pill,
+                alignItems: 'center',
+                justifyContent: 'center',
+                transform: [{ scale: pressed ? 0.94 : 1 }],
+              },
+              shadows.fab,
+            ]}
           >
-            <AppIcon name="plus" size={26} color={colors.white} strokeWidth={2.5} />
-          </LinearGradient>
-        </Pressable>
+            <LinearGradient
+              colors={gradients.primary}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={{
+                width: ADD_SIZE,
+                height: ADD_SIZE,
+                borderRadius: radii.pill,
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderWidth: 4,
+                borderColor: colors.card,
+              }}
+            >
+              <AppIcon name="plus" size={26} color={colors.white} strokeWidth={2.5} />
+            </LinearGradient>
+          </Pressable>
+        </View>
       )}
     </View>
   );
