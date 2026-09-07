@@ -9,8 +9,9 @@
  * screen replaces STEP 16-D's app/auth-ready.tsx, which is removed now
  * that this one exists (see completion report).
  */
-import { useRouter } from 'expo-router';
-import { Pressable, ScrollView, Text, View } from 'react-native';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback } from 'react';
+import { BackHandler, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { GradientButton } from '@/components/ui/GradientButton';
@@ -23,6 +24,30 @@ import { fontFamily } from '@/theme/typography';
 export default function HouseholdReady() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+
+  // Android hardware back. AuthGate reaches this screen via
+  // `router.replace('/household-ready')`, so on a fresh launch there is
+  // nothing behind it in the stack — dispatching GO_BACK there produces
+  // "The action 'GO_BACK' was not handled by any navigator". Only go back
+  // when there is real history (e.g. this screen was pushed onto, then
+  // returned to); otherwise move FORWARD into the finance home. Never back
+  // into sign-in / sign-up / invite — the household is already connected.
+  // Registered only while this screen is focused (useFocusEffect).
+  useFocusEffect(
+    useCallback(() => {
+      const onBackPress = () => {
+        if (router.canGoBack()) {
+          router.back();
+        } else {
+          router.replace('/(tabs)');
+        }
+        return true;
+      };
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+      return () => sub.remove();
+    }, [router]),
+  );
+
   const { session, signOut } = useAuth();
   const { activeHousehold, members, membersLoading } = useHousehold();
   // STEP 16-G1B-FIX: read straight from useRemoteFinance() (the same
@@ -147,7 +172,12 @@ export default function HouseholdReady() {
               ? '가계부 열기 (연결 실패)'
               : '가계부 불러오는 중…'
         }
-        onPress={() => router.push('/(tabs)')}
+        // `replace`, not `push`: this screen is the AuthGate landing target,
+        // so pushing would leave it in the back stack and Android back on
+        // the finance home would bounce here (household-home <-> household-
+        // ready loop). Replacing swaps it out; back on the tabs root then
+        // does the normal Android "exit / previous tab" thing.
+        onPress={() => router.replace('/(tabs)')}
         disabled={!financeReady}
         style={{ width: '100%', maxWidth: 430, marginTop: spacing.xl }}
       />
