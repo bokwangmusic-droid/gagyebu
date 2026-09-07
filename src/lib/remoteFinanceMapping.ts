@@ -86,6 +86,22 @@ export interface RemoteCardMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one budget — STEP 16-G2-C3-B.
+ *
+ * `public.budgets` has no surrogate id — its natural PK is
+ * `(household_id, category_id)` — so this map is keyed by `category_id`,
+ * parallel to `RemoteFinanceData.budgets` (a plain category->amount
+ * record). Only ACTIVE budgets appear here (the SELECT filters
+ * `deleted_at IS NULL`); a category with no live budget simply has no
+ * entry. `updatedAt` is the opaque optimistic-concurrency token — never
+ * re-serialised; `createdBy` is author bookkeeping only.
+ */
+export interface RemoteBudgetMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -98,6 +114,8 @@ export interface RemoteFinanceData {
   /** card id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-C2. */
   cardMeta: Record<string, RemoteCardMeta>;
   budgets: BudgetMap;
+  /** category_id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-C3-B. */
+  budgetMeta: Record<string, RemoteBudgetMeta>;
   recurring: RecurringRule[];
   planned: PlannedExpense[];
   goals: Goal[];
@@ -224,7 +242,14 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
   }
 
   const budgets: BudgetMap = {};
-  for (const b of raw.budgets) budgets[b.category_id] = b.amount;
+  const budgetMeta: Record<string, RemoteBudgetMeta> = {};
+  for (const b of raw.budgets) {
+    budgets[b.category_id] = b.amount;
+    // Parallel to `budgets`, keyed by category_id. `updatedAt` stored
+    // verbatim — an opaque concurrency token, never formatted/re-parsed
+    // (STEP 16-G2-C3-B §3).
+    budgetMeta[b.category_id] = { updatedAt: b.updated_at, createdBy: b.created_by };
+  }
 
   const recurring: RecurringRule[] = raw.recurringRules.map((r) => ({
     id: r.id,
@@ -282,6 +307,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     cards,
     cardMeta,
     budgets,
+    budgetMeta,
     recurring,
     planned,
     goals,

@@ -64,6 +64,11 @@ import { supabase } from '@/lib/supabase';
  * `updated_at`. `transactions` also gets its raw `card_id` mirrored into
  * `transactionMeta.rawCardId` so a transaction whose card was
  * soft-deleted can be edited without null-ing its real DB `card_id`.
+ *
+ * STEP 16-G2-C3-B: `budgets` additionally selects `created_by` and
+ * `updated_at`, routed into a separate `budgetMeta` map keyed by
+ * `category_id` (the BudgetMap domain type — a plain category->amount
+ * record — is untouched). Same opaque-token rule for `updated_at`.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -177,6 +182,16 @@ export interface RemoteTransaction {
 export interface RemoteBudgetRow {
   category_id: string;
   amount: number;
+  /**
+   * STEP 16-G2-C3-B — routed to `budgetMeta`, NOT the BudgetMap domain
+   * type. `updated_at` is the optimistic-concurrency token for budget edit
+   * / soft-delete / tombstone-revive (compared with an exact
+   * `.eq('updated_at', …)`), so it must travel as the RAW PostgREST string
+   * — never re-parsed through Date/toISOString. `created_by` is author
+   * bookkeeping only.
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteHouseholdSettings {
@@ -294,7 +309,7 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('budgets')
-      .select('category_id,amount')
+      .select('category_id,amount,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
