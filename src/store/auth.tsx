@@ -57,12 +57,22 @@ interface AuthContextValue {
 
   /** The signed-in user's public.profiles row, once fetched. Never blocks navigation. */
   profile: AuthProfile | null;
+  /** True while the current session's profiles row is being (re-)fetched. */
+  profileLoading: boolean;
   /** True if a session exists but its profiles row could not be found/read. */
   profileError: boolean;
 
   signUp(params: { name: string; email: string; password: string }): Promise<SignUpResult>;
   signIn(params: { email: string; password: string }): Promise<AuthActionResult>;
   signOut(): Promise<void>;
+  /**
+   * Update the CURRENT account's `public.profiles.display_name` (self-only,
+   * RLS-enforced). Re-checks the live session first and refuses if it no
+   * longer matches the context's user (stale-account guard). On success the
+   * authoritative returned row replaces `profile` — no optimistic UI, no
+   * local-settings write.
+   */
+  updateDisplayName(name: string): Promise<AuthActionResult>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -90,6 +100,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<AuthProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState(false);
   const mountedRef = useRef(true);
 
@@ -123,15 +134,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // ---- confirm the trigger-created profile row exists (§10) ----
   // Read-only, self-only (`.eq('id', ...)` — RLS also enforces this), and
   // never blocks navigation (household-ready and others): a missing row
-  // surfaces as `profileError` instead of an infinite loading state.
+  // surfaces as `profileError` instead of an infinite loading state. Re-runs
+  // on every account switch, so `profile` is ALWAYS the live session's own
+  // row and can never carry another account's name across a sign-out.
   useEffect(() => {
     const uid = session?.user?.id;
     if (!uid) {
       setProfile(null);
       setProfileError(false);
+      setProfileLoading(false);
       return;
     }
     let cancelled = false;
+    setProfileLoading(true);
     (async () => {
       const { data, error } = await supabase
         .from('profiles')
@@ -142,10 +157,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (error || !data) {
         setProfile(null);
         setProfileError(true);
+        setProfileLoading(false);
         return;
       }
       setProfileError(false);
       setProfile({ id: data.id, displayName: data.display_name });
+      setProfileLoading(false);
     })();
     return () => {
       cancelled = true;
@@ -188,7 +205,63 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // sync yet for it to belong to, so nothing to namespace or wipe (see
     // app/_layout.tsx header comment).
     await supabase.auth.signOut();
+    // Drop the account-scoped profile immediately (the session effect also
+    // clears it once SIGNED_OUT lands, but this removes any window where a
+    // stale name could be read). Device-local gagyebu.* settings are NOT
+    // touched — only this account's identity.
+    if (mountedRef.current) {
+      setProfile(null);
+      setProfileError(false);
+      setProfileLoading(false);
+    }
   }, []);
+
+  /**
+   * STEP 16-PROFILE-FIX §4-§7: the ONLY writer of the account name. Writes
+   * `public.profiles.display_name` for the LIVE session's own user (RLS
+   * `id = auth.uid()` + an explicit `.eq('id', …)`), then adopts the
+   * authoritative returned row. No `auth.admin`, no RPC, no service_role,
+   * no household_members write, no local-settings write.
+   */
+  const updateDisplayName = useCallback(
+    async (name: string): Promise<AuthActionResult> => {
+      const normalized = name.trim();
+      if (!normalized) return { ok: false, message: '이름을 입력해주세요' };
+
+      // Re-confirm the live session right before writing.
+      const { data: sessionData } = await supabase.auth.getSession();
+      const liveUserId = sessionData.session?.user?.id ?? null;
+      if (!liveUserId) {
+        return { ok: false, message: '세션이 만료됐어요. 다시 로그인해주세요' };
+      }
+      // Stale-account guard: the context we believe we're editing for must
+      // still be the live session's user.
+      if (session?.user?.id && session.user.id !== liveUserId) {
+        return { ok: false, message: '로그인 정보가 변경됐어요. 다시 시도해주세요' };
+      }
+
+      const { data, error } = await supabase
+        .from('profiles')
+        .update({ display_name: normalized })
+        .eq('id', liveUserId)
+        .select('id, display_name')
+        .single();
+
+      if (error || !data) {
+        return {
+          ok: false,
+          message: describeAuthError(error ?? new Error('profile update failed')),
+        };
+      }
+
+      if (mountedRef.current) {
+        setProfile({ id: data.id, displayName: data.display_name });
+        setProfileError(false);
+      }
+      return { ok: true };
+    },
+    [session?.user?.id],
+  );
 
   const value = useMemo<AuthContextValue>(
     () => ({
@@ -196,12 +269,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user: session?.user ?? null,
       loading,
       profile,
+      profileLoading,
       profileError,
       signUp,
       signIn,
       signOut,
+      updateDisplayName,
     }),
-    [session, loading, profile, profileError, signUp, signIn, signOut],
+    [
+      session,
+      loading,
+      profile,
+      profileLoading,
+      profileError,
+      signUp,
+      signIn,
+      signOut,
+      updateDisplayName,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

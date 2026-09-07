@@ -24,7 +24,13 @@ import { fontFamily, noPad } from '@/theme/typography';
 export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
-  const { signOut } = useAuth();
+  // Account identity (name / email) comes ONLY from the live Supabase
+  // session + its public.profiles row — NEVER settings.profileName /
+  // settings.profileEmail, which are a single device-global gagyebu.*
+  // value shared by every account that signs in on this device
+  // (URGENT PROFILE FIX). `Settings.profileName` is left in place as a
+  // now-unused legacy field so backups/storage don't break.
+  const { session, profile, profileLoading, profileError, updateDisplayName, signOut } = useAuth();
   // LOCAL device data — used ONLY by the "데이터 백업 · 복원" / "모든 데이터
   // 초기화" section below, which reads/writes this device's own gagyebu.*
   // storage and never touches the household's remote data (STEP 16-G1B
@@ -58,8 +64,19 @@ export default function ProfileScreen() {
 
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState('');
+  const [savingName, setSavingName] = useState(false);
 
-  const initial = (settings.profileName || '나').charAt(0);
+  // Priority: authoritative profiles.display_name -> email local-part ->
+  // '사용자'. NEVER settings.profileName — a stale name from another
+  // account must not flash here even for a frame.
+  const emailLocalPart = (session?.user?.email ?? '').split('@')[0];
+  const accountName = profile?.displayName?.trim() || emailLocalPart || '사용자';
+  const initial = accountName.charAt(0) || '나';
+  const nameHint = profileError
+    ? '계정 이름을 불러오지 못했어요'
+    : profileLoading && !profile
+      ? '계정 이름을 불러오는 중…'
+      : null;
 
   // App metadata straight from the Expo config (app.json) — never hard-coded,
   // so it can't drift from the real release. `nativeBuildVersion` is only set
@@ -176,15 +193,15 @@ export default function ProfileScreen() {
         </View>
         <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
           <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, lineHeight: 18, color: colors.text, ...noPad }}>
-            {settings.profileName || '나'}
+            {accountName}
           </Text>
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 13, color: colors.textMuted, ...noPad }}>
-            {settings.profileEmail || '이메일 미설정'}
+            {nameHint ?? (session?.user?.email ?? '이메일 미설정')}
           </Text>
         </View>
         <Pressable
           onPress={() => {
-            setDraftName(settings.profileName || '');
+            setDraftName(profile?.displayName ?? '');
             setEditingName(true);
           }}
           style={{ paddingVertical: 6, paddingHorizontal: 12, borderRadius: radii.pill, backgroundColor: colors.primaryLight }}
@@ -432,7 +449,13 @@ export default function ProfileScreen() {
       </View>
 
       {editingName && (
-        <BottomSheet visible onClose={() => setEditingName(false)} title="이름 변경">
+        <BottomSheet
+          visible
+          onClose={() => {
+            if (!savingName) setEditingName(false);
+          }}
+          title="이름 변경"
+        >
           <Field label="이름">
             <TextField
               value={draftName}
@@ -443,11 +466,25 @@ export default function ProfileScreen() {
             />
           </Field>
           <GradientButton
-            label="저장"
+            label={savingName ? '저장 중…' : '저장'}
+            disabled={savingName || draftName.trim().length === 0}
             onPress={() => {
               const n = draftName.trim();
-              if (n) setSettings({ profileName: n });
-              setEditingName(false);
+              if (!n || savingName) return;
+              setSavingName(true);
+              void (async () => {
+                // Writes public.profiles.display_name for the LIVE account
+                // only; identity re-checked inside updateDisplayName. No
+                // local settings write, no optimistic UI.
+                const res = await updateDisplayName(n);
+                setSavingName(false);
+                if (res.ok) {
+                  setEditingName(false);
+                  toast.show('이름을 변경했어요');
+                } else {
+                  toast.show(res.message); // keep the sheet open, remote name unchanged
+                }
+              })();
             }}
           />
         </BottomSheet>
