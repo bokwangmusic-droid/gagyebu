@@ -119,6 +119,22 @@ export interface RemoteCategoryMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one PLANNED EXPENSE — STEP 16-G2-D1.
+ *
+ * Keyed by the planned-expense id, parallel to `RemoteFinanceData.planned`.
+ * Only ACTIVE planned expenses appear here (the SELECT filters
+ * `deleted_at IS NULL`). `updatedAt` is the opaque optimistic-concurrency
+ * token for planned edit / soft-delete — the RAW PostgREST string, never
+ * re-serialised. `createdBy` is author bookkeeping only (the 23505
+ * idempotency check on CREATE). The `PlannedExpense` domain type stays
+ * free of this metadata.
+ */
+export interface RemotePlannedMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -137,6 +153,8 @@ export interface RemoteFinanceData {
   categoryMeta: Record<string, RemoteCategoryMeta>;
   recurring: RecurringRule[];
   planned: PlannedExpense[];
+  /** planned-expense id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D1. */
+  plannedMeta: Record<string, RemotePlannedMeta>;
   goals: Goal[];
   loans: Loan[];
   customCats: CustomCatMap;
@@ -300,6 +318,13 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     createdAt: p.created_at,
   }));
 
+  // Parallel to `planned`, keyed by id. `updatedAt` stored verbatim — an
+  // opaque concurrency token, never formatted/re-parsed (STEP 16-G2-D1).
+  const plannedMeta: Record<string, RemotePlannedMeta> = {};
+  for (const p of raw.plannedExpenses) {
+    plannedMeta[p.id] = { updatedAt: p.updated_at, createdBy: p.created_by };
+  }
+
   const goals: Goal[] = raw.goals.map((g) => ({
     id: g.id,
     name: g.name,
@@ -335,6 +360,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     categoryMeta,
     recurring,
     planned,
+    plannedMeta,
     goals,
     loans,
     customCats,

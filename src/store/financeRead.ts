@@ -26,6 +26,7 @@ import type {
   RemoteBudgetMeta,
   RemoteCardMeta,
   RemoteCategoryMeta,
+  RemotePlannedMeta,
   RemoteTransactionMeta,
 } from '@/lib/remoteFinanceMapping';
 import { useAuth } from '@/store/auth';
@@ -74,6 +75,12 @@ export interface FinanceReadResult {
   categoryMeta: Record<string, RemoteCategoryMeta>;
   recurring: RecurringRule[];
   planned: PlannedExpense[];
+  /**
+   * planned-expense id -> remote-only metadata (updatedAt concurrency token
+   * + createdBy). STEP 16-G2-D1. `{}` while not ready. Kept separate from
+   * `planned` so the PlannedExpense domain type stays free of sync metadata.
+   */
+  plannedMeta: Record<string, RemotePlannedMeta>;
   goals: Goal[];
   loans: Loan[];
   customCats: CustomCatMap;
@@ -94,6 +101,7 @@ const EMPTY_SLICES = {
   categoryMeta: {} as Record<string, RemoteCategoryMeta>,
   recurring: [] as RecurringRule[],
   planned: [] as PlannedExpense[],
+  plannedMeta: {} as Record<string, RemotePlannedMeta>,
   goals: [] as Goal[],
   loans: [] as Loan[],
   customCats: DEFAULT_CUSTOM_CATS,
@@ -134,6 +142,7 @@ export function useFinanceRead(): FinanceReadResult {
         categoryMeta: data.categoryMeta,
         recurring: data.recurring,
         planned: data.planned,
+        plannedMeta: data.plannedMeta,
         goals: data.goals,
         loans: data.loans,
         customCats: data.customCats,

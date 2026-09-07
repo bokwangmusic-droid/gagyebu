@@ -74,6 +74,11 @@ import { supabase } from '@/lib/supabase';
  * and `updated_at`, routed into a separate `categoryMeta` map keyed by the
  * custom category id (the Category domain type is untouched; built-in
  * categories have no meta). Same opaque-token rule for `updated_at`.
+ *
+ * STEP 16-G2-D1: `planned_expenses` additionally selects `created_by` and
+ * `updated_at`, routed into a separate `plannedMeta` map keyed by the
+ * planned-expense id (the PlannedExpense domain type is untouched). Same
+ * opaque-token rule for `updated_at`.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -136,6 +141,16 @@ export interface RemotePlannedExpense {
   memo: string;
   type: 'income' | 'expense';
   created_at: string;
+  /**
+   * STEP 16-G2-D1 — routed to `plannedMeta`, NOT the PlannedExpense domain
+   * type. `updated_at` is the optimistic-concurrency token for planned
+   * edit / soft-delete (compared with an exact `.eq('updated_at', …)`), so
+   * it must travel as the RAW PostgREST string — never re-parsed through
+   * Date/toISOString anywhere. `created_by` is author bookkeeping only (the
+   * 23505-idempotency check on CREATE).
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteGoal {
@@ -296,7 +311,7 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('planned_expenses')
-      .select('id,name,amount,category,date,memo,type,created_at')
+      .select('id,name,amount,category,date,memo,type,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
