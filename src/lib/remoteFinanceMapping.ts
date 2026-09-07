@@ -102,6 +102,23 @@ export interface RemoteBudgetMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one CUSTOM category — STEP 16-G2-C4-B.
+ *
+ * Keyed by the custom category id, parallel to the custom entries inside
+ * `RemoteFinanceData.customCats`. Only ACTIVE custom categories appear
+ * here (the SELECT filters `deleted_at IS NULL`); built-in categories are
+ * not rows and therefore never have an entry — consumers must treat a
+ * missing entry for a built-in id as normal, not an error. `updatedAt` is
+ * the opaque optimistic-concurrency token — never re-serialised;
+ * `createdBy` is author bookkeeping only. The `Category` domain type stays
+ * free of this metadata.
+ */
+export interface RemoteCategoryMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -116,6 +133,8 @@ export interface RemoteFinanceData {
   budgets: BudgetMap;
   /** category_id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-C3-B. */
   budgetMeta: Record<string, RemoteBudgetMeta>;
+  /** custom category id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-C4-B. */
+  categoryMeta: Record<string, RemoteCategoryMeta>;
   recurring: RecurringRule[];
   planned: PlannedExpense[];
   goals: Goal[];
@@ -185,6 +204,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
   }
 
   const customCats: CustomCatMap = { expense: [], income: [] };
+  const categoryMeta: Record<string, RemoteCategoryMeta> = {};
   for (const c of raw.customCategories) {
     customCats[c.type].push({
       id: c.id,
@@ -194,6 +214,10 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
       icon: c.icon as IconKey, // remote value was only ever written from a valid IconKey
       custom: true,
     });
+    // Parallel to the custom entries, keyed by id. `updatedAt` stored
+    // verbatim — an opaque concurrency token, never formatted/re-parsed
+    // (STEP 16-G2-C4-B §2).
+    categoryMeta[c.id] = { updatedAt: c.updated_at, createdBy: c.created_by };
   }
 
   const paymentsByLoan = new Map<string, LoanPayment[]>();
@@ -308,6 +332,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     cardMeta,
     budgets,
     budgetMeta,
+    categoryMeta,
     recurring,
     planned,
     goals,

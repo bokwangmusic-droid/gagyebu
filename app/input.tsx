@@ -315,10 +315,22 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     [customCats, catOrder],
   );
 
-  // Keep the selected category valid when the type flips.
+  // Keep the selected category valid when the type flips — but NEVER
+  // silently rewrite an existing transaction's category. If we are editing,
+  // the type is still what was loaded, AND `category` is still the exact id
+  // that was loaded, then that id may simply be a custom category that was
+  // soft-deleted after this transaction was created (STEP 16-G2-C4 B1).
+  // Keeping it means "edit only the memo/amount/…" leaves the real DB
+  // `transactions.category` untouched (the picker just shows nothing
+  // selected). The fallback still fires for a genuine expense↔income flip,
+  // an explicit re-pick of an active category, or a brand-new transaction.
   useEffect(() => {
-    if (!cats.some((c) => c.id === category)) setCategory(cats[0]?.id ?? 'food');
-  }, [cats, category]);
+    if (cats.some((c) => c.id === category)) return;
+    const isUntouchedEditCategory =
+      !!editing && type === editing.type && category === editing.category;
+    if (isUntouchedEditCategory) return;
+    setCategory(cats[0]?.id ?? 'food');
+  }, [cats, category, type, editing]);
 
   // Live preview while the user pastes a card message.
   useEffect(() => {

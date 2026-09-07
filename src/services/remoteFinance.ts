@@ -69,6 +69,11 @@ import { supabase } from '@/lib/supabase';
  * `updated_at`, routed into a separate `budgetMeta` map keyed by
  * `category_id` (the BudgetMap domain type — a plain category->amount
  * record — is untouched). Same opaque-token rule for `updated_at`.
+ *
+ * STEP 16-G2-C4-B: `custom_categories` additionally selects `created_by`
+ * and `updated_at`, routed into a separate `categoryMeta` map keyed by the
+ * custom category id (the Category domain type is untouched; built-in
+ * categories have no meta). Same opaque-token rule for `updated_at`.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -78,6 +83,15 @@ export interface RemoteCustomCategory {
   bg: string;
   color: string;
   icon: string;
+  /**
+   * STEP 16-G2-C4-B — routed to `categoryMeta`, NOT the Category domain
+   * type. `updated_at` is the optimistic-concurrency token for custom
+   * category edit / soft-delete (exact `.eq('updated_at', …)`), so it
+   * travels as the RAW PostgREST string — never re-parsed through
+   * Date/toISOString. `created_by` is author bookkeeping only.
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteCard {
@@ -267,7 +281,7 @@ export async function fetchHouseholdFinanceSnapshot(
   ] = await Promise.all([
     supabase
       .from('custom_categories')
-      .select('id,type,name,bg,color,icon')
+      .select('id,type,name,bg,color,icon,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase

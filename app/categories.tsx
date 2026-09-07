@@ -11,61 +11,352 @@ import Animated, {
 } from 'react-native-reanimated';
 
 import { AppIcon } from '@/components/AppIcon';
+import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import { BottomSheet } from '@/components/ui/BottomSheet';
 import { Field, SegmentedTabs, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { ModalScreen } from '@/components/ui/ModalScreen';
+import { useToast } from '@/components/ui/Toast';
 import {
   CAT_COLOR_PALETTE,
   CAT_ICON_PALETTE,
   getAllCats,
+  type CatOrderMap,
   type Category,
+  type CustomCatMap,
   type IconKey,
   type TxnType,
 } from '@/data/categories';
-import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
-import { useStore } from '@/store/store';
-import { useToast } from '@/components/ui/Toast';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
+import { uid } from '@/lib/id';
+import {
+  isCategoryNameTaken,
+  type NewCustomCategoryDraft,
+} from '@/lib/remoteCategoryWriteMapping';
+import type { RemoteBudgetMeta, RemoteCategoryMeta } from '@/lib/remoteFinanceMapping';
+import { softDeleteBudget } from '@/services/remoteBudgetWrite';
+import {
+  createCustomCategory,
+  saveCategoryOrder,
+  softDeleteCustomCategory,
+  updateCustomCategory,
+} from '@/services/remoteCategoryWrite';
+import { useAuth } from '@/store/auth';
+import { useFinanceRead } from '@/store/financeRead';
+import { useHousehold } from '@/store/household';
+import type { BudgetMap } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
 
 const ROW_H = 54;
 
-export default function CategoriesManager() {
-  // STEP 16-G1B: see app/input.tsx's identical guard comment. Category
-  // management (add/delete/reorder) is a financial-data mutation just like
-  // the other *-add screens, even though its route name doesn't end in
-  // "-add".
-  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="카테고리" />;
+/**
+ * Route entry for /categories — STEP 16-G2-C4-B.
+ *
+ * Custom category management (create/edit/soft-delete + shared reorder) is
+ * a household-shared financial write. Thin wrapper (card-add / budget-add
+ * pattern) so CategoriesManager keeps an unconditional hook order.
+ */
+export default function CategoriesRoute() {
+  const anyCap =
+    REMOTE_FINANCE_WRITE.categoryCreate ||
+    REMOTE_FINANCE_WRITE.categoryEdit ||
+    REMOTE_FINANCE_WRITE.categoryDelete ||
+    REMOTE_FINANCE_WRITE.categoryReorder;
+  if (!anyCap) return <ReadOnlyRouteNotice title="카테고리" />;
+  return <CategoriesManagerRoute />;
+}
 
+function CategoriesManagerRoute() {
+  const router = useRouter();
+  const fr = useFinanceRead();
+
+  if (fr.status !== 'ready') {
+    return (
+      <ModalScreen title="카테고리 관리" onClose={() => router.back()} scroll={false}>
+        <FinanceLoadState status={fr.status} error={fr.error} onRetry={() => void fr.refresh()} />
+      </ModalScreen>
+    );
+  }
+
+  return (
+    <CategoriesManager
+      customCats={fr.customCats}
+      catOrder={fr.catOrder}
+      categoryMeta={fr.categoryMeta}
+      budgets={fr.budgets}
+      budgetMeta={fr.budgetMeta}
+      refresh={fr.refresh}
+    />
+  );
+}
+
+type SheetState =
+  | { mode: 'create' }
+  | { mode: 'edit'; category: Category; expectedUpdatedAt: string };
+
+function CategoriesManager({
+  customCats,
+  catOrder,
+  categoryMeta,
+  budgets,
+  budgetMeta,
+  refresh,
+}: {
+  customCats: CustomCatMap;
+  catOrder: CatOrderMap;
+  categoryMeta: Record<string, RemoteCategoryMeta>;
+  budgets: BudgetMap;
+  budgetMeta: Record<string, RemoteBudgetMeta>;
+  refresh: () => Promise<void>;
+}) {
   const router = useRouter();
   const toast = useToast();
-  const { customCats, catOrder, addCustomCat, deleteCustomCat, reorderCats } = useStore();
+  const { session } = useAuth();
+  const { activeHousehold } = useHousehold();
+  const { status } = useFinanceRead();
 
   const [tab, setTab] = useState<TxnType>('expense');
-  const [adding, setAdding] = useState(false);
+  const [sheet, setSheet] = useState<SheetState | null>(null);
+
+  // One `c-...` id per CREATE SESSION (STEP 16-G2-C4-B §9): minted when the
+  // add sheet opens, reused across save retries for that sheet, discarded
+  // when the sheet closes so the NEXT create gets a fresh id.
+  const createIdRef = useRef<string | null>(null);
+
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const deletingRef = useRef(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const reorderBusyRef = useRef(false);
 
   const allCats = getAllCats(tab, customCats, catOrder);
   const customIds = new Set(customCats[tab].map((c) => c.id));
 
-  const confirmDelete = (id: string, name: string) => {
-    Alert.alert(`${name} 카테고리를 삭제할까요?`, '이 카테고리로 저장된 기록은 "기타"로 표시돼요.', [
-      { text: '취소', style: 'cancel' },
-      {
-        text: '삭제',
-        style: 'destructive',
-        onPress: () => {
-          deleteCustomCat(tab, id);
-          toast.show('카테고리를 삭제했어요');
-        },
-      },
-    ]);
+  const canCreate = REMOTE_FINANCE_WRITE.categoryCreate;
+  const canEdit = REMOTE_FINANCE_WRITE.categoryEdit;
+  const canDelete = REMOTE_FINANCE_WRITE.categoryDelete;
+  const canReorder = REMOTE_FINANCE_WRITE.categoryReorder;
+
+  /** built-in + live custom names of the CURRENT tab, minus an optional self id. */
+  const namesForTab = (excludeId?: string) =>
+    getAllCats(tab, customCats, catOrder)
+      .filter((c) => c.id !== excludeId)
+      .map((c) => c.name);
+
+  const ready = status === 'ready' && !!session?.user?.id && !!activeHousehold;
+
+  /* ---------------- create ---------------- */
+
+  const openCreate = () => {
+    if (!canCreate) return;
+    createIdRef.current = uid('c');
+    setSheet({ mode: 'create' });
   };
 
-  const addBtn = (
+  const closeSheet = () => {
+    if (submittingRef.current) return;
+    createIdRef.current = null;
+    setSheet(null);
+  };
+
+  const doCreate = async (draft: NewCustomCategoryDraft) => {
+    if (submittingRef.current || deletingRef.current) return;
+    if (!ready || !session?.user?.id || !activeHousehold) return;
+    const id = createIdRef.current;
+    if (!id) return;
+
+    submittingRef.current = true;
+    setSubmitting(true);
+    const res = await createCustomCategory({
+      id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      draft,
+    });
+    submittingRef.current = false;
+    setSubmitting(false);
+
+    if (!res.ok) {
+      toast.show(res.reason === 'invalid' ? '카테고리 정보를 확인해 주세요.' : res.message);
+      return; // keep the sheet open; createIdRef unchanged so a retry reuses the id
+    }
+    createIdRef.current = null;
+    setSheet(null);
+    await refresh();
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    toast.show('카테고리를 추가했어요');
+  };
+
+  /* ---------------- edit ---------------- */
+
+  const openEdit = (cat: Category) => {
+    if (!canEdit) return;
+    const meta = categoryMeta[cat.id];
+    if (!meta) {
+      toast.show('카테고리 정보를 다시 불러온 뒤 수정해 주세요.');
+      return;
+    }
+    setSheet({ mode: 'edit', category: cat, expectedUpdatedAt: meta.updatedAt });
+  };
+
+  const doUpdate = async (draft: NewCustomCategoryDraft) => {
+    if (submittingRef.current || deletingRef.current) return;
+    if (!ready || !session?.user?.id || !activeHousehold) return;
+    if (!sheet || sheet.mode !== 'edit') return;
+
+    submittingRef.current = true;
+    setSubmitting(true);
+    const res = await updateCustomCategory({
+      id: sheet.category.id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: sheet.expectedUpdatedAt, // captured at sheet open, never re-read
+      draft,
+    });
+    submittingRef.current = false;
+    setSubmitting(false);
+
+    if (res.ok) {
+      setSheet(null);
+      await refresh();
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show('카테고리를 수정했어요');
+      return;
+    }
+    if (res.reason === 'identity' || res.reason === 'error' || res.reason === 'invalid') {
+      toast.show(res.message); // keep the sheet open
+      return;
+    }
+    // conflict / deleted / gone
+    setSheet(null);
+    await refresh();
+    toast.show('다른 곳에서 변경됐거나 삭제된 카테고리예요. 최신 내용을 불러왔어요.');
+  };
+
+  /* ---------------- delete (A+C) ---------------- */
+
+  const confirmDelete = (id: string, name: string) => {
+    if (!canDelete || deletingRef.current) return;
+    // STEP 16-G2-C4-B §17: capture BOTH tokens at initiation (before the
+    // Alert), so a background refresh can't swap them under us.
+    const categoryToken = categoryMeta[id]?.updatedAt ?? null;
+    if (!categoryToken) {
+      toast.show('카테고리 정보를 다시 불러온 뒤 삭제해 주세요.');
+      return;
+    }
+    const hasLiveBudget = Object.prototype.hasOwnProperty.call(budgets, id);
+    const budgetToken = hasLiveBudget ? budgetMeta[id]?.updatedAt ?? null : null;
+    if (hasLiveBudget && !budgetToken) {
+      // A live budget with no meta -> a safe concurrency-guarded budget
+      // delete is impossible; do NOT start a blind category delete.
+      toast.show('예산 정보를 다시 불러온 뒤 삭제해 주세요.');
+      return;
+    }
+
+    Alert.alert(
+      `${name} 카테고리를 삭제할까요?`,
+      '이 카테고리로 저장된 기존 기록은 기타로 표시되고, 설정된 예산도 함께 삭제돼요.',
+      [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '삭제',
+          style: 'destructive',
+          onPress: () => void doDelete(id, categoryToken, budgetToken),
+        },
+      ],
+    );
+  };
+
+  const doDelete = async (id: string, categoryToken: string, budgetToken: string | null) => {
+    if (deletingRef.current || submittingRef.current) return;
+    if (!ready || !session?.user?.id || !activeHousehold) return;
+
+    deletingRef.current = true;
+    setDeletingId(id);
+
+    // 1. category soft delete FIRST.
+    const catRes = await softDeleteCustomCategory({
+      id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: categoryToken,
+    });
+
+    if (!catRes.ok) {
+      // §22: category failed -> do NOT attempt the budget delete.
+      await refresh();
+      deletingRef.current = false;
+      setDeletingId(null);
+      if (catRes.reason === 'identity' || catRes.reason === 'error') {
+        toast.show(catRes.message);
+        return;
+      }
+      toast.show('다른 곳에서 변경됐거나 삭제된 카테고리예요. 최신 내용을 불러왔어요.');
+      return;
+    }
+
+    // 2. A+C: only if the snapshot had a live budget for this category.
+    if (budgetToken) {
+      const budRes = await softDeleteBudget({
+        householdId: activeHousehold.id,
+        expectedUserId: session.user.id,
+        category: id,
+        expectedUpdatedAt: budgetToken,
+      });
+      await refresh();
+      deletingRef.current = false;
+      setDeletingId(null);
+      if (budRes.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('카테고리를 삭제했어요');
+        return;
+      }
+      // §22: category is deleted; do NOT roll it back. Orphan budget is the
+      // benign policy-A state — surface it clearly.
+      toast.show('카테고리는 삭제됐지만 예산 정리에 실패했어요. 예산 관리에서 확인해 주세요.');
+      return;
+    }
+
+    await refresh();
+    deletingRef.current = false;
+    setDeletingId(null);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    toast.show('카테고리를 삭제했어요');
+  };
+
+  /* ---------------- reorder (shared, household_settings) ---------------- */
+
+  const onReorder = (orderedIds: string[]) => {
+    if (!canReorder || reorderBusyRef.current) return;
+    if (!ready || !session?.user?.id || !activeHousehold) return;
+    // §26 validation: non-empty strings, no dupes.
+    if (
+      orderedIds.length === 0 ||
+      orderedIds.some((x) => !x) ||
+      new Set(orderedIds).size !== orderedIds.length
+    ) {
+      void refresh();
+      return;
+    }
+    reorderBusyRef.current = true;
+    void (async () => {
+      const res = await saveCategoryOrder({
+        householdId: activeHousehold.id,
+        expectedUserId: session.user.id,
+        type: tab, // §25: column chosen from `type` in the service, never caller text
+        orderedIds,
+      });
+      await refresh(); // authoritative order restore on failure, confirm on success
+      reorderBusyRef.current = false;
+      if (!res.ok) toast.show(res.message);
+    })();
+  };
+
+  const addBtn = canCreate ? (
     <Pressable
-      onPress={() => setAdding(true)}
+      onPress={openCreate}
       style={{
         width: 36,
         height: 36,
@@ -77,7 +368,17 @@ export default function CategoriesManager() {
     >
       <AppIcon name="plus" size={18} color={colors.white} strokeWidth={2.5} />
     </Pressable>
-  );
+  ) : undefined;
+
+  const editInitial =
+    sheet?.mode === 'edit'
+      ? {
+          name: sheet.category.name,
+          icon: sheet.category.icon,
+          bg: sheet.category.bg,
+          color: sheet.category.color,
+        }
+      : undefined;
 
   return (
     <ModalScreen title="카테고리 관리" onClose={() => router.back()} right={addBtn}>
@@ -111,8 +412,10 @@ export default function CategoriesManager() {
         key={tab}
         cats={allCats}
         customIds={customIds}
-        onReorder={(ids) => reorderCats(tab, ids)}
-        onDelete={confirmDelete}
+        deletingId={deletingId}
+        onReorder={canReorder ? onReorder : undefined}
+        onEdit={canEdit ? openEdit : undefined}
+        onDelete={canDelete ? confirmDelete : undefined}
       />
 
       <View
@@ -129,14 +432,23 @@ export default function CategoriesManager() {
         </Text>
       </View>
 
-      {adding && (
-        <AddCategoryOverlay
+      {sheet && (
+        <CategorySheet
+          key={sheet.mode === 'edit' ? `edit-${sheet.category.id}` : 'create'}
+          mode={sheet.mode}
           type={tab}
-          onCancel={() => setAdding(false)}
-          onSave={(cat) => {
-            addCustomCat(tab, cat);
-            toast.show('카테고리를 추가했어요');
-            setAdding(false);
+          initial={editInitial}
+          busy={submitting}
+          isNameTaken={(name) =>
+            isCategoryNameTaken(
+              name,
+              namesForTab(sheet.mode === 'edit' ? sheet.category.id : undefined),
+            )
+          }
+          onCancel={closeSheet}
+          onSubmit={(draft) => {
+            if (sheet.mode === 'create') void doCreate(draft);
+            else void doUpdate(draft);
           }}
         />
       )}
@@ -145,26 +457,200 @@ export default function CategoriesManager() {
 }
 
 /* ------------------------------------------------------------------ *
- * Long-press-and-drag reorderable list. Rows are absolutely positioned
- * inside a fixed-height card; the picked-up row follows the finger and
- * the others slide out of its way (reanimated). Commits the final order
- * once on release.
+ * Create / edit sheet — one BottomSheet for both. `type` is shown only
+ * as context (create) and NEVER editable (STEP 16-G2-C4-B §2/§14).
+ * ------------------------------------------------------------------ */
+function CategorySheet({
+  mode,
+  type,
+  initial,
+  busy,
+  isNameTaken,
+  onCancel,
+  onSubmit,
+}: {
+  mode: 'create' | 'edit';
+  type: TxnType;
+  initial?: { name: string; icon: IconKey; bg: string; color: string };
+  busy: boolean;
+  isNameTaken: (name: string) => boolean;
+  onCancel: () => void;
+  onSubmit: (draft: NewCustomCategoryDraft) => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? '');
+  const [iconIdx, setIconIdx] = useState(() => {
+    const i = initial ? CAT_ICON_PALETTE.indexOf(initial.icon) : 0;
+    return i < 0 ? 0 : i;
+  });
+  const [colorIdx, setColorIdx] = useState(() => {
+    if (!initial) return 0;
+    const i = CAT_COLOR_PALETTE.findIndex((p) => p.bg === initial.bg && p.color === initial.color);
+    return i < 0 ? 0 : i;
+  });
+
+  const pair = CAT_COLOR_PALETTE[colorIdx];
+  const icon = CAT_ICON_PALETTE[iconIdx];
+  const trimmed = name.trim();
+  const dup = trimmed.length > 0 && isNameTaken(trimmed);
+  const canSave = trimmed.length > 0 && !dup && !busy;
+
+  return (
+    <BottomSheet
+      visible
+      onClose={() => {
+        if (!busy) onCancel();
+      }}
+      title={
+        mode === 'create'
+          ? `${type === 'expense' ? '지출' : '수입'} 카테고리 추가`
+          : '카테고리 수정'
+      }
+      scroll
+    >
+      <View
+        style={{
+          alignItems: 'center',
+          marginBottom: 16,
+          paddingVertical: 16,
+          backgroundColor: colors.white,
+          borderRadius: radii.xl,
+          borderWidth: 1,
+          borderColor: colors.border,
+        }}
+      >
+        <View
+          style={{
+            width: 52,
+            height: 52,
+            borderRadius: 16,
+            backgroundColor: pair.bg,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <AppIcon name={icon} size={24} color={pair.color} />
+        </View>
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginTop: 8 }}>
+          {trimmed || '카테고리 이름'}
+        </Text>
+      </View>
+
+      <Field label="이름" hint="최대 12자">
+        <TextField
+          value={name}
+          onChangeText={(t) => setName(t.slice(0, 12))}
+          placeholder="예: 반려동물, 자기계발, 커피"
+          maxLength={12}
+          autoFocus={mode === 'create'}
+        />
+      </Field>
+      {dup && (
+        <Text
+          style={{
+            fontFamily: fontFamily.medium,
+            fontSize: 11,
+            color: colors.expenseText,
+            marginTop: -6,
+            marginBottom: 6,
+          }}
+        >
+          이미 있는 카테고리 이름이에요
+        </Text>
+      )}
+
+      <Field label="아이콘">
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+          {CAT_ICON_PALETTE.map((ic, i) => {
+            const active = iconIdx === i;
+            return (
+              <Pressable
+                key={ic}
+                onPress={() => setIconIdx(i)}
+                style={{
+                  width: 46,
+                  height: 46,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  backgroundColor: active ? pair.bg : colors.white,
+                  borderWidth: 2,
+                  borderColor: active ? pair.color : colors.border,
+                  borderRadius: radii.md,
+                }}
+              >
+                <AppIcon name={ic} size={19} color={active ? pair.color : colors.textSub} />
+              </Pressable>
+            );
+          })}
+        </View>
+      </Field>
+
+      <Field label="색상">
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+          {CAT_COLOR_PALETTE.map((c, i) => (
+            <Pressable
+              key={i}
+              onPress={() => setColorIdx(i)}
+              style={{
+                width: 36,
+                height: 36,
+                borderRadius: radii.pill,
+                backgroundColor: c.bg,
+                borderWidth: 2,
+                borderColor: colorIdx === i ? c.color : 'transparent',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <View style={{ width: 16, height: 16, borderRadius: radii.pill, backgroundColor: c.color }} />
+            </Pressable>
+          ))}
+        </View>
+      </Field>
+
+      <GradientButton
+        label={busy ? '저장 중…' : mode === 'create' ? '카테고리 추가' : '수정하기'}
+        disabled={!canSave}
+        onPress={() =>
+          canSave &&
+          onSubmit({
+            type,
+            name: trimmed.slice(0, 12),
+            icon,
+            bg: pair.bg,
+            color: pair.color,
+          })
+        }
+      />
+    </BottomSheet>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Long-press-and-drag reorderable list. Unchanged drag mechanics; adds an
+ * `onEdit` tap target on the left (icon + name) of CUSTOM rows only. The
+ * edit Pressable, the delete Pressable and the drag GestureDetector are
+ * SIBLINGS — a tap lands on exactly one, so tapping the trash never opens
+ * the edit sheet (STEP 16-G2-C4-B §33).
  * ------------------------------------------------------------------ */
 function DragList({
   cats,
   customIds,
+  deletingId,
   onReorder,
+  onEdit,
   onDelete,
 }: {
   cats: Category[];
   customIds: Set<string>;
-  onReorder: (ids: string[]) => void;
-  onDelete: (id: string, name: string) => void;
+  deletingId: string | null;
+  onReorder?: (ids: string[]) => void;
+  onEdit?: (cat: Category) => void;
+  onDelete?: (id: string, name: string) => void;
 }) {
   const [data, setData] = useState<Category[]>(cats);
   const draggingRef = useRef(false);
 
-  // Re-sync from the store unless a drag is in progress.
+  // Re-sync from the (remote) store unless a drag is in progress.
   useEffect(() => {
     if (!draggingRef.current) setData(cats);
   }, [cats]);
@@ -182,7 +668,7 @@ function DragList({
       const next = cur.slice();
       const [moved] = next.splice(from, 1);
       next.splice(to, 0, moved);
-      onReorder(next.map((c) => c.id));
+      onReorder?.(next.map((c) => c.id));
       return next;
     });
   };
@@ -205,9 +691,12 @@ function DragList({
           index={index}
           count={data.length}
           custom={customIds.has(c.id)}
+          dimmed={deletingId === c.id}
           activeIndex={activeIndex}
           dragY={dragY}
+          onEdit={onEdit}
           onDelete={onDelete}
+          reorderable={!!onReorder}
           onDragStart={() => setDragging(true)}
           onCommit={(from, to) => {
             commit(from, to);
@@ -224,9 +713,12 @@ function DragRow({
   index,
   count,
   custom,
+  dimmed,
   activeIndex,
   dragY,
+  onEdit,
   onDelete,
+  reorderable,
   onDragStart,
   onCommit,
 }: {
@@ -234,9 +726,12 @@ function DragRow({
   index: number;
   count: number;
   custom: boolean;
+  dimmed: boolean;
   activeIndex: { value: number };
   dragY: { value: number };
-  onDelete: (id: string, name: string) => void;
+  onEdit?: (cat: Category) => void;
+  onDelete?: (id: string, name: string) => void;
+  reorderable: boolean;
   onDragStart: () => void;
   onCommit: (from: number, to: number) => void;
 }) {
@@ -244,8 +739,8 @@ function DragRow({
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
   };
 
-  // Starts as soon as the finger moves ~4px vertically on the handle — no hold.
   const pan = Gesture.Pan()
+    .enabled(reorderable)
     .activeOffsetY([-4, 4])
     .failOffsetX([-16, 16])
     .onStart(() => {
@@ -258,10 +753,7 @@ function DragRow({
       dragY.value = e.translationY;
     })
     .onEnd(() => {
-      const target = Math.min(
-        count - 1,
-        Math.max(0, Math.round(index + dragY.value / ROW_H)),
-      );
+      const target = Math.min(count - 1, Math.max(0, Math.round(index + dragY.value / ROW_H)));
       runOnJS(onCommit)(index, target);
       activeIndex.value = -1;
       dragY.value = 0;
@@ -301,6 +793,44 @@ function DragRow({
     };
   });
 
+  const editable = custom && !!onEdit;
+
+  const left = (
+    <>
+      <View
+        style={{
+          width: 32,
+          height: 32,
+          borderRadius: 10,
+          backgroundColor: cat.bg,
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <AppIcon name={cat.icon} size={16} color={cat.color} />
+      </View>
+      <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+        <Text
+          numberOfLines={1}
+          style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
+        >
+          {cat.name}
+        </Text>
+        <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+          {custom ? (editable ? '사용자 추가 · 눌러서 수정' : '사용자 추가') : '기본'}
+        </Text>
+      </View>
+    </>
+  );
+
+  const leftStyle = {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row' as const,
+    alignItems: 'center' as const,
+    gap: spacing.sm,
+  };
+
   return (
     <Animated.View
       style={[
@@ -326,34 +856,21 @@ function DragRow({
           borderBottomColor: colors.track,
           backgroundColor: colors.white,
           borderRadius: radii.xxl,
+          opacity: dimmed ? 0.5 : 1,
         }}
       >
-        <View
-          style={{
-            width: 32,
-            height: 32,
-            borderRadius: 10,
-            backgroundColor: cat.bg,
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
-          <AppIcon name={cat.icon} size={16} color={cat.color} />
-        </View>
-        <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
-          <Text
-            numberOfLines={1}
-            style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
-          >
-            {cat.name}
-          </Text>
-          <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-            {custom ? '사용자 추가' : '기본'}
-          </Text>
-        </View>
-        {custom && (
+        {editable ? (
+          <Pressable onPress={() => onEdit!(cat)} style={leftStyle}>
+            {left}
+          </Pressable>
+        ) : (
+          <View style={leftStyle}>{left}</View>
+        )}
+
+        {custom && onDelete && (
           <Pressable
             onPress={() => onDelete(cat.id, cat.name)}
+            disabled={dimmed}
             hitSlop={8}
             style={{
               width: 30,
@@ -368,135 +885,14 @@ function DragRow({
             <AppIcon name="trash" size={13} color={colors.expenseText} />
           </Pressable>
         )}
-        {/* Drag handle — grab here and slide, no hold needed. */}
+
+        {/* Drag handle — grab here and slide. */}
         <GestureDetector gesture={pan}>
-          <View style={{ paddingVertical: 12, paddingHorizontal: 8 }}>
+          <View style={{ paddingVertical: 12, paddingHorizontal: 8, opacity: reorderable ? 1 : 0.35 }}>
             <AppIcon name="grip" size={20} color={colors.textMuted} />
           </View>
         </GestureDetector>
       </View>
     </Animated.View>
-  );
-}
-
-function AddCategoryOverlay({
-  type,
-  onCancel,
-  onSave,
-}: {
-  type: TxnType;
-  onCancel: () => void;
-  onSave: (cat: { name: string; icon: IconKey; color: string; bg: string }) => void;
-}) {
-  const [name, setName] = useState('');
-  const [iconIdx, setIconIdx] = useState(0);
-  const [colorIdx, setColorIdx] = useState(0);
-  const color = CAT_COLOR_PALETTE[colorIdx];
-  const icon = CAT_ICON_PALETTE[iconIdx];
-  const canSave = name.trim().length > 0;
-
-  return (
-    <BottomSheet
-      visible
-      onClose={onCancel}
-      title={`${type === 'expense' ? '지출' : '수입'} 카테고리 추가`}
-      scroll
-    >
-          <View
-            style={{
-              alignItems: 'center',
-              marginBottom: 16,
-              paddingVertical: 16,
-              backgroundColor: colors.white,
-              borderRadius: radii.xl,
-              borderWidth: 1,
-              borderColor: colors.border,
-            }}
-          >
-            <View
-              style={{
-                width: 52,
-                height: 52,
-                borderRadius: 16,
-                backgroundColor: color.bg,
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <AppIcon name={icon} size={24} color={color.color} />
-            </View>
-            <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginTop: 8 }}>
-              {name.trim() || '카테고리 이름'}
-            </Text>
-          </View>
-
-          <Field label="이름" hint="최대 12자">
-            <TextField
-              value={name}
-              onChangeText={(t) => setName(t.slice(0, 12))}
-              placeholder="예: 반려동물, 자기계발, 커피"
-              maxLength={12}
-              autoFocus
-            />
-          </Field>
-
-          <Field label="아이콘">
-            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-              {CAT_ICON_PALETTE.map((ic, i) => {
-                const active = iconIdx === i;
-                return (
-                  <Pressable
-                    key={ic}
-                    onPress={() => setIconIdx(i)}
-                    style={{
-                      width: 46,
-                      height: 46,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      backgroundColor: active ? color.bg : colors.white,
-                      borderWidth: 2,
-                      borderColor: active ? color.color : colors.border,
-                      borderRadius: radii.md,
-                    }}
-                  >
-                    <AppIcon name={ic} size={19} color={active ? color.color : colors.textSub} />
-                  </Pressable>
-                );
-              })}
-            </View>
-          </Field>
-
-          <Field label="색상">
-            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-              {CAT_COLOR_PALETTE.map((c, i) => (
-                <Pressable
-                  key={i}
-                  onPress={() => setColorIdx(i)}
-                  style={{
-                    width: 36,
-                    height: 36,
-                    borderRadius: radii.pill,
-                    backgroundColor: c.bg,
-                    borderWidth: 2,
-                    borderColor: colorIdx === i ? c.color : 'transparent',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <View style={{ width: 16, height: 16, borderRadius: radii.pill, backgroundColor: c.color }} />
-                </Pressable>
-              ))}
-            </View>
-          </Field>
-
-          <GradientButton
-            label="카테고리 추가"
-            disabled={!canSave}
-            onPress={() =>
-              canSave &&
-              onSave({ name: name.trim().slice(0, 12), icon, color: color.color, bg: color.bg })
-            }
-          />
-    </BottomSheet>
   );
 }
