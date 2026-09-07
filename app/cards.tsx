@@ -1,11 +1,10 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useMemo } from 'react';
-import { Text, View } from 'react-native';
+import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
-import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import {
@@ -14,6 +13,7 @@ import {
   resolveCardKey,
   UNASSIGNED_CARD_ID,
 } from '@/lib/card';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
@@ -93,9 +93,28 @@ export default function CardsList() {
     );
   }
 
+  const openAdd = () => router.push('/card-add');
+  const openEdit = (id: string) =>
+    router.push({ pathname: '/card-add', params: { id } });
+
+  const addBtn = REMOTE_FINANCE_WRITE.cardCreate ? (
+    <Pressable
+      onPress={openAdd}
+      style={{
+        width: 36,
+        height: 36,
+        borderRadius: radii.pill,
+        backgroundColor: colors.primary,
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <AppIcon name="plus" size={18} color={colors.white} strokeWidth={2.5} />
+    </Pressable>
+  ) : undefined;
+
   return (
-    <ModalScreen title="카드 관리" onClose={() => router.back()}>
-      <FinanceReadOnlyBanner />
+    <ModalScreen title="카드 관리" onClose={() => router.back()} right={addBtn}>
       <LinearGradient
         colors={gradients.primary}
         start={{ x: 0, y: 0 }}
@@ -126,15 +145,26 @@ export default function CardsList() {
 
       {cards.length === 0 && !unassigned ? (
         <EmptyState
-          icon="card"
+          icon={REMOTE_FINANCE_WRITE.cardCreate ? undefined : 'card'}
+          onPress={REMOTE_FINANCE_WRITE.cardCreate ? openAdd : undefined}
+          cta={REMOTE_FINANCE_WRITE.cardCreate ? '카드 등록하기' : undefined}
           title="등록된 카드가 없어요"
-          sub={'우리집 가계부에 등록된 카드가 없어요'}
+          sub={
+            REMOTE_FINANCE_WRITE.cardCreate
+              ? '카드를 등록하고 지출을 「신용」으로 기록하면\n사용월 기준 예상 카드값을 계산해드려요'
+              : '우리집 가계부에 등록된 카드가 없어요'
+          }
         />
       ) : (
         <>
           {rows.map((row) => (
-            <CardItem key={row.id} row={row} />
+            <CardItem
+              key={row.id}
+              row={row}
+              onPress={REMOTE_FINANCE_WRITE.cardEdit ? () => openEdit(row.id) : undefined}
+            />
           ))}
+          {/* "카드 미지정" is not a real card — never an edit target. */}
           {unassigned && <CardItem key="unassigned" row={unassigned} />}
         </>
       )}
@@ -142,23 +172,13 @@ export default function CardsList() {
   );
 }
 
-function CardItem({ row }: { row: CardRow }) {
+function CardItem({ row, onPress }: { row: CardRow; onPress?: () => void }) {
   const isUnassigned = row.id === UNASSIGNED_CARD_ID;
   const accent = row.color?.color ?? colors.primaryStrong;
   const accentBg = row.color?.bg ?? colors.primaryLight;
 
-  return (
-    <View
-      style={{
-        marginHorizontal: spacing.lg,
-        marginBottom: spacing.md,
-        padding: spacing.lg,
-        backgroundColor: colors.white,
-        borderWidth: 1,
-        borderColor: colors.border,
-        borderRadius: radii.xxl,
-      }}
-    >
+  const body = (
+    <>
       <View style={{ flexDirection: 'row', gap: spacing.md, alignItems: 'center' }}>
         <View
           style={{
@@ -187,6 +207,9 @@ function CardItem({ row }: { row: CardRow }) {
                 : '결제일 미설정'}
           </Text>
         </View>
+        {onPress && !isUnassigned && (
+          <AppIcon name="chevron" size={16} color={colors.textMuted} />
+        )}
       </View>
 
       <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginTop: spacing.md }}>
@@ -208,8 +231,27 @@ function CardItem({ row }: { row: CardRow }) {
           <Chip label="남은 할부" value={`${fmt(row.remainingInstallment)}원`} />
         )}
       </View>
-    </View>
+    </>
   );
+
+  const containerStyle = {
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.md,
+    padding: spacing.lg,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.xxl,
+  } as const;
+
+  if (onPress && !isUnassigned) {
+    return (
+      <Pressable onPress={onPress} style={({ pressed }) => [containerStyle, pressed && { opacity: 0.85 }]}>
+        {body}
+      </Pressable>
+    );
+  }
+  return <View style={containerStyle}>{body}</View>;
 }
 
 function Chip({ label, value }: { label: string; value: string }) {

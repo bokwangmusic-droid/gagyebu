@@ -22,7 +22,7 @@
 import { useMemo } from 'react';
 
 import { DEFAULT_CAT_ORDER, DEFAULT_CUSTOM_CATS, type CatOrderMap, type CustomCatMap } from '@/data/categories';
-import type { RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
+import type { RemoteCardMeta, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { useRemoteFinance } from '@/store/remoteFinance';
@@ -47,6 +47,12 @@ export interface FinanceReadResult {
    */
   transactionMeta: Record<string, RemoteTransactionMeta>;
   cards: CreditCard[];
+  /**
+   * card id -> remote-only metadata (updatedAt concurrency token + createdBy).
+   * STEP 16-G2-C2. `{}` while not ready. Kept separate from `cards` so the
+   * CreditCard domain type stays free of sync metadata.
+   */
+  cardMeta: Record<string, RemoteCardMeta>;
   budgets: BudgetMap;
   recurring: RecurringRule[];
   planned: PlannedExpense[];
@@ -64,6 +70,7 @@ const EMPTY_SLICES = {
   transactions: [] as Transaction[],
   transactionMeta: {} as Record<string, RemoteTransactionMeta>,
   cards: [] as CreditCard[],
+  cardMeta: {} as Record<string, RemoteCardMeta>,
   budgets: {} as BudgetMap,
   recurring: [] as RecurringRule[],
   planned: [] as PlannedExpense[],
@@ -101,6 +108,7 @@ export function useFinanceRead(): FinanceReadResult {
         transactions: data.transactions,
         transactionMeta: data.transactionMeta,
         cards: data.cards,
+        cardMeta: data.cardMeta,
         budgets: data.budgets,
         recurring: data.recurring,
         planned: data.planned,

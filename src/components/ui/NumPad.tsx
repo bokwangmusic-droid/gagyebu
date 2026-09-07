@@ -10,7 +10,7 @@ import {
 
 import { AppIcon } from '@/components/AppIcon';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
-import { fontFamily } from '@/theme/typography';
+import { fontFamily, noPad } from '@/theme/typography';
 
 /**
  * The app's custom money keypad — 1–9 / 00 / 0 digit grid, a backspace key
@@ -129,6 +129,14 @@ function NumKey({
         style={{
           fontFamily: fontFamily.semibold,
           fontSize: ghost ? 20 : 22,
+          // Android's default font padding is asymmetric for Noto Sans KR
+          // (tall Hangul metrics), so the digit glyph sits below the true
+          // centre of its line box. Drop the padding and pin lineHeight ==
+          // fontSize so the wrapper's justifyContent:'center' centres the
+          // glyph itself. Same recipe as `noPad` elsewhere (typography.ts).
+          ...noPad,
+          lineHeight: ghost ? 20 : 22,
+          textAlignVertical: 'center',
           color: ghost ? colors.textSub : colors.text,
         }}
       >

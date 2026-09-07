@@ -46,7 +46,8 @@ import type {
 } from '@/store/types';
 
 /**
- * Remote-only bookkeeping for one transaction — STEP 16-G2-B.
+ * Remote-only bookkeeping for one transaction — STEP 16-G2-B, extended in
+ * STEP 16-G2-C2 (`rawCardId`).
  *
  * Kept OUT of the `Transaction` domain type on purpose (G1A §7): `updatedAt`
  * / `createdBy` are sync/ownership metadata, not user-facing ledger data.
@@ -54,8 +55,32 @@ import type {
  * it is the RAW string PostgREST returned and MUST be passed straight back
  * into `.eq('updated_at', …)` with no Date/toISOString round-trip, or the
  * exact-match compare silently never matches.
+ *
+ * `rawCardId` is the transaction's ORIGINAL `public.transactions.card_id`
+ * exactly as stored, WITHOUT the read-model's "dangling card_id ->
+ * undefined" collapse applied to `Transaction.cardId`. It exists so a
+ * transaction whose card was soft-deleted (DB `card_id` still points at
+ * the deleted card, but the read model shows "카드 미지정") can be edited
+ * for memo/amount/etc. WITHOUT `buildTransactionUpdate` null-ing that real
+ * DB link (STEP 16-G2-C2 §5). The UI read model (`Transaction.cardId`) and
+ * this raw DB reference are deliberately separate.
  */
 export interface RemoteTransactionMeta {
+  updatedAt: string;
+  createdBy: string | null;
+  rawCardId: string | null;
+}
+
+/**
+ * Remote-only bookkeeping for one card — STEP 16-G2-C2.
+ *
+ * Exact mirror of `RemoteTransactionMeta`'s rationale: the `CreditCard`
+ * domain type stays free of sync metadata, so `updatedAt` (opaque
+ * optimistic-concurrency token — never re-serialised) and `createdBy`
+ * (author bookkeeping, never an edit/delete permission input) live here,
+ * keyed by card id, parallel to `RemoteFinanceData.cards`.
+ */
+export interface RemoteCardMeta {
   updatedAt: string;
   createdBy: string | null;
 }
@@ -70,6 +95,8 @@ export interface RemoteFinanceData {
   /** id -> remote-only metadata (write/concurrency only, never UI domain). */
   transactionMeta: Record<string, RemoteTransactionMeta>;
   cards: CreditCard[];
+  /** card id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-C2. */
+  cardMeta: Record<string, RemoteCardMeta>;
   budgets: BudgetMap;
   recurring: RecurringRule[];
   planned: PlannedExpense[];
@@ -131,6 +158,14 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     createdAt: c.created_at,
   }));
 
+  // Parallel to `cards`, keyed by id. `updatedAt` is stored verbatim (the
+  // raw PostgREST timestamptz string) — an opaque concurrency token, never
+  // a value to format or re-parse (STEP 16-G2-C2 §2).
+  const cardMeta: Record<string, RemoteCardMeta> = {};
+  for (const c of raw.cards) {
+    cardMeta[c.id] = { updatedAt: c.updated_at, createdBy: c.created_by };
+  }
+
   const customCats: CustomCatMap = { expense: [], income: [] };
   for (const c of raw.customCategories) {
     customCats[c.type].push({
@@ -179,7 +214,13 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
   // token, never a value to format or re-parse (STEP 16-G2-B §4).
   const transactionMeta: Record<string, RemoteTransactionMeta> = {};
   for (const t of raw.transactions) {
-    transactionMeta[t.id] = { updatedAt: t.updated_at, createdBy: t.created_by };
+    transactionMeta[t.id] = {
+      updatedAt: t.updated_at,
+      createdBy: t.created_by,
+      // Raw DB card_id, WITHOUT the "dangling -> undefined" collapse the
+      // read-model `cardId` above gets. STEP 16-G2-C2 §4.
+      rawCardId: t.card_id,
+    };
   }
 
   const budgets: BudgetMap = {};
@@ -239,6 +280,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     transactions,
     transactionMeta,
     cards,
+    cardMeta,
     budgets,
     recurring,
     planned,

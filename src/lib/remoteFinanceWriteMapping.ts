@@ -118,10 +118,33 @@ export function buildTransactionInsert(
  * A feature turned OFF during an edit is sent as an explicit `null`
  * (splits / card_id / installment_months), so the previous value is
  * cleared rather than left behind.
+ *
+ * card_id — STEP 16-G2-C2 §5. Now that a household card can be
+ * soft-deleted, a transaction can legitimately still carry a real DB
+ * `card_id` that points at a now-deleted card while the read model shows
+ * `Transaction.cardId === undefined` ("카드 미지정"). Editing only that
+ * transaction's memo/amount/category must NOT wipe the DB link. The rule:
+ *   A. draft.paymentMethod !== 'credit'            -> card_id: null
+ *   B. draft.cardId is a KNOWN active card         -> card_id: draft.cardId
+ *   C. credit, no draft.cardId, but originalRawCardId is a non-null id
+ *      that is NOT among the known active cards    -> OMIT card_id
+ *      (preserve the dangling deleted-card link)
+ *   D. anything else (explicit clear of an active card / never had one /
+ *      an unresolvable draft.cardId)               -> card_id: null
+ * `card_id` is OPTIONAL on the row type precisely so case C can leave the
+ * column untouched; src/services/remoteFinanceWrite.ts's reconcile logic
+ * treats an absent `card_id` as "preserve", not "wants null".
  * ================================================================== */
 
 export interface BuildTransactionUpdateContext {
   knownCardIds: ReadonlySet<string>;
+  /**
+   * The transaction's ORIGINAL `public.transactions.card_id` exactly as
+   * stored (transactionMeta.rawCardId) — NOT the read-model's collapsed
+   * `Transaction.cardId`. Only used for case C above. Undefined/null =>
+   * no dangling link to preserve.
+   */
+  originalRawCardId?: string | null;
 }
 
 export interface TransactionUpdateRow {
@@ -131,27 +154,48 @@ export interface TransactionUpdateRow {
   memo: string;
   date: string;
   payment_method: PaymentMethod | null;
-  card_id: string | null;
+  /** Omitted entirely when preserving a dangling deleted-card link (§5-C). */
+  card_id?: string | null;
   installment_months: number | null;
   splits: TransactionSplit[] | null;
+}
+
+function resolveUpdateCardId(
+  draft: NewTransactionDraft,
+  ctx: BuildTransactionUpdateContext,
+): { omit: true } | { omit: false; value: string | null } {
+  // A. not a credit purchase any more -> clear.
+  if (draft.paymentMethod !== 'credit') return { omit: false, value: null };
+  // B. an explicitly selected, currently-known card -> use it.
+  if (draft.cardId && ctx.knownCardIds.has(draft.cardId)) {
+    return { omit: false, value: draft.cardId };
+  }
+  // C. still credit, no resolvable selection, but the row already links to
+  //    a card that simply isn't in the active set (soft-deleted) -> keep it.
+  const raw = ctx.originalRawCardId;
+  if (!draft.cardId && raw != null && !ctx.knownCardIds.has(raw)) {
+    return { omit: true };
+  }
+  // D. explicit clear of an active card, or never had one.
+  return { omit: false, value: null };
 }
 
 export function buildTransactionUpdate(
   draft: NewTransactionDraft,
   ctx: BuildTransactionUpdateContext,
 ): TransactionUpdateRow {
-  const cardId =
-    draft.cardId && ctx.knownCardIds.has(draft.cardId) ? draft.cardId : null;
-
-  return {
+  const base: TransactionUpdateRow = {
     type: draft.type,
     category: draft.category,
     amount: draft.amount,
     memo: draft.memo,
     date: draft.date,
     payment_method: draft.paymentMethod ?? null,
-    card_id: cardId,
     installment_months: draft.installment?.months ?? null,
     splits: draft.splits && draft.splits.length > 0 ? draft.splits : null,
   };
+
+  const cardId = resolveUpdateCardId(draft, ctx);
+  if (cardId.omit) return base; // dangling deleted-card link preserved
+  return { ...base, card_id: cardId.value };
 }

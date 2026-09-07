@@ -49,7 +49,7 @@ import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
 import type { PaymentMethod, Transaction } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
-import { fontFamily } from '@/theme/typography';
+import { fontFamily, noPad } from '@/theme/typography';
 
 const PAY_METHODS: { value: PaymentMethod; label: string }[] = [
   { value: 'cash', label: '현금' },
@@ -556,6 +556,10 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       expectedUpdatedAt: token,
       draft,
       knownCardIds,
+      // STEP 16-G2-C2 §5: the ORIGINAL DB card_id, so an edit to a
+      // transaction whose card was soft-deleted preserves that link
+      // instead of null-ing it. `mode.meta` is captured at mount.
+      originalRawCardId: mode.meta.rawCardId,
     });
     if (!res.ok) {
       submittingRef.current = false;
@@ -1468,6 +1472,12 @@ function NumKey({
         style={{
           fontFamily: fontFamily.semibold,
           fontSize: ghost ? 20 : 22,
+          // Keep this inline keypad visually in sync with
+          // src/components/ui/NumPad.tsx — Android font padding otherwise
+          // pushes the digit glyph below the button's centre.
+          ...noPad,
+          lineHeight: ghost ? 20 : 22,
+          textAlignVertical: 'center',
           color: ghost ? colors.textSub : colors.text,
         }}
       >

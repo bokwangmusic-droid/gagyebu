@@ -218,6 +218,13 @@ function financialFieldsMatch(
   existing: Record<string, unknown>,
   row: TransactionUpdateRow,
 ): boolean {
+  // STEP 16-G2-C2 §6: when `card_id` is absent from the PATCH body the
+  // mapper deliberately preserved a dangling deleted-card link — the stored
+  // value is whatever it already was, so it can never make this a mismatch.
+  const cardIdMatches =
+    !('card_id' in row) ||
+    ((existing.card_id as string | null) ?? null) === row.card_id;
+
   return (
     existing.type === row.type &&
     existing.category === row.category &&
@@ -225,7 +232,7 @@ function financialFieldsMatch(
     ((existing.memo as string | null) ?? '') === row.memo &&
     new Date(existing.date as string).getTime() === new Date(row.date).getTime() &&
     ((existing.payment_method as string | null) ?? null) === row.payment_method &&
-    ((existing.card_id as string | null) ?? null) === row.card_id &&
+    cardIdMatches &&
     ((existing.installment_months as number | null) ?? null) === row.installment_months &&
     splitsEqual(existing.splits, row.splits)
   );
@@ -239,6 +246,12 @@ export async function updateTransaction(args: {
   expectedUpdatedAt: string;
   draft: NewTransactionDraft;
   knownCardIds: ReadonlySet<string>;
+  /**
+   * transactionMeta.rawCardId — the transaction's ORIGINAL DB card_id.
+   * STEP 16-G2-C2 §5: lets buildTransactionUpdate preserve (omit) a
+   * card_id that points at a now-soft-deleted card instead of null-ing it.
+   */
+  originalRawCardId?: string | null;
 }): Promise<UpdateTransactionResult> {
   const { data: sessionData } = await supabase.auth.getSession();
   const liveUserId = sessionData.session?.user?.id ?? null;
@@ -247,7 +260,10 @@ export async function updateTransaction(args: {
     return { ok: false, reason: 'identity', message: IDENTITY_CHANGED };
   }
 
-  const row = buildTransactionUpdate(args.draft, { knownCardIds: args.knownCardIds });
+  const row = buildTransactionUpdate(args.draft, {
+    knownCardIds: args.knownCardIds,
+    originalRawCardId: args.originalRawCardId ?? null,
+  });
 
   const { data, error } = await supabase
     .from('transactions')

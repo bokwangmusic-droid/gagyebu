@@ -253,7 +253,11 @@ export interface UpdateMapperCase {
   name: string;
   draft: NewTransactionDraft;
   knownCardIds: string[];
+  /** STEP 16-G2-C2 §5: the transaction's ORIGINAL DB card_id (transactionMeta.rawCardId). */
+  originalRawCardId?: string | null;
   expect: Partial<TransactionUpdateRow>;
+  /** STEP 16-G2-C2 §5-C: `card_id` must be ABSENT from the built row (dangling link preserved). */
+  expectCardIdOmitted?: boolean;
 }
 
 export const UPDATE_MAPPER_CASES: UpdateMapperCase[] = [
@@ -338,6 +342,61 @@ export const UPDATE_MAPPER_CASES: UpdateMapperCase[] = [
       ],
     },
   },
+
+  /* ---- STEP 16-G2-C2 §5: deleted-card link preservation on transaction edit ---- */
+  {
+    // Card was soft-deleted; read model shows cardId=undefined but the DB
+    // row still points at it. A memo-only edit must NOT null that link.
+    name: 'deleted card + memo-only edit -> card_id omitted (preserved)',
+    draft: {
+      type: 'expense', category: 'food', amount: 9000, memo: '메모만 변경', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit',
+    },
+    knownCardIds: ['card-A'],
+    originalRawCardId: 'card-DELETED',
+    expect: { memo: '메모만 변경', payment_method: 'credit' },
+    expectCardIdOmitted: true,
+  },
+  {
+    name: 'credit -> cash change -> card_id null (even with dangling raw id)',
+    draft: {
+      type: 'expense', category: 'food', amount: 9000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'cash',
+    },
+    knownCardIds: ['card-A'],
+    originalRawCardId: 'card-DELETED',
+    expect: { payment_method: 'cash', card_id: null },
+  },
+  {
+    name: 'deleted card -> user picks a NEW active card -> new card_id',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 40000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit', cardId: 'card-B',
+    },
+    knownCardIds: ['card-A', 'card-B'],
+    originalRawCardId: 'card-DELETED',
+    expect: { payment_method: 'credit', card_id: 'card-B' },
+  },
+  {
+    name: 'active card explicitly deselected -> card_id null (raw id was still active)',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 40000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit',
+    },
+    knownCardIds: ['card-A'],
+    originalRawCardId: 'card-A',
+    expect: { payment_method: 'credit', card_id: null },
+  },
+  {
+    name: 'no raw card id + no selection -> card_id null (never had one)',
+    draft: {
+      type: 'expense', category: 'shopping', amount: 40000, memo: '', date: '2026-09-06T03:00:00.000Z',
+      paymentMethod: 'credit',
+    },
+    knownCardIds: ['card-A'],
+    originalRawCardId: null,
+    expect: { payment_method: 'credit', card_id: null },
+  },
 ];
 
 export function runUpdateMapperCases(cases: UpdateMapperCase[] = UPDATE_MAPPER_CASES): {
@@ -346,7 +405,10 @@ export function runUpdateMapperCases(cases: UpdateMapperCase[] = UPDATE_MAPPER_C
   failed: number;
 } {
   const results = cases.map((c) => {
-    const row = buildTransactionUpdate(c.draft, { knownCardIds: new Set(c.knownCardIds) });
+    const row = buildTransactionUpdate(c.draft, {
+      knownCardIds: new Set(c.knownCardIds),
+      originalRawCardId: c.originalRawCardId ?? null,
+    });
     const keys = Object.keys(row);
 
     const forbidden = keys.filter((k) => UPDATE_FORBIDDEN_KEYS.includes(k));
@@ -361,7 +423,11 @@ export function runUpdateMapperCases(cases: UpdateMapperCase[] = UPDATE_MAPPER_C
       }
     }
 
-    const pass = forbidden.length === 0 && unexpected.length === 0 && fieldMiss === null;
+    const cardIdOmitOk =
+      c.expectCardIdOmitted === true ? !('card_id' in row) : true;
+
+    const pass =
+      forbidden.length === 0 && unexpected.length === 0 && fieldMiss === null && cardIdOmitOk;
     return {
       name: c.name,
       pass,
@@ -370,6 +436,7 @@ export function runUpdateMapperCases(cases: UpdateMapperCase[] = UPDATE_MAPPER_C
         : [
             forbidden.length ? `forbidden keys: ${forbidden.join(',')}` : '',
             unexpected.length ? `unexpected keys: ${unexpected.join(',')}` : '',
+            cardIdOmitOk ? '' : `card_id present (want omitted): ${JSON.stringify(row.card_id)}`,
             fieldMiss ?? '',
           ]
             .filter(Boolean)

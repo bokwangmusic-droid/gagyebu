@@ -57,6 +57,13 @@ import { supabase } from '@/lib/supabase';
  * for edit/soft-delete (compared with an exact `.eq('updated_at', …)`), so
  * it must travel as the RAW PostgREST string — never re-parsed through
  * Date/toISOString anywhere.
+ *
+ * STEP 16-G2-C2: `cards` additionally selects `created_by` and
+ * `updated_at`, routed the same way into a separate `cardMeta` map (the
+ * CreditCard domain type is untouched). Same opaque-token rule for
+ * `updated_at`. `transactions` also gets its raw `card_id` mirrored into
+ * `transactionMeta.rawCardId` so a transaction whose card was
+ * soft-deleted can be edited without null-ing its real DB `card_id`.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -76,6 +83,15 @@ export interface RemoteCard {
   payment_day: number | null;
   closing_day: number | null;
   created_at: string;
+  /**
+   * STEP 16-G2-C2 — routed to `cardMeta`, NOT the CreditCard domain type.
+   * `updated_at` is the optimistic-concurrency token for card edit /
+   * soft-delete (compared with an exact `.eq('updated_at', …)`), so it
+   * must travel as the RAW PostgREST string — never re-parsed through
+   * Date/toISOString anywhere. `created_by` is author bookkeeping only.
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteRecurringRule {
@@ -241,7 +257,7 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('cards')
-      .select('id,name,color_bg,color_fg,payment_day,closing_day,created_at')
+      .select('id,name,color_bg,color_fg,payment_day,closing_day,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
