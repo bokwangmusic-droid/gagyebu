@@ -26,6 +26,7 @@ import type {
   RemoteBudgetMeta,
   RemoteCardMeta,
   RemoteCategoryMeta,
+  RemoteGoalMeta,
   RemotePlannedMeta,
   RemoteRecurringMeta,
   RemoteTransactionMeta,
@@ -91,6 +92,12 @@ export interface FinanceReadResult {
    */
   plannedMeta: Record<string, RemotePlannedMeta>;
   goals: Goal[];
+  /**
+   * goal id -> remote-only metadata (updatedAt concurrency token +
+   * createdBy). STEP 16-G2-D3. `{}` while not ready. Kept separate from
+   * `goals` so the Goal domain type stays free of sync metadata.
+   */
+  goalMeta: Record<string, RemoteGoalMeta>;
   loans: Loan[];
   customCats: CustomCatMap;
   notes: string;
@@ -113,6 +120,7 @@ const EMPTY_SLICES = {
   planned: [] as PlannedExpense[],
   plannedMeta: {} as Record<string, RemotePlannedMeta>,
   goals: [] as Goal[],
+  goalMeta: {} as Record<string, RemoteGoalMeta>,
   loans: [] as Loan[],
   customCats: DEFAULT_CUSTOM_CATS,
   notes: '',
@@ -155,6 +163,7 @@ export function useFinanceRead(): FinanceReadResult {
         planned: data.planned,
         plannedMeta: data.plannedMeta,
         goals: data.goals,
+        goalMeta: data.goalMeta,
         loans: data.loans,
         customCats: data.customCats,
         notes: data.notes,

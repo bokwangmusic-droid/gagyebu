@@ -1,12 +1,12 @@
 /**
  * STEP 16-G1B / 16-G2-A / 16-G2-B / 16-G2-C2 / 16-G2-C3-B / 16-G2-C4-B /
- * 16-G2-D1 / 16-G2-D2 — household finance write gating.
+ * 16-G2-D1 / 16-G2-D2 / 16-G2-D3 — household finance write gating.
  *
  * `REMOTE_FINANCE_READ_ONLY` stays `true` and keeps its exact original
  * meaning: every OTHER mutation screen still renders <ReadOnlyRouteNotice/>
- * instead of its real form — goal-add, loan-add. Those files check this
- * constant directly (not `REMOTE_FINANCE_WRITE`), so they stay closed.
- * (`planned-add` and `recurring-add` no longer check it — see below.)
+ * instead of its real form — loan-add. That file checks this constant
+ * directly (not `REMOTE_FINANCE_WRITE`), so it stays closed. (`planned-add`,
+ * `recurring-add` and `goal-add` no longer check it — see below.)
  *
  * `REMOTE_FINANCE_WRITE` is the one greppable place that says which
  * financial writes are open:
@@ -42,10 +42,19 @@
  *     after create; `active` is NEVER in the edit payload — it has its own
  *     `setRecurringActive`; `last_run` is NEVER written; NO transaction
  *     auto-generation, NO `transactions` write, no RPC, no hard DELETE).
- * `card-add`, `budget-add`, `categories`, `planned-add` and `recurring-add`
- * are the former `REMOTE_FINANCE_READ_ONLY` routes that now check
- * `REMOTE_FINANCE_WRITE.*` instead. Everything else — goals, loans —
- * remains closed.
+ *   - savings-goal CREATE / EDIT / (soft) DELETE / ADD-MOVEMENT —
+ *     STEP 16-G2-D3, via src/services/remoteGoalWrite.ts (direct
+ *     `public.goals` INSERT / conditional UPDATE of name·target·deadline·
+ *     icon / UPDATE deleted_at, keyed on `(household_id, id)` with a client
+ *     `goal-...` id; `saved` is NEVER written directly — deposits and
+ *     withdrawals are a `public.goal_movements` INSERT of a signed
+ *     `amount_delta`, and the DB `trg_apply_goal_movement` trigger updates
+ *     `goals.saved` atomically; the movement `gm-...` id is stable across
+ *     retries; NO `transactions` write, no RPC, no hard DELETE).
+ * `card-add`, `budget-add`, `categories`, `planned-add`, `recurring-add`
+ * and `goal-add` are the former `REMOTE_FINANCE_READ_ONLY` routes that now
+ * check `REMOTE_FINANCE_WRITE.*` instead. Everything else — loans — remains
+ * closed.
  */
 export const REMOTE_FINANCE_READ_ONLY = true as const;
 
@@ -70,4 +79,8 @@ export const REMOTE_FINANCE_WRITE = {
   recurringEdit: true,
   recurringToggle: true,
   recurringDelete: true,
+  goalCreate: true,
+  goalEdit: true,
+  goalDelete: true,
+  goalAddMovement: true,
 } as const;

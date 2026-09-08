@@ -1,0 +1,276 @@
+import * as Haptics from 'expo-haptics';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useRef, useState } from 'react';
+import { Keyboard, Pressable, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
+import { Field, HeaderTextButton } from '@/components/ui/controls';
+import { ModalScreen } from '@/components/ui/ModalScreen';
+import { NumPad } from '@/components/ui/NumPad';
+import { useToast } from '@/components/ui/Toast';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
+import { fmt, parseNum } from '@/lib/format';
+import { uid } from '@/lib/id';
+import type { GoalMovementMode } from '@/lib/remoteGoalWriteMapping';
+import { addGoalMovement } from '@/services/remoteGoalWrite';
+import { useAuth } from '@/store/auth';
+import { useFinanceRead } from '@/store/financeRead';
+import { useHousehold } from '@/store/household';
+import type { Goal } from '@/store/types';
+import { colors, radii, spacing } from '@/theme/tokens';
+import { fontFamily, tabularNums } from '@/theme/typography';
+
+/** Digit-entry rules — identical to the main expense keypad (app/input.tsx). */
+function applyDigit(amount: string, k: string): string {
+  if (k === 'back') return amount.slice(0, -1);
+  if (k === '00') return amount === '' || amount === '0' || amount.length >= 9 ? amount : amount + '00';
+  if (k === '0') return amount === '' || amount === '0' || amount.length >= 10 ? amount : amount + '0';
+  return amount.length >= 10 ? amount : (amount === '0' ? '' : amount) + k;
+}
+
+function normalizeMode(raw: string | string[] | undefined): GoalMovementMode | null {
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  return v === 'deposit' || v === 'withdraw' ? v : null;
+}
+
+/**
+ * Route entry for /goal-movement — STEP 16-G2-D3.
+ *
+ *   /goal-movement?id=<gid>&mode=deposit   -> "저축하기"
+ *   /goal-movement?id=<gid>&mode=withdraw  -> "인출하기"
+ *
+ * The user always types a POSITIVE amount; `mode` decides the sign of the
+ * stored `amount_delta`. This screen NEVER writes `goals.saved` — it does a
+ * single `goal_movements` INSERT and the DB trigger updates the cache.
+ */
+export default function GoalMovementRoute() {
+  const params = useLocalSearchParams<{ id?: string | string[]; mode?: string | string[] }>();
+  const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
+  const mode = normalizeMode(params.mode);
+
+  if (!REMOTE_FINANCE_WRITE.goalAddMovement || !idParam || !mode) {
+    return <ReadOnlyRouteNotice title="저축 목표" />;
+  }
+  return <GoalMovementFormRoute goalId={idParam} mode={mode} />;
+}
+
+function GoalMovementFormRoute({ goalId, mode }: { goalId: string; mode: GoalMovementMode }) {
+  const router = useRouter();
+  const { status, error, goals, refresh } = useFinanceRead();
+  const title = mode === 'deposit' ? '저축하기' : '인출하기';
+
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title={title} onClose={() => router.back()} scroll={false}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
+  const goal = goals.find((g) => g.id === goalId) ?? null;
+  if (!goal) {
+    return (
+      <ModalScreen title={title} onClose={() => router.back()} scroll={false}>
+        <View
+          style={{
+            flex: 1,
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingHorizontal: spacing.xl,
+            gap: spacing.md,
+          }}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+            저축 목표를 찾을 수 없어요
+          </Text>
+          <Text
+            style={{
+              fontFamily: fontFamily.regular,
+              fontSize: 13,
+              color: colors.textSub,
+              textAlign: 'center',
+              lineHeight: 19,
+            }}
+          >
+            이미 삭제됐거나 다른 우리집의 목표일 수 있어요.
+          </Text>
+          <Pressable onPress={() => router.back()} hitSlop={8}>
+            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+              목록으로 돌아가기
+            </Text>
+          </Pressable>
+        </View>
+      </ModalScreen>
+    );
+  }
+
+  return <GoalMovementForm key={`${goalId}-${mode}`} goal={goal} mode={mode} />;
+}
+
+function GoalMovementForm({ goal, mode }: { goal: Goal; mode: GoalMovementMode }) {
+  const router = useRouter();
+  const toast = useToast();
+  const insets = useSafeAreaInsets();
+
+  const { session } = useAuth();
+  const { activeHousehold } = useHousehold();
+  const { status, refresh } = useFinanceRead();
+
+  const isWithdraw = mode === 'withdraw';
+  const title = isWithdraw ? '인출하기' : '저축하기';
+
+  // Client-generated movement id, minted ONCE per sheet mount and reused on
+  // EVERY save retry (STEP 16-G2-D3 §9). A fresh id on retry would let
+  // trg_apply_goal_movement apply the delta twice.
+  const movementIdRef = useRef(uid('gm'));
+
+  const [amount, setAmount] = useState('');
+  const [padVisible, setPadVisible] = useState(true);
+
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const magnitude = parseNum(amount);
+  const withdrawBlocked = isWithdraw && goal.saved <= 0;
+  const overSaved = isWithdraw && goal.saved > 0 && magnitude > goal.saved;
+  const canSave =
+    Number.isInteger(magnitude) && magnitude > 0 && !withdrawBlocked && !submitting;
+
+  const onKey = (k: string) => setAmount((a) => applyDigit(a, k));
+
+  const save = async () => {
+    if (submittingRef.current || !canSave) return;
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+
+    submittingRef.current = true;
+    setSubmitting(true);
+
+    const res = await addGoalMovement({
+      movementId: movementIdRef.current, // unchanged on retry
+      householdId: activeHousehold.id,
+      goalId: goal.id,
+      expectedUserId: session.user.id,
+      draft: { mode, amount: magnitude },
+    });
+
+    if (res.ok) {
+      await refresh();
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show(isWithdraw ? '인출했어요' : '저축했어요');
+      router.back();
+      return;
+    }
+
+    submittingRef.current = false;
+    setSubmitting(false);
+    if (
+      res.reason === 'identity' ||
+      res.reason === 'error' ||
+      res.reason === 'invalid' ||
+      res.reason === 'insufficient'
+    ) {
+      toast.show(res.message); // keep the sheet open with the amount
+      return;
+    }
+    // gone / deleted / conflict — reload and leave.
+    await refresh();
+    toast.show(res.message);
+    router.back();
+  };
+
+  return (
+    <ModalScreen
+      title={title}
+      closeIcon="x"
+      onClose={() => router.back()}
+      right={
+        <HeaderTextButton
+          label={submitting ? '저장 중…' : '저장'}
+          onPress={() => void save()}
+          disabled={!canSave}
+        />
+      }
+      footer={
+        padVisible ? (
+          <NumPad
+            style={{ paddingBottom: insets.bottom + 16 }}
+            onKey={onKey}
+            onBackspace={() => onKey('back')}
+            onDone={() => setPadVisible(false)}
+          />
+        ) : undefined
+      }
+    >
+      <View style={{ paddingHorizontal: spacing.xl, paddingTop: spacing.xs }}>
+        <View
+          style={{
+            padding: spacing.lg,
+            marginBottom: spacing.lg,
+            backgroundColor: colors.track,
+            borderRadius: radii.md,
+          }}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>{goal.name}</Text>
+          <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub, marginTop: 4, ...tabularNums }}>
+            지금까지 모은 금액 {fmt(goal.saved)}원
+          </Text>
+        </View>
+
+        <Field label={isWithdraw ? '인출할 금액' : '저축할 금액'}>
+          <Pressable
+            onPress={() => {
+              Keyboard.dismiss();
+              setPadVisible(true);
+            }}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              width: '100%',
+              paddingVertical: 12,
+              paddingHorizontal: 14,
+              backgroundColor: padVisible ? colors.primaryLighter : colors.white,
+              borderWidth: 1,
+              borderColor: padVisible ? colors.primaryLight : colors.border,
+              borderRadius: radii.md,
+            }}
+          >
+            <Text
+              style={{
+                flex: 1,
+                fontFamily: fontFamily.semibold,
+                fontSize: 16,
+                color: amount ? colors.text : padVisible ? colors.primaryStrong : colors.textMuted,
+                ...tabularNums,
+              }}
+            >
+              {amount ? fmt(Number(amount)) : '0'}
+            </Text>
+            <Text
+              style={{
+                fontFamily: fontFamily.medium,
+                fontSize: 14,
+                color: padVisible ? colors.primaryStrong : colors.textSub,
+                marginLeft: 6,
+              }}
+            >
+              원
+            </Text>
+          </Pressable>
+        </Field>
+
+        {withdrawBlocked && (
+          <Text style={{ fontFamily: fontFamily.medium, fontSize: 12, color: colors.expenseText, marginTop: -6 }}>
+            아직 모은 금액이 없어서 인출할 수 없어요.
+          </Text>
+        )}
+        {overSaved && (
+          <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.warningText, marginTop: -6 }}>
+            현재 모은 금액보다 큰 금액이에요. 저장 시 반영되지 않을 수 있어요.
+          </Text>
+        )}
+      </View>
+    </ModalScreen>
+  );
+}

@@ -85,6 +85,13 @@ import { supabase } from '@/lib/supabase';
  * recurring-rule id (the RecurringRule domain type is untouched). Same
  * opaque-token rule for `updated_at`. `last_run` stays domain-only and is
  * NEVER written by any client path in this STEP.
+ *
+ * STEP 16-G2-D3: `goals` additionally selects `created_by` and
+ * `updated_at`, routed into a separate `goalMeta` map keyed by the goal id
+ * (the Goal domain type is untouched). Same opaque-token rule for
+ * `updated_at`. `saved` stays a server-maintained cache — it is NEVER
+ * written directly by any client path; balance changes go only through a
+ * `goal_movements` INSERT (STEP 16-G2-D3).
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -177,6 +184,16 @@ export interface RemoteGoal {
   deadline: string | null;
   icon: string;
   created_at: string;
+  /**
+   * STEP 16-G2-D3 — routed to `goalMeta`, NOT the Goal domain type.
+   * `updated_at` is the optimistic-concurrency token for goal edit /
+   * soft-delete (compared with an exact `.eq('updated_at', …)`), so it must
+   * travel as the RAW PostgREST string — never re-parsed through
+   * Date/toISOString anywhere. `created_by` is author bookkeeping only (the
+   * 23505-idempotency check on CREATE / movement INSERT).
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteLoan {
@@ -332,7 +349,7 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('goals')
-      .select('id,name,target,saved,deadline,icon,created_at')
+      .select('id,name,target,saved,deadline,icon,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase

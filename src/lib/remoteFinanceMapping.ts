@@ -153,6 +153,26 @@ export interface RemoteRecurringMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one SAVINGS GOAL — STEP 16-G2-D3.
+ *
+ * Keyed by the goal id, parallel to `RemoteFinanceData.goals`. Only
+ * non-soft-deleted goals appear (the SELECT filters `deleted_at IS NULL`).
+ * `updatedAt` is the opaque optimistic-concurrency token for goal edit /
+ * soft-delete — the RAW PostgREST string, never re-serialised. It is also
+ * bumped by the `trg_goal_movements` -> `trg_goals_touch` chain whenever a
+ * `goal_movements` row changes `goals.saved`, so a goal edit form opened
+ * before a deposit/withdrawal correctly conflicts on save (this is
+ * intended, not a bug). `createdBy` is author bookkeeping only (the 23505
+ * idempotency check on CREATE / movement INSERT). The `Goal` domain type
+ * stays free of this metadata, and `saved` is never written directly by
+ * any client path.
+ */
+export interface RemoteGoalMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -176,6 +196,8 @@ export interface RemoteFinanceData {
   /** planned-expense id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D1. */
   plannedMeta: Record<string, RemotePlannedMeta>;
   goals: Goal[];
+  /** goal id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D3. */
+  goalMeta: Record<string, RemoteGoalMeta>;
   loans: Loan[];
   customCats: CustomCatMap;
   notes: string;
@@ -362,6 +384,13 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     createdAt: g.created_at,
   }));
 
+  // Parallel to `goals`, keyed by id. `updatedAt` stored verbatim — an
+  // opaque concurrency token, never formatted/re-parsed (STEP 16-G2-D3).
+  const goalMeta: Record<string, RemoteGoalMeta> = {};
+  for (const g of raw.goals) {
+    goalMeta[g.id] = { updatedAt: g.updated_at, createdBy: g.created_by };
+  }
+
   const loans: Loan[] = raw.loans.map((l) => ({
     id: l.id,
     name: l.name,
@@ -390,6 +419,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     planned,
     plannedMeta,
     goals,
+    goalMeta,
     loans,
     customCats,
     notes: raw.householdSettings?.notes ?? '',

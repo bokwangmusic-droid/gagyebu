@@ -1,16 +1,23 @@
+import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { Text, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { Alert, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
-import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { ProgressBar } from '@/components/ui/ProgressBar';
+import { useToast } from '@/components/ui/Toast';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, formatShortDate } from '@/lib/format';
 import { goalStats, type GoalPace } from '@/lib/goal';
+import { softDeleteGoal } from '@/services/remoteGoalWrite';
+import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
+import { useHousehold } from '@/store/household';
+import type { Goal } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 
@@ -27,10 +34,75 @@ const PACE_COLOR: Record<GoalPace, string> = {
 
 export default function GoalsList() {
   const router = useRouter();
-  const { status, error, goals, refresh } = useFinanceRead();
+  const toast = useToast();
+  const { session } = useAuth();
+  const { activeHousehold } = useHousehold();
+  const { status, error, goals, goalMeta, refresh } = useFinanceRead();
+
+  const pendingRef = useRef(false);
+  const [pendingId, setPendingId] = useState<string | null>(null);
+
+  const canCreate = REMOTE_FINANCE_WRITE.goalCreate;
+  const canEdit = REMOTE_FINANCE_WRITE.goalEdit;
+  const canDelete = REMOTE_FINANCE_WRITE.goalDelete;
+  const canMove = REMOTE_FINANCE_WRITE.goalAddMovement;
 
   const now = new Date();
   const totalSaved = goals.reduce((s, g) => s + g.saved, 0);
+
+  const openAdd = () => router.push('/goal-add');
+  const openEdit = (id: string) => router.push({ pathname: '/goal-add', params: { id } });
+  const openMovement = (id: string, mode: 'deposit' | 'withdraw') =>
+    router.push({ pathname: '/goal-movement', params: { id, mode } });
+
+  const doDelete = async (id: string, token: string) => {
+    if (pendingRef.current) return;
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+
+    pendingRef.current = true;
+    setPendingId(id);
+
+    const res = await softDeleteGoal({
+      id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: token,
+    });
+
+    await refresh();
+    pendingRef.current = false;
+    setPendingId(null);
+
+    if (res.ok) {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show('저축 목표를 삭제했어요');
+      return;
+    }
+    if (res.reason === 'identity' || res.reason === 'error') {
+      toast.show(res.message);
+      return;
+    }
+    toast.show('다른 곳에서 변경됐거나 삭제된 저축 목표예요. 최신 내용을 불러왔어요.');
+  };
+
+  const confirmDelete = (g: Goal) => {
+    if (!canDelete || pendingRef.current) return;
+    // Capture the concurrency token BEFORE the Alert — a background refresh
+    // (e.g. after a deposit elsewhere) can't swap it under us.
+    const token = goalMeta[g.id]?.updatedAt ?? null;
+    if (!token) {
+      toast.show('저축 목표 정보를 불러오지 못했어요. 새로고침 후 다시 시도해 주세요.');
+      return;
+    }
+    Alert.alert(
+      '저축 목표를 삭제할까요?',
+      '목표는 목록에서 사라지고 기존 저축 기록은 보존돼요. 실제 거래 내역에는 영향이 없어요.',
+      [
+        { text: '취소', style: 'cancel' },
+        { text: '삭제', style: 'destructive', onPress: () => void doDelete(g.id, token) },
+      ],
+    );
+  };
 
   if (status !== 'ready') {
     return (
@@ -40,9 +112,24 @@ export default function GoalsList() {
     );
   }
 
+  const addBtn = canCreate ? (
+    <Pressable
+      onPress={openAdd}
+      style={{
+        width: 36,
+        height: 36,
+        borderRadius: radii.pill,
+        backgroundColor: colors.primary,
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <AppIcon name="plus" size={18} color={colors.white} strokeWidth={2.5} />
+    </Pressable>
+  ) : undefined;
+
   return (
-    <ModalScreen title="저축 목표" onClose={() => router.back()}>
-      <FinanceReadOnlyBanner />
+    <ModalScreen title="저축 목표" onClose={() => router.back()} right={addBtn}>
       <LinearGradient
         colors={gradients.goalPink}
         start={{ x: 0, y: 0 }}
@@ -78,27 +165,24 @@ export default function GoalsList() {
 
       {goals.length === 0 ? (
         <EmptyState
-          icon="target"
+          icon={canCreate ? undefined : 'target'}
+          onPress={canCreate ? openAdd : undefined}
+          cta={canCreate ? '저축 목표 추가하기' : undefined}
           title="목표가 없어요"
-          sub={'우리집 가계부에 등록된 목표가 없어요'}
+          sub={
+            canCreate
+              ? '모으고 싶은 금액과 목표일을 정해두면\n진행 상황을 한눈에 볼 수 있어요'
+              : '우리집 가계부에 등록된 목표가 없어요'
+          }
         />
       ) : (
         goals.map((g) => {
           const st = goalStats(g, now);
           const dl = st.deadline;
-          return (
-            <View
-              key={g.id}
-              style={{
-                marginHorizontal: spacing.lg,
-                marginBottom: spacing.md,
-                padding: spacing.lg,
-                backgroundColor: colors.white,
-                borderWidth: 1,
-                borderColor: colors.border,
-                borderRadius: radii.xxl,
-              }}
-            >
+          const rowPending = pendingId === g.id;
+
+          const body = (
+            <>
               <View style={{ flexDirection: 'row', gap: spacing.md, alignItems: 'flex-start' }}>
                 <View
                   style={{
@@ -140,9 +224,6 @@ export default function GoalsList() {
               </View>
               <ProgressBar percent={st.progressPct} size="md" style={{ marginTop: spacing.md }} />
 
-              {/* deadline-driven guidance: 월 필요 저축액 → 현재 페이스,
-                  or an 'achieved' / 'past deadline' fallback. Hidden entirely
-                  when the goal has no deadline. */}
               {st.achieved ? (
                 <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.incomeText, marginTop: spacing.sm }}>
                   목표 달성 🎉
@@ -163,10 +244,117 @@ export default function GoalsList() {
                   ) : null}
                 </View>
               ) : null}
+            </>
+          );
+
+          return (
+            <View
+              key={g.id}
+              style={{
+                marginHorizontal: spacing.lg,
+                marginBottom: spacing.md,
+                padding: spacing.lg,
+                backgroundColor: colors.white,
+                borderWidth: 1,
+                borderColor: colors.border,
+                borderRadius: radii.xxl,
+                opacity: rowPending ? 0.5 : 1,
+              }}
+            >
+              {/* The card body (tap -> edit) and the deposit / withdraw /
+                  delete controls are SIBLINGS, not nested — a tap lands on
+                  exactly one, so an action never also opens the edit screen. */}
+              {canEdit ? (
+                <Pressable
+                  onPress={() => openEdit(g.id)}
+                  disabled={rowPending}
+                  style={({ pressed }) => [pressed && { opacity: 0.7 }]}
+                >
+                  {body}
+                </Pressable>
+              ) : (
+                body
+              )}
+
+              {(canMove || canDelete) && (
+                <View
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    gap: spacing.sm,
+                    marginTop: spacing.md,
+                    paddingTop: spacing.md,
+                    borderTopWidth: 1,
+                    borderTopColor: colors.track,
+                  }}
+                >
+                  {canMove && (
+                    <>
+                      <ActionPill
+                        label="저축하기"
+                        onPress={() => openMovement(g.id, 'deposit')}
+                        disabled={rowPending}
+                      />
+                      <ActionPill
+                        label="인출하기"
+                        onPress={() => openMovement(g.id, 'withdraw')}
+                        disabled={rowPending || g.saved <= 0}
+                      />
+                    </>
+                  )}
+                  <View style={{ flex: 1 }} />
+                  {canDelete && (
+                    <Pressable
+                      onPress={() => confirmDelete(g)}
+                      disabled={rowPending}
+                      hitSlop={8}
+                      style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: radii.sm,
+                        borderWidth: 1,
+                        borderColor: colors.expenseLight,
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    >
+                      <AppIcon name="trash" size={13} color={colors.expenseText} />
+                    </Pressable>
+                  )}
+                </View>
+              )}
             </View>
           );
         })
       )}
     </ModalScreen>
+  );
+}
+
+function ActionPill({
+  label,
+  onPress,
+  disabled,
+}: {
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      style={{
+        paddingVertical: 7,
+        paddingHorizontal: 12,
+        borderRadius: radii.pill,
+        borderWidth: 1,
+        borderColor: colors.primaryLight,
+        backgroundColor: colors.white,
+        opacity: disabled ? 0.4 : 1,
+      }}
+    >
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.primaryStrong }}>{label}</Text>
+    </Pressable>
   );
 }
