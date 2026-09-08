@@ -88,6 +88,7 @@ const HOUSEHOLD_READY_SCREENS = [
   'goal-add',
   'goal-movement',
   'loan-add',
+  'loan-payment',
   'categories',
   'backup',
 ];
@@ -338,6 +339,7 @@ function RootNav() {
         <Stack.Screen name="goal-movement" options={MODAL} />
         <Stack.Screen name="loans" options={MODAL} />
         <Stack.Screen name="loan-add" options={MODAL} />
+        <Stack.Screen name="loan-payment" options={MODAL} />
         <Stack.Screen name="cards" options={MODAL} />
         <Stack.Screen name="card-add" options={MODAL} />
         <Stack.Screen name="categories" options={MODAL} />

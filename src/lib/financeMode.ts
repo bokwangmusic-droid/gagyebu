@@ -1,12 +1,11 @@
 /**
  * STEP 16-G1B / 16-G2-A / 16-G2-B / 16-G2-C2 / 16-G2-C3-B / 16-G2-C4-B /
- * 16-G2-D1 / 16-G2-D2 / 16-G2-D3 — household finance write gating.
+ * 16-G2-D1 / 16-G2-D2 / 16-G2-D3 / 16-G2-D4 — household finance write gating.
  *
- * `REMOTE_FINANCE_READ_ONLY` stays `true` and keeps its exact original
- * meaning: every OTHER mutation screen still renders <ReadOnlyRouteNotice/>
- * instead of its real form — loan-add. That file checks this constant
- * directly (not `REMOTE_FINANCE_WRITE`), so it stays closed. (`planned-add`,
- * `recurring-add` and `goal-add` no longer check it — see below.)
+ * `REMOTE_FINANCE_READ_ONLY` stays `true` and keeps its exact declaration
+ * for now. As of STEP 16-G2-D4 NO screen checks it any more (`loan-add` is
+ * the last one to switch to `REMOTE_FINANCE_WRITE.*`); tidying the constant
+ * away is left as its own follow-up so this STEP has no unrelated cleanup.
  *
  * `REMOTE_FINANCE_WRITE` is the one greppable place that says which
  * financial writes are open:
@@ -51,10 +50,23 @@
  *     `amount_delta`, and the DB `trg_apply_goal_movement` trigger updates
  *     `goals.saved` atomically; the movement `gm-...` id is stable across
  *     retries; NO `transactions` write, no RPC, no hard DELETE).
- * `card-add`, `budget-add`, `categories`, `planned-add`, `recurring-add`
- * and `goal-add` are the former `REMOTE_FINANCE_READ_ONLY` routes that now
- * check `REMOTE_FINANCE_WRITE.*` instead. Everything else — loans — remains
- * closed.
+ *   - loan CREATE / EDIT / (soft) DELETE + loan-payment ADD / (soft) DELETE
+ *     — STEP 16-G2-D4, via src/services/remoteLoanWrite.ts (direct
+ *     `public.loans` INSERT / conditional UPDATE of name·lender·principal·
+ *     annual_rate·term_months·start_date·payment_day·repay_type / UPDATE
+ *     deleted_at, keyed on `(household_id, id)` with a client `loan-...`
+ *     id; `paid` is NEVER written directly — a repayment is a
+ *     `public.loan_payments` INSERT of a client-`splitPayment`-ed
+ *     principal_part / interest_part computed from an AUTHORITATIVE
+ *     re-SELECT of the loan, and the DB `trg_apply_loan_payment` trigger
+ *     moves `loans.paid`; a payment soft-delete reverses it the same way;
+ *     the payment `lp-...` id is stable across retries; `principal` cannot
+ *     be edited below the current `paid`; NO `transactions` write, no RPC,
+ *     no hard DELETE).
+ * `card-add`, `budget-add`, `categories`, `planned-add`, `recurring-add`,
+ * `goal-add` and `loan-add` are the former `REMOTE_FINANCE_READ_ONLY`
+ * routes that now check `REMOTE_FINANCE_WRITE.*` instead. Nothing else is
+ * gated.
  */
 export const REMOTE_FINANCE_READ_ONLY = true as const;
 
@@ -83,4 +95,9 @@ export const REMOTE_FINANCE_WRITE = {
   goalEdit: true,
   goalDelete: true,
   goalAddMovement: true,
+  loanCreate: true,
+  loanEdit: true,
+  loanDelete: true,
+  loanAddPayment: true,
+  loanDeletePayment: true,
 } as const;

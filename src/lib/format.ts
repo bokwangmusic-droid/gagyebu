@@ -28,7 +28,8 @@ export function signed(type: 'income' | 'expense', n: number): string {
   return `${type === 'income' ? '+' : '−'}${fmt(n)}`;
 }
 
-const WEEKDAYS_KO = ['일', '월', '화', '수', '목', '금', '토'] as const;
+/** Korean weekday labels, Sunday-first — index by `Date.getDay()` (0 = 일). */
+export const WEEKDAYS_KO = ['일', '월', '화', '수', '목', '금', '토'] as const;
 
 export function weekdayKo(d: Date): string {
   return WEEKDAYS_KO[d.getDay()];

@@ -173,6 +173,39 @@ export interface RemoteGoalMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one LOAN — STEP 16-G2-D4.
+ *
+ * Keyed by the loan id, parallel to `RemoteFinanceData.loans`. Only
+ * non-soft-deleted loans appear (`deleted_at IS NULL`). `updatedAt` is the
+ * opaque optimistic-concurrency token for loan edit / soft-delete — the
+ * RAW PostgREST string, never re-serialised. It is also bumped by the
+ * `trg_apply_loan_payment` -> `trg_loans_touch` chain whenever a
+ * `loan_payments` row changes `loans.paid`, so a loan edit form opened
+ * before a repayment correctly conflicts on save (intended). `createdBy`
+ * is author bookkeeping only. The `Loan` domain type stays free of this
+ * metadata, and `paid` is never written directly by any client path.
+ */
+export interface RemoteLoanMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
+ * Remote-only bookkeeping for one LOAN PAYMENT — STEP 16-G2-D4.
+ *
+ * Keyed by the payment id, parallel to the `LoanPayment` entries inside
+ * `RemoteFinanceData.loans[].payments`. Only non-soft-deleted payments
+ * appear. `updatedAt` is the opaque optimistic-concurrency token for a
+ * payment soft-delete — the RAW PostgREST string, never re-serialised.
+ * `createdBy` is author bookkeeping only (the 23505 idempotency check on
+ * payment INSERT). The `LoanPayment` domain type stays free of this.
+ */
+export interface RemoteLoanPaymentMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -199,6 +232,10 @@ export interface RemoteFinanceData {
   /** goal id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D3. */
   goalMeta: Record<string, RemoteGoalMeta>;
   loans: Loan[];
+  /** loan id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D4. */
+  loanMeta: Record<string, RemoteLoanMeta>;
+  /** loan-payment id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D4. */
+  loanPaymentMeta: Record<string, RemoteLoanPaymentMeta>;
   customCats: CustomCatMap;
   notes: string;
   catOrder: CatOrderMap;
@@ -281,6 +318,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
   }
 
   const paymentsByLoan = new Map<string, LoanPayment[]>();
+  const loanPaymentMeta: Record<string, RemoteLoanPaymentMeta> = {};
   for (const p of raw.loanPayments) {
     const list = paymentsByLoan.get(p.loan_id) ?? [];
     list.push({
@@ -292,6 +330,9 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
       memo: p.memo ?? undefined,
     });
     paymentsByLoan.set(p.loan_id, list);
+    // Parallel to the payment entries, keyed by payment id. `updatedAt`
+    // stored verbatim — an opaque concurrency token (STEP 16-G2-D4).
+    loanPaymentMeta[p.id] = { updatedAt: p.updated_at, createdBy: p.created_by };
   }
 
   const transactions: Transaction[] = raw.transactions.map((t) => ({
@@ -406,6 +447,13 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     createdAt: l.created_at,
   }));
 
+  // Parallel to `loans`, keyed by id. `updatedAt` stored verbatim — an
+  // opaque concurrency token, never formatted/re-parsed (STEP 16-G2-D4).
+  const loanMeta: Record<string, RemoteLoanMeta> = {};
+  for (const l of raw.loans) {
+    loanMeta[l.id] = { updatedAt: l.updated_at, createdBy: l.created_by };
+  }
+
   return {
     transactions,
     transactionMeta,
@@ -421,6 +469,8 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     goals,
     goalMeta,
     loans,
+    loanMeta,
+    loanPaymentMeta,
     customCats,
     notes: raw.householdSettings?.notes ?? '',
     catOrder: {

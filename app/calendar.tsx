@@ -7,15 +7,14 @@ import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
+import { isKrRedDay } from '@/data/holidays';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
-import { fmt, toDateKey } from '@/lib/format';
+import { fmt, toDateKey, WEEKDAYS_KO, weekdayKo } from '@/lib/format';
+import { buildMonthWeeks } from '@/lib/monthGrid';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
 import type { Transaction } from '@/store/types';
-
-const WD = ['월', '화', '수', '목', '금', '토', '일'];
-const WD_FULL = ['일', '월', '화', '수', '목', '금', '토'];
 
 interface DayTotals {
   income: number;
@@ -44,27 +43,7 @@ export default function CalendarScreen() {
     return map;
   }, [transactions]);
 
-  const grid = useMemo(() => {
-    const first = new Date(view.year, view.month, 1);
-    const last = new Date(view.year, view.month + 1, 0);
-    const pad = (first.getDay() + 6) % 7;
-    const cells: { date: Date; inMonth: boolean }[] = [];
-    for (let i = pad; i > 0; i--) {
-      const d = new Date(first);
-      d.setDate(first.getDate() - i);
-      cells.push({ date: d, inMonth: false });
-    }
-    for (let i = 1; i <= last.getDate(); i++) {
-      cells.push({ date: new Date(view.year, view.month, i), inMonth: true });
-    }
-    while (cells.length % 7 !== 0) {
-      const lastCell = cells[cells.length - 1].date;
-      const d = new Date(lastCell);
-      d.setDate(lastCell.getDate() + 1);
-      cells.push({ date: d, inMonth: false });
-    }
-    return cells;
-  }, [view]);
+  const weeks = useMemo(() => buildMonthWeeks(view.year, view.month), [view]);
 
   const monthTotal = useMemo(() => {
     let income = 0;
@@ -96,7 +75,7 @@ export default function CalendarScreen() {
   const selected = daily[selectedKey] ?? { income: 0, expense: 0, txns: [] };
   const selLabel = (() => {
     const [y, m, d] = selectedKey.split('-').map(Number);
-    const wd = WD_FULL[new Date(y, m - 1, d).getDay()];
+    const wd = weekdayKo(new Date(y, m - 1, d));
     return `${m}월 ${d}일 (${wd})${selectedKey === todayKey ? ' · 오늘' : ''}`;
   })();
 
@@ -172,98 +151,98 @@ export default function CalendarScreen() {
         />
       </View>
 
-      {/* Weekday header */}
+      {/* Weekday header — Korean Sunday-first, same 7 × flex:1 sizing as the grid */}
       <View style={{ flexDirection: 'row', marginHorizontal: spacing.lg, marginBottom: 4 }}>
-        {WD.map((d, i) => (
-          <Text
-            key={d}
-            style={{
-              flex: 1,
-              textAlign: 'center',
-              fontFamily: fontFamily.bold,
-              fontSize: 10,
-              paddingVertical: 6,
-              color: i === 5 ? colors.infoText : i === 6 ? colors.expenseStrong : colors.textMuted,
-            }}
-          >
-            {d}
-          </Text>
+        {WEEKDAYS_KO.map((d, i) => (
+          <View key={d} style={{ flex: 1, alignItems: 'center', paddingVertical: 6 }}>
+            <Text
+              style={{
+                fontFamily: fontFamily.bold,
+                fontSize: 10,
+                color: i === 0 ? colors.expenseStrong : i === 6 ? colors.infoText : colors.textMuted,
+              }}
+            >
+              {d}
+            </Text>
+          </View>
         ))}
       </View>
 
-      {/* Grid */}
+      {/* Grid — one row per week, 7 flex:1 cells (never wraps to 6 columns) */}
       <View
         style={{
           marginHorizontal: spacing.lg,
-          flexDirection: 'row',
-          flexWrap: 'wrap',
           backgroundColor: colors.border,
           borderRadius: radii.md,
           padding: 2,
         }}
       >
-        {grid.map((cell, i) => {
-          const key = toDateKey(cell.date);
-          const isToday = key === todayKey;
-          const isSel = key === selectedKey;
-          const totals = daily[key];
-          const dow = cell.date.getDay();
-          return (
-            <Pressable
-              key={i}
-              onPress={() => cell.inMonth && setSelectedKey(key)}
-              disabled={!cell.inMonth}
-              style={{
-                width: `${100 / 7}%`,
-                minHeight: 62,
-                padding: 3,
-                paddingTop: 5,
-                alignItems: 'center',
-                borderRadius: radii.sm,
-                borderWidth: isToday || isSel ? 1.5 : 0,
-                borderColor: colors.primary,
-                backgroundColor: isSel ? colors.primaryLight : colors.white,
-                opacity: cell.inMonth ? 1 : 0.3,
-              }}
-            >
-              <Text
-                style={{
-                  fontFamily: isToday ? fontFamily.extrabold : fontFamily.medium,
-                  fontSize: 12,
-                  color: isToday
-                    ? colors.primaryStrong
-                    : dow === 0
-                      ? colors.expenseStrong
-                      : dow === 6
-                        ? colors.infoText
-                        : colors.text,
-                }}
-              >
-                {cell.date.getDate()}
-              </Text>
-              {totals && cell.inMonth && (
-                <View style={{ marginTop: 2, width: '100%', alignItems: 'center' }}>
-                  {totals.income > 0 && (
-                    <Text
-                      numberOfLines={1}
-                      style={{ fontSize: 8, fontFamily: fontFamily.bold, color: colors.incomeStrong }}
-                    >
-                      +{fmt(totals.income)}
-                    </Text>
+        {weeks.map((week, wi) => (
+          <View key={wi} style={{ flexDirection: 'row' }}>
+            {week.map((day) => {
+              const isToday = day.key === todayKey;
+              const isSel = day.key === selectedKey;
+              const totals = daily[day.key];
+              const red = day.inMonth && (day.dow === 0 || isKrRedDay(day.key));
+              const blue = day.inMonth && day.dow === 6 && !red;
+              return (
+                <Pressable
+                  key={day.key}
+                  onPress={() => day.inMonth && setSelectedKey(day.key)}
+                  disabled={!day.inMonth}
+                  style={{
+                    flex: 1,
+                    minHeight: 62,
+                    padding: 3,
+                    paddingTop: 5,
+                    alignItems: 'center',
+                    borderRadius: radii.sm,
+                    borderWidth: isToday || isSel ? 1.5 : 0,
+                    borderColor: colors.primary,
+                    backgroundColor: isSel ? colors.primaryLight : colors.white,
+                    opacity: day.inMonth ? 1 : 0.3,
+                  }}
+                >
+                  <Text
+                    style={{
+                      fontFamily: isToday ? fontFamily.extrabold : fontFamily.medium,
+                      fontSize: 12,
+                      color: isToday
+                        ? colors.primaryStrong
+                        : red
+                          ? colors.expenseStrong
+                          : blue
+                            ? colors.infoText
+                            : colors.text,
+                    }}
+                  >
+                    {day.date.getDate()}
+                  </Text>
+                  {totals && day.inMonth && (
+                    <View style={{ marginTop: 2, width: '100%', alignItems: 'center' }}>
+                      {totals.income > 0 && (
+                        <Text
+                          numberOfLines={1}
+                          style={{ fontSize: 8, fontFamily: fontFamily.bold, color: colors.incomeStrong }}
+                        >
+                          +{fmt(totals.income)}
+                        </Text>
+                      )}
+                      {totals.expense > 0 && (
+                        <Text
+                          numberOfLines={1}
+                          style={{ fontSize: 8, fontFamily: fontFamily.bold, color: colors.expenseStrong }}
+                        >
+                          −{fmt(totals.expense)}
+                        </Text>
+                      )}
+                    </View>
                   )}
-                  {totals.expense > 0 && (
-                    <Text
-                      numberOfLines={1}
-                      style={{ fontSize: 8, fontFamily: fontFamily.bold, color: colors.expenseStrong }}
-                    >
-                      −{fmt(totals.expense)}
-                    </Text>
-                  )}
-                </View>
-              )}
-            </Pressable>
-          );
-        })}
+                </Pressable>
+              );
+            })}
+          </View>
+        ))}
       </View>
 
       {/* Selected day */}

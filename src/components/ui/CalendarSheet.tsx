@@ -3,32 +3,15 @@ import { Modal, Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
-import { toDateKey } from '@/lib/format';
+import { isKrRedDay, krEvent } from '@/data/holidays';
+import { toDateKey, WEEKDAYS_KO } from '@/lib/format';
+import { buildMonthWeeks } from '@/lib/monthGrid';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
 
-const WD = ['월', '화', '수', '목', '금', '토', '일'];
-
-function buildGrid(year: number, month: number) {
-  const first = new Date(year, month, 1);
-  const last = new Date(year, month + 1, 0);
-  const pad = (first.getDay() + 6) % 7; // Monday-first
-  const cells: { date: Date; inMonth: boolean }[] = [];
-  for (let i = pad; i > 0; i--) {
-    const d = new Date(first);
-    d.setDate(first.getDate() - i);
-    cells.push({ date: d, inMonth: false });
-  }
-  for (let i = 1; i <= last.getDate(); i++) {
-    cells.push({ date: new Date(year, month, i), inMonth: true });
-  }
-  while (cells.length % 7 !== 0) {
-    const lastCell = cells[cells.length - 1].date;
-    const d = new Date(lastCell);
-    d.setDate(lastCell.getDate() + 1);
-    cells.push({ date: d, inMonth: false });
-  }
-  return cells;
+/** 요일 헤더 색: 일(0) 빨강 · 토(6) 파랑 · 평일 muted. */
+function weekdayHeaderColor(i: number): string {
+  return i === 0 ? colors.expenseStrong : i === 6 ? colors.infoText : colors.textMuted;
 }
 
 interface Props {
@@ -66,7 +49,7 @@ export function CalendarSheet({
     setView({ year: y, month: m - 1 });
   }, [visible, value]);
 
-  const grid = useMemo(() => buildGrid(view.year, view.month), [view]);
+  const weeks = useMemo(() => buildMonthWeeks(view.year, view.month), [view]);
 
   const shiftMonth = (delta: number) =>
     setView((v) => {
@@ -198,80 +181,110 @@ export function CalendarSheet({
             </Pressable>
           </View>
 
-          {/* Weekday header */}
+          {/* Weekday header — same 7 × flex:1 sizing as the grid rows */}
           <View style={{ flexDirection: 'row', marginBottom: 2 }}>
-            {WD.map((d, i) => (
-              <Text
-                key={d}
-                style={{
-                  flex: 1,
-                  textAlign: 'center',
-                  fontFamily: fontFamily.bold,
-                  fontSize: 10,
-                  paddingVertical: 6,
-                  color: i === 5 ? colors.infoText : i === 6 ? colors.expenseStrong : colors.textMuted,
-                }}
-              >
-                {d}
-              </Text>
+            {WEEKDAYS_KO.map((d, i) => (
+              <View key={d} style={{ flex: 1, alignItems: 'center', paddingVertical: 6 }}>
+                <Text
+                  style={{ fontFamily: fontFamily.bold, fontSize: 10, color: weekdayHeaderColor(i) }}
+                >
+                  {d}
+                </Text>
+              </View>
             ))}
           </View>
 
-          {/* Grid */}
-          <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
-            {grid.map((cell, i) => {
-              const key = toDateKey(cell.date);
-              const disabled =
-                (minDate != null && key < minDate) || (maxDate != null && key > maxDate);
-              const isSel = key === value;
-              const isToday = key === todayKey;
-              const dow = cell.date.getDay();
-              return (
-                <Pressable
-                  key={i}
-                  onPress={() => !disabled && cell.inMonth && pick(key)}
-                  disabled={disabled || !cell.inMonth}
-                  style={{
-                    width: `${100 / 7}%`,
-                    height: 42,
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <View
-                    style={{
-                      width: 34,
-                      height: 34,
-                      borderRadius: radii.pill,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      backgroundColor: isSel ? colors.primary : 'transparent',
-                      borderWidth: !isSel && isToday ? 1.5 : 0,
-                      borderColor: colors.primary,
-                      opacity: disabled || !cell.inMonth ? 0.28 : 1,
-                    }}
+          {/* Grid — one row per week, each with exactly 7 flex:1 cells so a
+              row can never wrap to 6 columns. */}
+          {weeks.map((week, wi) => (
+            <View key={wi} style={{ flexDirection: 'row' }}>
+              {week.map((day) => {
+                const disabled =
+                  (minDate != null && day.key < minDate) || (maxDate != null && day.key > maxDate);
+                const isSel = day.key === value;
+                const showToday = !isSel && day.inMonth && day.key === todayKey;
+                const ev = day.inMonth ? krEvent(day.key) : undefined;
+                // 일요일 또는 대한민국 '빨간 날'(공휴일·대체·임시·명절·선거) -> 빨강.
+                // 토요일 -> 파랑 (단 빨간 날이면 빨강이 우선).
+                const red = day.inMonth && (day.dow === 0 || (ev != null && isKrRedDay(day.key)));
+                const blue = day.inMonth && day.dow === 6 && !red;
+                const numColor = isSel
+                  ? colors.white
+                  : !day.inMonth
+                    ? colors.textMuted
+                    : red
+                      ? colors.expenseStrong
+                      : blue
+                        ? colors.infoText
+                        : colors.text;
+                return (
+                  <Pressable
+                    key={day.key}
+                    onPress={() => !disabled && day.inMonth && pick(day.key)}
+                    disabled={disabled || !day.inMonth}
+                    style={{ flex: 1, height: 48, alignItems: 'center', paddingTop: 3 }}
                   >
-                    <Text
+                    <View
                       style={{
-                        fontFamily: isSel || isToday ? fontFamily.bold : fontFamily.medium,
-                        fontSize: 13,
-                        color: isSel
-                          ? colors.white
-                          : !cell.inMonth
-                            ? colors.textMuted
-                            : dow === 0
-                              ? colors.expenseStrong
-                              : dow === 6
-                                ? colors.infoText
-                                : colors.text,
+                        width: 32,
+                        height: 32,
+                        borderRadius: radii.pill,
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        backgroundColor: isSel
+                          ? colors.primary
+                          : showToday
+                            ? colors.primaryLighter
+                            : 'transparent',
+                        borderWidth: showToday ? 1.5 : 0,
+                        borderColor: colors.primary,
+                        opacity: !day.inMonth ? 0.32 : disabled ? 0.24 : 1,
                       }}
                     >
-                      {cell.date.getDate()}
+                      <Text
+                        style={{
+                          fontFamily: isSel || showToday ? fontFamily.bold : fontFamily.medium,
+                          fontSize: 13,
+                          color: numColor,
+                        }}
+                      >
+                        {day.date.getDate()}
+                      </Text>
+                    </View>
+                    {/* Event label — always rendered (empty when none) so every
+                        cell keeps the same height and the 7-column grid stays aligned. */}
+                    <Text
+                      numberOfLines={1}
+                      style={{
+                        marginTop: 1,
+                        fontSize: 8,
+                        lineHeight: 10,
+                        fontFamily: fontFamily.medium,
+                        color: red ? colors.expenseStrong : colors.textFaint,
+                        opacity: disabled && day.inMonth ? 0.5 : 1,
+                      }}
+                    >
+                      {ev ? ev.shortLabel : ''}
                     </Text>
-                  </View>
-                </Pressable>
-              );
-            })}
+                  </Pressable>
+                );
+              })}
+            </View>
+          ))}
+
+          {/* Legend — 색 의미를 숫자만 보고 이해하기 어렵지 않도록 */}
+          <View
+            style={{
+              flexDirection: 'row',
+              justifyContent: 'center',
+              gap: 4,
+              marginTop: spacing.sm,
+            }}
+          >
+            <Text style={{ fontFamily: fontFamily.medium, fontSize: 10, color: colors.infoText }}>토요일</Text>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, color: colors.textFaint }}>파랑 ·</Text>
+            <Text style={{ fontFamily: fontFamily.medium, fontSize: 10, color: colors.expenseStrong }}>일요일·공휴일</Text>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, color: colors.textFaint }}>빨강</Text>
           </View>
         </View>
       </View>

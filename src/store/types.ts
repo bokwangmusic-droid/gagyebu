@@ -110,8 +110,11 @@ export interface PlannedExpense {
   createdAt: string;
 }
 
-/** 원리금균등상환 | 만기일시상환(이자만 매달, 원금은 만기) */
-export type LoanRepayType = 'amortizing' | 'bullet';
+/**
+ * 원리금균등상환(매달 총액 고정) | 원금균등상환(매달 원금 고정 + 잔액 이자 →
+ * 납입액이 매달 감소) | 만기일시상환(이자만 매달, 원금은 만기).
+ */
+export type LoanRepayType = 'amortizing' | 'equal_principal' | 'bullet';
 
 export interface LoanPayment {
   id: string;

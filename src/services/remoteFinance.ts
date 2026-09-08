@@ -92,6 +92,15 @@ import { supabase } from '@/lib/supabase';
  * `updated_at`. `saved` stays a server-maintained cache — it is NEVER
  * written directly by any client path; balance changes go only through a
  * `goal_movements` INSERT (STEP 16-G2-D3).
+ *
+ * STEP 16-G2-D4: `loans` additionally selects `created_by` and
+ * `updated_at` (routed into `loanMeta`), and `loan_payments` additionally
+ * selects `created_by` and `updated_at` (routed into `loanPaymentMeta`).
+ * The Loan / LoanPayment domain types are untouched. Same opaque-token
+ * rule for `updated_at`. `loans.paid` stays a server-maintained cache — it
+ * is NEVER written directly by any client path; it changes only through a
+ * `loan_payments` INSERT / soft-delete and the `trg_apply_loan_payment`
+ * trigger (STEP 16-G2-D4).
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -205,9 +214,18 @@ export interface RemoteLoan {
   term_months: number;
   start_date: string;
   payment_day: number;
-  repay_type: 'amortizing' | 'bullet';
+  repay_type: 'amortizing' | 'equal_principal' | 'bullet';
   paid: number;
   created_at: string;
+  /**
+   * STEP 16-G2-D4 — routed to `loanMeta`, NOT the Loan domain type.
+   * `updated_at` is the optimistic-concurrency token for loan edit /
+   * soft-delete (exact `.eq('updated_at', …)`), so it travels as the RAW
+   * PostgREST string — never re-parsed. `created_by` is author bookkeeping
+   * only (the 23505-idempotency check on CREATE).
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteLoanPayment {
@@ -218,6 +236,15 @@ export interface RemoteLoanPayment {
   principal_part: number;
   interest_part: number;
   memo: string | null;
+  /**
+   * STEP 16-G2-D4 — routed to `loanPaymentMeta`, NOT the LoanPayment domain
+   * type. `updated_at` is the optimistic-concurrency token for a payment
+   * soft-delete (exact `.eq('updated_at', …)`), so it travels as the RAW
+   * PostgREST string — never re-parsed. `created_by` is author bookkeeping
+   * only (the 23505-idempotency check on payment INSERT).
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemoteTransaction {
@@ -354,12 +381,12 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('loans')
-      .select('id,name,lender,principal,annual_rate,term_months,start_date,payment_day,repay_type,paid,created_at')
+      .select('id,name,lender,principal,annual_rate,term_months,start_date,payment_day,repay_type,paid,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
       .from('loan_payments')
-      .select('id,loan_id,date,amount,principal_part,interest_part,memo')
+      .select('id,loan_id,date,amount,principal_part,interest_part,memo,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase

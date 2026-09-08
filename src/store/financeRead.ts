@@ -27,6 +27,8 @@ import type {
   RemoteCardMeta,
   RemoteCategoryMeta,
   RemoteGoalMeta,
+  RemoteLoanMeta,
+  RemoteLoanPaymentMeta,
   RemotePlannedMeta,
   RemoteRecurringMeta,
   RemoteTransactionMeta,
@@ -99,6 +101,18 @@ export interface FinanceReadResult {
    */
   goalMeta: Record<string, RemoteGoalMeta>;
   loans: Loan[];
+  /**
+   * loan id -> remote-only metadata (updatedAt concurrency token +
+   * createdBy). STEP 16-G2-D4. `{}` while not ready. Kept separate from
+   * `loans` so the Loan domain type stays free of sync metadata.
+   */
+  loanMeta: Record<string, RemoteLoanMeta>;
+  /**
+   * loan-payment id -> remote-only metadata (updatedAt concurrency token +
+   * createdBy). STEP 16-G2-D4. `{}` while not ready. Used to guard a
+   * payment soft-delete.
+   */
+  loanPaymentMeta: Record<string, RemoteLoanPaymentMeta>;
   customCats: CustomCatMap;
   notes: string;
   catOrder: CatOrderMap;
@@ -122,6 +136,8 @@ const EMPTY_SLICES = {
   goals: [] as Goal[],
   goalMeta: {} as Record<string, RemoteGoalMeta>,
   loans: [] as Loan[],
+  loanMeta: {} as Record<string, RemoteLoanMeta>,
+  loanPaymentMeta: {} as Record<string, RemoteLoanPaymentMeta>,
   customCats: DEFAULT_CUSTOM_CATS,
   notes: '',
   catOrder: DEFAULT_CAT_ORDER,
@@ -165,6 +181,8 @@ export function useFinanceRead(): FinanceReadResult {
         goals: data.goals,
         goalMeta: data.goalMeta,
         loans: data.loans,
+        loanMeta: data.loanMeta,
+        loanPaymentMeta: data.loanPaymentMeta,
         customCats: data.customCats,
         notes: data.notes,
         catOrder: data.catOrder,

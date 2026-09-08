@@ -1,16 +1,31 @@
 /**
  * Loan maths — pure, no store/UI imports.
  *
- * Supports two Korean repayment styles:
- *  - 'amortizing' (원리금균등상환): equal total payment every month
- *  - 'bullet'     (만기일시상환): interest only each month, principal at maturity
+ * Supports three Korean repayment styles:
+ *  - 'amortizing'      (원리금균등상환): equal TOTAL payment every month
+ *  - 'equal_principal' (원금균등상환): equal PRINCIPAL slice every month
+ *                       (principal / termMonths) + interest on the current
+ *                       balance, so the total payment DECREASES each month
+ *  - 'bullet'          (만기일시상환): interest only each month, principal at maturity
+ *
+ * `splitPayment` is deliberately repayType-agnostic: the product lets the
+ * user enter whatever TOTAL they actually paid, and every style splits it
+ * "interest on the balance first, the rest to principal (clamped to the
+ * remaining balance)". `repayType` only shapes the PROJECTED / displayed
+ * monthly payment via `scheduledPayment`.
  */
 
 import type { Loan, LoanRepayType } from '@/store/types';
 
 export const monthlyRateOf = (annualRatePct: number) => annualRatePct / 100 / 12;
 
-/** Scheduled monthly payment for the whole loan. */
+/**
+ * Projected monthly payment.
+ *  - amortizing      -> the fixed monthly total for the whole term
+ *  - equal_principal -> the FIRST month's total (fixed principal slice +
+ *                       first-month interest); later months are smaller
+ *  - bullet          -> the monthly interest (principal repaid at maturity)
+ */
 export function scheduledPayment(
   principal: number,
   annualRatePct: number,
@@ -21,9 +36,23 @@ export function scheduledPayment(
   if (principal <= 0) return 0;
   if (repayType === 'bullet') return Math.round(principal * r);
   if (termMonths <= 0) return 0;
+  if (repayType === 'equal_principal') {
+    // Fixed principal slice + interest on the full balance (first month).
+    return Math.round(principal / termMonths) + Math.round(principal * r);
+  }
   if (r === 0) return Math.round(principal / termMonths);
   const f = Math.pow(1 + r, termMonths);
   return Math.round((principal * r * f) / (f - 1));
+}
+
+/** Fixed monthly PRINCIPAL slice for an 원금균등 loan (0 for other styles). */
+export function equalPrincipalSlice(
+  principal: number,
+  termMonths: number,
+  repayType: LoanRepayType,
+): number {
+  if (repayType !== 'equal_principal' || principal <= 0 || termMonths <= 0) return 0;
+  return Math.round(principal / termMonths);
 }
 
 /** Split one payment into interest (on the current balance) + principal. */
@@ -58,7 +87,9 @@ export function formatYearMonth(d: Date): string {
 }
 
 export function describeRepayType(t: LoanRepayType): string {
-  return t === 'bullet' ? '만기일시상환' : '원리금균등상환';
+  if (t === 'bullet') return '만기일시상환';
+  if (t === 'equal_principal') return '원금균등상환';
+  return '원리금균등상환';
 }
 
 export interface LoanView {

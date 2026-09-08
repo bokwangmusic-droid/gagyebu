@@ -1,0 +1,478 @@
+/**
+ * Remote household loan WRITE layer — STEP 16-G2-D4.
+ *
+ * Five direct writes, no RPC:
+ *   - createLoan            : `.insert()` one `public.loans` row (NEVER `paid`)
+ *   - updateLoan            : conditional `.update()` of name/lender/principal/
+ *                             annual_rate/term_months/start_date/payment_day/
+ *                             repay_type — refuses `principal < current paid`
+ *   - softDeleteLoan        : `.update({ deleted_at })` — never a hard DELETE,
+ *                             never touches loan_payments/transactions
+ *   - addLoanPayment        : `.insert()` one `public.loan_payments` row with
+ *                             `principal_part` / `interest_part` computed by
+ *                             `splitPayment()` from an AUTHORITATIVE re-SELECT
+ *                             of the loan done immediately before the INSERT;
+ *                             the DB `trg_apply_loan_payment` trigger then
+ *                             moves `loans.paid`. The client NEVER reads
+ *                             `paid`, adds to it and writes it back — the
+ *                             `authenticated` UPDATE grant on `public.loans`
+ *                             does not include `paid`.
+ *   - softDeleteLoanPayment : `.update({ deleted_at })` on `public.loan_payments`
+ *                             — the trigger reverses `loans.paid` by
+ *                             `old.principal_part`. Never a hard DELETE,
+ *                             never a direct `loans.paid` write.
+ *
+ * This module writes ONLY `public.loans` and `public.loan_payments`. It
+ * NEVER writes `transactions`, never adds a provenance column, never
+ * touches an existing loan_payments row on a loan soft-delete.
+ *
+ * Concurrency (STEP 16-G2-D4 §9): the `paid` cache itself is safe — the
+ * trigger does `paid = paid + principal_part` under a row lock. But the
+ * interest/principal SPLIT is client-side (`splitPayment`), so two
+ * near-simultaneous repayments can each compute their split against a
+ * balance the other has not yet reduced — a small `interest_part`
+ * inaccuracy in the race window between this module's authoritative
+ * re-SELECT and its INSERT. This STEP mitigates (fresh re-SELECT, latest
+ * annual_rate, DB `paid <= principal` CHECK, 23514 -> refresh UX) but does
+ * NOT fully solve it; a server-side row-locked split (trigger/RPC change =
+ * migration) is a future hardening item.
+ *
+ * Session identity: every write re-checks the live session and refuses if
+ * it no longer matches `expectedUserId`.
+ */
+import type { PostgrestError } from '@supabase/supabase-js';
+
+import { supabase } from '@/lib/supabase';
+import {
+  buildLoanInsert,
+  buildLoanPaymentInsert,
+  buildLoanUpdate,
+  isValidLoanDraft,
+  isValidLoanPaymentDraft,
+  type LoanInsertRow,
+  type LoanPaymentInsertRow,
+  type NewLoanDraft,
+  type NewLoanPaymentDraft,
+} from '@/lib/remoteLoanWriteMapping';
+
+export type LoanWriteReason =
+  | 'identity'
+  | 'invalid'
+  | 'conflict'
+  | 'deleted'
+  | 'gone'
+  | 'error';
+
+/** updateLoan can additionally fail with `principal_low`. */
+export type UpdateLoanReason = LoanWriteReason | 'principal_low';
+/** addLoanPayment can additionally fail with `paid_off` or `stale` (23514). */
+export type AddLoanPaymentReason = LoanWriteReason | 'paid_off' | 'stale';
+
+export type CreateLoanResult =
+  | { ok: true; id: string }
+  | { ok: false; reason: LoanWriteReason; message: string };
+
+export type UpdateLoanResult =
+  | { ok: true; updatedAt: string }
+  | { ok: false; reason: UpdateLoanReason; message: string };
+
+export type SoftDeleteLoanResult =
+  | { ok: true }
+  | { ok: false; reason: Exclude<LoanWriteReason, 'invalid' | 'deleted'>; message: string };
+
+export type AddLoanPaymentResult =
+  | { ok: true }
+  | { ok: false; reason: AddLoanPaymentReason; message: string };
+
+export type SoftDeleteLoanPaymentResult =
+  | { ok: true }
+  | { ok: false; reason: Exclude<LoanWriteReason, 'invalid' | 'deleted'>; message: string };
+
+const GENERIC_ERROR = '대출을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+const PAYMENT_ERROR = '상환 기록을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
+const RELOGIN = '다시 로그인해 주세요.';
+const INVALID = '대출 정보를 확인해 주세요.';
+const INVALID_PAYMENT = '상환 금액을 확인해 주세요.';
+const EDIT_CONFLICT = '다른 곳에서 변경됐거나 삭제된 대출이에요. 최신 내용을 불러올게요.';
+const LOAN_GONE = '삭제됐거나 찾을 수 없는 대출이에요. 최신 내용을 불러올게요.';
+const PRINCIPAL_LOW = '이미 상환한 원금보다 대출 원금을 낮출 수 없어요.';
+const PAID_OFF = '이미 모두 상환한 대출이에요.';
+const PAYMENT_STALE = '상환 상태가 변경됐어요. 최신 잔액을 불러왔으니 다시 확인해주세요.';
+const PAYMENT_DELETE_CONFLICT = '다른 곳에서 이미 변경된 상환 기록이에요. 최신 내용을 불러올게요.';
+
+/** Never surfaces raw Postgres/PostgREST internals (mirrors remoteCardWrite.ts). */
+function describeWriteError(error: PostgrestError, fallback = GENERIC_ERROR): string {
+  const m = (error.message ?? '').toLowerCase();
+  if (m.includes('network') || m.includes('fetch') || m.includes('timeout')) {
+    return '네트워크 연결을 확인한 뒤 다시 시도해주세요.';
+  }
+  return fallback;
+}
+
+async function assertLiveUser(
+  expectedUserId: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  const liveUserId = sessionData.session?.user?.id ?? null;
+  if (!liveUserId) return { ok: false, message: RELOGIN };
+  if (liveUserId !== expectedUserId) return { ok: false, message: IDENTITY_CHANGED };
+  return { ok: true };
+}
+
+/** Does a loan row read back after a 23505 represent the SAME create, by the
+ *  SAME user, still active? A soft-deleted row is an id collision, never an
+ *  idempotent success — never revived (STEP 16-G2-D4 §5). */
+function isSameLoanCreate(
+  existing: Record<string, unknown>,
+  row: LoanInsertRow,
+  expectedUserId: string,
+): boolean {
+  return (
+    existing.deleted_at == null &&
+    existing.created_by === expectedUserId &&
+    existing.household_id === row.household_id &&
+    existing.name === row.name &&
+    existing.lender === row.lender &&
+    existing.principal === row.principal &&
+    existing.annual_rate === row.annual_rate &&
+    existing.term_months === row.term_months &&
+    existing.start_date === row.start_date &&
+    existing.payment_day === row.payment_day &&
+    existing.repay_type === row.repay_type
+  );
+}
+
+/** Does the stored loan already hold exactly what this edit would write? */
+function loanFieldsMatch(
+  existing: Record<string, unknown>,
+  row: ReturnType<typeof buildLoanUpdate>,
+): boolean {
+  return (
+    existing.name === row.name &&
+    existing.lender === row.lender &&
+    existing.principal === row.principal &&
+    existing.annual_rate === row.annual_rate &&
+    existing.term_months === row.term_months &&
+    existing.start_date === row.start_date &&
+    existing.payment_day === row.payment_day &&
+    existing.repay_type === row.repay_type
+  );
+}
+
+/* ================================================================== *
+ * CREATE
+ * ================================================================== */
+
+export async function createLoan(args: {
+  /** Client-generated `loan-...` id, stable across retries of ONE form mount. */
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  draft: NewLoanDraft;
+}): Promise<CreateLoanResult> {
+  if (!isValidLoanDraft(args.draft)) {
+    return { ok: false, reason: 'invalid', message: INVALID };
+  }
+  const live = await assertLiveUser(args.expectedUserId);
+  if (!live.ok) return { ok: false, reason: 'identity', message: live.message };
+
+  const row = buildLoanInsert(args.draft, { id: args.id, householdId: args.householdId });
+
+  const { data, error } = await supabase
+    .from('loans')
+    .insert(row) // `paid` omitted -> DB default 0; `created_by` set by trigger
+    .select('id')
+    .single();
+
+  if (!error && data?.id) return { ok: true, id: data.id as string };
+
+  if (error?.code === '23505') {
+    const { data: existing, error: readErr } = await supabase
+      .from('loans')
+      .select(
+        'id,household_id,created_by,name,lender,principal,annual_rate,term_months,start_date,payment_day,repay_type,deleted_at',
+      )
+      .eq('household_id', args.householdId)
+      .eq('id', args.id)
+      .maybeSingle();
+
+    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+    if (!existing) return { ok: false, reason: 'error', message: GENERIC_ERROR };
+    if (isSameLoanCreate(existing as Record<string, unknown>, row, args.expectedUserId)) {
+      return { ok: true, id: args.id };
+    }
+    return { ok: false, reason: 'conflict', message: GENERIC_ERROR };
+  }
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  return { ok: false, reason: 'error', message: GENERIC_ERROR };
+}
+
+/* ================================================================== *
+ * UPDATE (loan conditions — NEVER paid; refuses principal < current paid)
+ * ================================================================== */
+
+export async function updateLoan(args: {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  /** RAW PostgREST timestamptz string captured at form MOUNT — never re-parsed. */
+  expectedUpdatedAt: string;
+  draft: NewLoanDraft;
+}): Promise<UpdateLoanResult> {
+  if (!isValidLoanDraft(args.draft)) {
+    return { ok: false, reason: 'invalid', message: INVALID };
+  }
+  const live = await assertLiveUser(args.expectedUserId);
+  if (!live.ok) return { ok: false, reason: 'identity', message: live.message };
+
+  // Authoritative check (STEP 16-G2-D4 §6): the new principal may not drop
+  // below the amount already repaid. The DB `loans_paid_within_principal`
+  // CHECK is the final authority; this is the friendly early message.
+  const { data: current, error: curErr } = await supabase
+    .from('loans')
+    .select('paid, deleted_at')
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .maybeSingle();
+
+  if (curErr) return { ok: false, reason: 'error', message: describeWriteError(curErr) };
+  if (!current) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
+  const cur = current as Record<string, unknown>;
+  if (cur.deleted_at != null) return { ok: false, reason: 'deleted', message: EDIT_CONFLICT };
+  if (typeof cur.paid === 'number' && args.draft.principal < cur.paid) {
+    return { ok: false, reason: 'principal_low', message: PRINCIPAL_LOW };
+  }
+
+  const row = buildLoanUpdate(args.draft); // editable fields only — no paid, no identity
+
+  const { data, error } = await supabase
+    .from('loans')
+    .update(row)
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .eq('updated_at', args.expectedUpdatedAt)
+    .is('deleted_at', null)
+    .select('id, updated_at')
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
+
+  // 0 rows — reconcile against the authoritative row.
+  const { data: existing, error: readErr } = await supabase
+    .from('loans')
+    .select(
+      'name,lender,principal,annual_rate,term_months,start_date,payment_day,repay_type,deleted_at,updated_at',
+    )
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .maybeSingle();
+
+  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
+
+  const existingRow = existing as Record<string, unknown>;
+  if (existingRow.deleted_at != null) {
+    return { ok: false, reason: 'deleted', message: EDIT_CONFLICT };
+  }
+  if (loanFieldsMatch(existingRow, row)) {
+    // Our earlier edit already landed; the response was lost.
+    return { ok: true, updatedAt: existingRow.updated_at as string };
+  }
+  return { ok: false, reason: 'conflict', message: EDIT_CONFLICT };
+}
+
+/* ================================================================== *
+ * SOFT DELETE (loan_payments + transactions untouched)
+ * ================================================================== */
+
+export async function softDeleteLoan(args: {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  /** RAW PostgREST timestamptz string captured BEFORE the confirm Alert — never re-parsed. */
+  expectedUpdatedAt: string;
+}): Promise<SoftDeleteLoanResult> {
+  const live = await assertLiveUser(args.expectedUserId);
+  if (!live.ok) return { ok: false, reason: 'identity', message: live.message };
+
+  const { data, error } = await supabase
+    .from('loans')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .eq('updated_at', args.expectedUpdatedAt)
+    .is('deleted_at', null)
+    .select('id, deleted_at, updated_at')
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (data?.id) return { ok: true };
+
+  // 0 rows — reconcile.
+  const { data: existing, error: readErr } = await supabase
+    .from('loans')
+    .select('deleted_at, updated_at')
+    .eq('household_id', args.householdId)
+    .eq('id', args.id)
+    .maybeSingle();
+
+  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
+  if ((existing as Record<string, unknown>).deleted_at != null) {
+    // Already soft-deleted — our earlier delete landed, response was lost.
+    return { ok: true };
+  }
+  // Still active but our updated_at no longer matches — someone edited it first.
+  return { ok: false, reason: 'conflict', message: EDIT_CONFLICT };
+}
+
+/* ================================================================== *
+ * ADD PAYMENT (repayment) — loan_payments INSERT only
+ * ================================================================== */
+
+export async function addLoanPayment(args: {
+  /** Client-generated `lp-...` id, STABLE across every save retry of one sheet. */
+  paymentId: string;
+  householdId: string;
+  loanId: string;
+  expectedUserId: string;
+  draft: NewLoanPaymentDraft;
+}): Promise<AddLoanPaymentResult> {
+  if (!isValidLoanPaymentDraft(args.draft)) {
+    return { ok: false, reason: 'invalid', message: INVALID_PAYMENT };
+  }
+  const live = await assertLiveUser(args.expectedUserId);
+  if (!live.ok) return { ok: false, reason: 'identity', message: live.message };
+
+  // Authoritative precheck (STEP 16-G2-D4 §8-2). `remaining` AND the
+  // `annual_rate` used by splitPayment come from THIS re-SELECT, never the
+  // UI/domain value.
+  const { data: loan, error: loanErr } = await supabase
+    .from('loans')
+    .select('id, principal, paid, annual_rate, deleted_at')
+    .eq('household_id', args.householdId)
+    .eq('id', args.loanId)
+    .maybeSingle();
+
+  if (loanErr) return { ok: false, reason: 'error', message: describeWriteError(loanErr, PAYMENT_ERROR) };
+  if (!loan) return { ok: false, reason: 'gone', message: LOAN_GONE };
+  const lr = loan as Record<string, unknown>;
+  if (lr.deleted_at != null) return { ok: false, reason: 'deleted', message: LOAN_GONE };
+
+  const principal = typeof lr.principal === 'number' ? lr.principal : 0;
+  const paid = typeof lr.paid === 'number' ? lr.paid : 0;
+  const annualRate = typeof lr.annual_rate === 'number' ? lr.annual_rate : 0;
+  const remaining = principal - paid;
+  if (remaining <= 0) {
+    return { ok: false, reason: 'paid_off', message: PAID_OFF };
+  }
+
+  const row = buildLoanPaymentInsert(args.draft, {
+    id: args.paymentId,
+    householdId: args.householdId,
+    loanId: args.loanId,
+    remaining,
+    annualRate,
+  });
+
+  const { data, error } = await supabase
+    .from('loan_payments')
+    .insert(row) // `created_by` set by trigger; `trg_apply_loan_payment` moves loans.paid
+    .select('id')
+    .single();
+
+  if (!error && data?.id) return { ok: true };
+
+  // `loans_paid_within_principal (paid <= principal)` CHECK aborted the
+  // whole statement. This is NOT necessarily "user typed too much" — a
+  // concurrent repayment on another device may have raised `paid` after our
+  // precheck. Ask for a refresh (STEP 16-G2-D4 §8-6).
+  if (error?.code === '23514') {
+    return { ok: false, reason: 'stale', message: PAYMENT_STALE };
+  }
+
+  // Parent loan vanished in the precheck->insert window (impossible via a
+  // normal client path — no hard delete — but the composite FK raises 23503).
+  if (error?.code === '23503') {
+    return { ok: false, reason: 'gone', message: LOAN_GONE };
+  }
+
+  // Same payment id already exists — a lost-response retry. NEVER retry with
+  // a fresh id (the trigger would move `paid` twice). Verify it is OUR
+  // payment before reporting idempotent success.
+  if (error?.code === '23505') {
+    const { data: existing, error: readErr } = await supabase
+      .from('loan_payments')
+      .select('id,household_id,loan_id,created_by,date,amount,principal_part,interest_part,deleted_at')
+      .eq('id', args.paymentId)
+      .maybeSingle();
+
+    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr, PAYMENT_ERROR) };
+    if (!existing) return { ok: false, reason: 'error', message: PAYMENT_ERROR };
+    const ex = existing as Record<string, unknown>;
+    if (
+      ex.deleted_at == null &&
+      ex.household_id === args.householdId &&
+      ex.loan_id === args.loanId &&
+      ex.created_by === args.expectedUserId &&
+      ex.date === row.date &&
+      ex.amount === row.amount &&
+      ex.principal_part === row.principal_part &&
+      ex.interest_part === row.interest_part
+    ) {
+      // Our earlier payment already landed and was already applied.
+      return { ok: true };
+    }
+    return { ok: false, reason: 'conflict', message: PAYMENT_ERROR };
+  }
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error, PAYMENT_ERROR) };
+  return { ok: false, reason: 'error', message: PAYMENT_ERROR };
+}
+
+/* ================================================================== *
+ * SOFT DELETE PAYMENT — loan_payments deleted_at UPDATE only
+ * ================================================================== */
+
+export async function softDeleteLoanPayment(args: {
+  paymentId: string;
+  householdId: string;
+  expectedUserId: string;
+  /** RAW PostgREST timestamptz string captured BEFORE the confirm Alert — never re-parsed. */
+  expectedUpdatedAt: string;
+}): Promise<SoftDeleteLoanPaymentResult> {
+  const live = await assertLiveUser(args.expectedUserId);
+  if (!live.ok) return { ok: false, reason: 'identity', message: live.message };
+
+  const { data, error } = await supabase
+    .from('loan_payments')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('household_id', args.householdId)
+    .eq('id', args.paymentId)
+    .eq('updated_at', args.expectedUpdatedAt)
+    .is('deleted_at', null)
+    .select('id, deleted_at, updated_at')
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: 'error', message: describeWriteError(error, PAYMENT_ERROR) };
+  if (data?.id) return { ok: true }; // trigger reversed loans.paid by old.principal_part
+
+  // 0 rows — reconcile.
+  const { data: existing, error: readErr } = await supabase
+    .from('loan_payments')
+    .select('deleted_at, updated_at')
+    .eq('household_id', args.householdId)
+    .eq('id', args.paymentId)
+    .maybeSingle();
+
+  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr, PAYMENT_ERROR) };
+  if (!existing) return { ok: false, reason: 'gone', message: PAYMENT_DELETE_CONFLICT };
+  if ((existing as Record<string, unknown>).deleted_at != null) {
+    // Already soft-deleted — our earlier delete landed, response was lost.
+    return { ok: true };
+  }
+  return { ok: false, reason: 'conflict', message: PAYMENT_DELETE_CONFLICT };
+}
