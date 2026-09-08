@@ -61,6 +61,18 @@ function GoalMovementFormRoute({ goalId, mode }: { goalId: string; mode: GoalMov
   const { status, error, goals, refresh } = useFinanceRead();
   const title = mode === 'deposit' ? '저축하기' : '인출하기';
 
+  // STEP 16-G3-B2 §17-21: once the parent goal has resolved, FREEZE it for
+  // this movement session. A later Realtime / foreground refresh that drops
+  // the goal (the other member deleted it) must NOT unmount the form and
+  // lose the typed amount — addGoalMovement()'s INSERT then fails its
+  // composite FK / reconcile and the user sees that outcome.
+  const frozenGoalRef = useRef<Goal | null>(null);
+  const liveGoal = goals.find((g) => g.id === goalId) ?? null;
+  if (!frozenGoalRef.current && liveGoal) frozenGoalRef.current = liveGoal;
+  if (frozenGoalRef.current) {
+    return <GoalMovementForm key={`${goalId}-${mode}`} goal={frozenGoalRef.current} mode={mode} />;
+  }
+
   if (status !== 'ready') {
     return (
       <ModalScreen title={title} onClose={() => router.back()} scroll={false}>
@@ -69,44 +81,40 @@ function GoalMovementFormRoute({ goalId, mode }: { goalId: string; mode: GoalMov
     );
   }
 
-  const goal = goals.find((g) => g.id === goalId) ?? null;
-  if (!goal) {
-    return (
-      <ModalScreen title={title} onClose={() => router.back()} scroll={false}>
-        <View
+  // Never resolved for this session — the goal genuinely isn't here.
+  return (
+    <ModalScreen title={title} onClose={() => router.back()} scroll={false}>
+      <View
+        style={{
+          flex: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          paddingHorizontal: spacing.xl,
+          gap: spacing.md,
+        }}
+      >
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+          저축 목표를 찾을 수 없어요
+        </Text>
+        <Text
           style={{
-            flex: 1,
-            alignItems: 'center',
-            justifyContent: 'center',
-            paddingHorizontal: spacing.xl,
-            gap: spacing.md,
+            fontFamily: fontFamily.regular,
+            fontSize: 13,
+            color: colors.textSub,
+            textAlign: 'center',
+            lineHeight: 19,
           }}
         >
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
-            저축 목표를 찾을 수 없어요
+          이미 삭제됐거나 다른 우리집의 목표일 수 있어요.
+        </Text>
+        <Pressable onPress={() => router.back()} hitSlop={8}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+            목록으로 돌아가기
           </Text>
-          <Text
-            style={{
-              fontFamily: fontFamily.regular,
-              fontSize: 13,
-              color: colors.textSub,
-              textAlign: 'center',
-              lineHeight: 19,
-            }}
-          >
-            이미 삭제됐거나 다른 우리집의 목표일 수 있어요.
-          </Text>
-          <Pressable onPress={() => router.back()} hitSlop={8}>
-            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
-              목록으로 돌아가기
-            </Text>
-          </Pressable>
-        </View>
-      </ModalScreen>
-    );
-  }
-
-  return <GoalMovementForm key={`${goalId}-${mode}`} goal={goal} mode={mode} />;
+        </Pressable>
+      </View>
+    </ModalScreen>
+  );
 }
 
 function GoalMovementForm({ goal, mode }: { goal: Goal; mode: GoalMovementMode }) {

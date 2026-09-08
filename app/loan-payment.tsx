@@ -55,6 +55,18 @@ function LoanPaymentFormRoute({ loanId }: { loanId: string }) {
   const router = useRouter();
   const { status, error, loans, refresh } = useFinanceRead();
 
+  // STEP 16-G3-B2 §17-21: once the parent loan has resolved, FREEZE it for
+  // this payment session. A later Realtime / foreground refresh that drops
+  // the loan (the other member deleted it) must NOT unmount the form and
+  // lose the typed amount — addLoanPayment()'s authoritative re-SELECT /
+  // INSERT then fails and the user sees that outcome.
+  const frozenLoanRef = useRef<Loan | null>(null);
+  const liveLoan = loans.find((l) => l.id === loanId) ?? null;
+  if (!frozenLoanRef.current && liveLoan) frozenLoanRef.current = liveLoan;
+  if (frozenLoanRef.current) {
+    return <LoanPaymentForm key={loanId} loan={frozenLoanRef.current} />;
+  }
+
   if (status !== 'ready') {
     return (
       <ModalScreen title="상환하기" onClose={() => router.back()} scroll={false}>
@@ -63,44 +75,40 @@ function LoanPaymentFormRoute({ loanId }: { loanId: string }) {
     );
   }
 
-  const loan = loans.find((l) => l.id === loanId) ?? null;
-  if (!loan) {
-    return (
-      <ModalScreen title="상환하기" onClose={() => router.back()} scroll={false}>
-        <View
+  // Never resolved for this session — the loan genuinely isn't here.
+  return (
+    <ModalScreen title="상환하기" onClose={() => router.back()} scroll={false}>
+      <View
+        style={{
+          flex: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          paddingHorizontal: spacing.xl,
+          gap: spacing.md,
+        }}
+      >
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+          대출을 찾을 수 없어요
+        </Text>
+        <Text
           style={{
-            flex: 1,
-            alignItems: 'center',
-            justifyContent: 'center',
-            paddingHorizontal: spacing.xl,
-            gap: spacing.md,
+            fontFamily: fontFamily.regular,
+            fontSize: 13,
+            color: colors.textSub,
+            textAlign: 'center',
+            lineHeight: 19,
           }}
         >
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
-            대출을 찾을 수 없어요
+          이미 삭제됐거나 다른 우리집의 대출일 수 있어요.
+        </Text>
+        <Pressable onPress={() => router.back()} hitSlop={8}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+            목록으로 돌아가기
           </Text>
-          <Text
-            style={{
-              fontFamily: fontFamily.regular,
-              fontSize: 13,
-              color: colors.textSub,
-              textAlign: 'center',
-              lineHeight: 19,
-            }}
-          >
-            이미 삭제됐거나 다른 우리집의 대출일 수 있어요.
-          </Text>
-          <Pressable onPress={() => router.back()} hitSlop={8}>
-            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
-              목록으로 돌아가기
-            </Text>
-          </Pressable>
-        </View>
-      </ModalScreen>
-    );
-  }
-
-  return <LoanPaymentForm key={loanId} loan={loan} />;
+        </Pressable>
+      </View>
+    </ModalScreen>
+  );
 }
 
 function LoanPaymentForm({ loan }: { loan: Loan }) {

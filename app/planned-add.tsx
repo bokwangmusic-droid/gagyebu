@@ -66,6 +66,25 @@ function PlannedFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
   const { status, error, planned, plannedMeta, refresh } = useFinanceRead();
 
+  // STEP 16-G3-B2 §17-21: freeze the first resolved row + token for the
+  // edit session so a later Realtime / foreground refresh that drops the
+  // row can't unmount the open form and lose the draft — the save's
+  // optimistic-concurrency check decides deleted / gone / conflict.
+  const frozenRef = useRef<{ planned: PlannedExpense; meta: RemotePlannedMeta } | null>(null);
+  const liveTarget = planned.find((p) => p.id === editId) ?? null;
+  const liveMeta = plannedMeta[editId] ?? null;
+  if (!frozenRef.current && liveTarget && liveMeta) {
+    frozenRef.current = { planned: liveTarget, meta: liveMeta };
+  }
+  if (frozenRef.current) {
+    return (
+      <PlannedForm
+        key={editId}
+        mode={{ kind: 'edit', planned: frozenRef.current.planned, meta: frozenRef.current.meta }}
+      />
+    );
+  }
+
   if (status !== 'ready') {
     return (
       <ModalScreen title="예정 지출 수정" onClose={() => router.back()} scroll={false}>
@@ -73,11 +92,7 @@ function PlannedFormRoute({ editId }: { editId: string }) {
       </ModalScreen>
     );
   }
-
-  const target = planned.find((p) => p.id === editId) ?? null;
-  const meta = plannedMeta[editId] ?? null;
-
-  if (!target) {
+  if (!liveTarget) {
     return (
       <EditUnavailable
         body="이미 삭제됐거나 다른 우리집의 예정 지출일 수 있어요."
@@ -85,14 +100,8 @@ function PlannedFormRoute({ editId }: { editId: string }) {
       />
     );
   }
-  if (!meta) {
-    // No concurrency token -> a safe edit is impossible. Never open the form.
-    return (
-      <EditUnavailable body="잠시 후 다시 시도해 주세요." onRetry={() => void refresh()} />
-    );
-  }
-
-  return <PlannedForm key={editId} mode={{ kind: 'edit', planned: target, meta }} />;
+  // liveTarget but no meta -> a safe concurrency-guarded edit is impossible.
+  return <EditUnavailable body="잠시 후 다시 시도해 주세요." onRetry={() => void refresh()} />;
 }
 
 function EditUnavailable({ body, onRetry }: { body: string; onRetry: () => void }) {

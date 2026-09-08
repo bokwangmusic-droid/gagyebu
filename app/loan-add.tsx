@@ -96,6 +96,25 @@ function LoanFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
   const { status, error, loans, loanMeta, refresh } = useFinanceRead();
 
+  // STEP 16-G3-B2 §17-21: freeze the first resolved loan + token for the
+  // edit session so a later Realtime / foreground refresh that drops the
+  // row can't unmount the open form and lose the draft — the save's
+  // optimistic-concurrency check decides deleted / gone / conflict.
+  const frozenRef = useRef<{ loan: Loan; meta: RemoteLoanMeta } | null>(null);
+  const liveTarget = loans.find((l) => l.id === editId) ?? null;
+  const liveMeta = loanMeta[editId] ?? null;
+  if (!frozenRef.current && liveTarget && liveMeta) {
+    frozenRef.current = { loan: liveTarget, meta: liveMeta };
+  }
+  if (frozenRef.current) {
+    return (
+      <LoanForm
+        key={editId}
+        mode={{ kind: 'edit', loan: frozenRef.current.loan, meta: frozenRef.current.meta }}
+      />
+    );
+  }
+
   if (status !== 'ready') {
     return (
       <ModalScreen title="대출 수정" onClose={() => router.back()} scroll={false}>
@@ -103,11 +122,7 @@ function LoanFormRoute({ editId }: { editId: string }) {
       </ModalScreen>
     );
   }
-
-  const target = loans.find((l) => l.id === editId) ?? null;
-  const meta = loanMeta[editId] ?? null;
-
-  if (!target) {
+  if (!liveTarget) {
     return (
       <EditUnavailable
         body="이미 삭제됐거나 다른 우리집의 대출일 수 있어요."
@@ -115,11 +130,8 @@ function LoanFormRoute({ editId }: { editId: string }) {
       />
     );
   }
-  if (!meta) {
-    return <EditUnavailable body="잠시 후 다시 시도해 주세요." onRetry={() => void refresh()} />;
-  }
-
-  return <LoanForm key={editId} mode={{ kind: 'edit', loan: target, meta }} />;
+  // liveTarget but no meta -> a safe concurrency-guarded edit is impossible.
+  return <EditUnavailable body="잠시 후 다시 시도해 주세요." onRetry={() => void refresh()} />;
 }
 
 function EditUnavailable({ body, onRetry }: { body: string; onRetry: () => void }) {

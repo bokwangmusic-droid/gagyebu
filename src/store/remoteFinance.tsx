@@ -27,7 +27,15 @@
  * This provider only supplies its `fetchSnapshot` (the existing SELECT
  * layer) and `commit` (the existing setState), plus one AppState
  * background->foreground authoritative refresh through the SAME scheduler.
- * No realtime, no polling — that is STEP 16-G3-B2.
+ *
+ * STEP 16-G3-B2: household finance Realtime is wired here too. A
+ * `postgres_changes` event on any finance table is a debounced invalidation
+ * SIGNAL only — it calls `scheduler.request()` (never patches state from a
+ * payload). Channel transport/lifecycle lives in
+ * src/services/remoteFinanceRealtime.ts; this provider just binds it to the
+ * `${userId}:${householdId}` scope and guards against a torn-down channel's
+ * late callback. Realtime payloads are NEVER the source of truth — the next
+ * authoritative snapshot always is.
  */
 import {
   createContext,
@@ -50,6 +58,7 @@ import {
   type RefreshScheduler,
 } from '@/lib/remoteFinanceRefreshScheduler';
 import { fetchHouseholdFinanceSnapshot } from '@/services/remoteFinance';
+import { subscribeHouseholdFinance } from '@/services/remoteFinanceRealtime';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 
@@ -193,6 +202,38 @@ export function RemoteFinanceProvider({ children }: { children: ReactNode }) {
       }
     });
     return () => sub.remove();
+  }, [userId, householdId]);
+
+  // STEP 16-G3-B2: household finance Realtime. One channel per
+  // `${userId}:${householdId}`; every finance-table INSERT/UPDATE is a
+  // debounced invalidation that goes through the SAME B1 scheduler. Torn
+  // down (removeChannel + debounce cancel) on account/household switch,
+  // sign-out and unmount — deps are exactly `[userId, householdId]`.
+  const realtimeScopeKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!userId || !householdId) {
+      realtimeScopeKeyRef.current = null;
+      return;
+    }
+    const scopeKey = `${userId}:${householdId}`;
+    realtimeScopeKeyRef.current = scopeKey;
+    const sub = subscribeHouseholdFinance({
+      userId,
+      householdId,
+      onInvalidate: () => {
+        // Stale-channel guard (STEP 16-G3-B2 §13): a late flush from a
+        // channel that has since been torn down must not refresh the new
+        // scope. (The B1 scheduler's own scope/generation guard is a third
+        // layer on top of this and `subscribeHouseholdFinance`'s own
+        // `disposed` flag.)
+        if (realtimeScopeKeyRef.current !== scopeKey) return;
+        void schedulerRef.current?.request();
+      },
+    });
+    return () => {
+      realtimeScopeKeyRef.current = null;
+      sub.unsubscribe();
+    };
   }, [userId, householdId]);
 
   const refreshRemoteFinance = useCallback(async () => {

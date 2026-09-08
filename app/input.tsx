@@ -157,10 +157,32 @@ function TransactionFormRoute({ editId }: { editId: string | null }) {
   const router = useRouter();
   const { status, error, transactions, transactionMeta, refresh } = useFinanceRead();
 
+  // STEP 16-G3-B2 §17-21: freeze the first resolved transaction + token for
+  // the edit session. A later Realtime / foreground refresh that drops the
+  // row (the other member soft-deleted it) must NOT unmount the open form
+  // and lose the user's draft — the save's own optimistic-concurrency check
+  // (0-row reselect -> deleted / gone / conflict) decides the outcome.
+  const frozenRef = useRef<{ transaction: Transaction; meta: RemoteTransactionMeta } | null>(null);
+
   if (editId == null) {
     return <TransactionForm key="create" mode={{ kind: 'create' }} />;
   }
 
+  const liveTxn = transactions.find((t) => t.id === editId) ?? null;
+  const liveMeta = transactionMeta[editId] ?? null;
+  if (!frozenRef.current && liveTxn && liveMeta) {
+    frozenRef.current = { transaction: liveTxn, meta: liveMeta };
+  }
+  if (frozenRef.current) {
+    return (
+      <TransactionForm
+        key={editId}
+        mode={{ kind: 'edit', transaction: frozenRef.current.transaction, meta: frozenRef.current.meta }}
+      />
+    );
+  }
+
+  // Never resolved for this session -> the ORIGINAL loading / not-found flow.
   if (status !== 'ready') {
     return (
       <ModalScreen title="거래 수정" onClose={() => router.back()} scroll={false}>
@@ -168,11 +190,7 @@ function TransactionFormRoute({ editId }: { editId: string | null }) {
       </ModalScreen>
     );
   }
-
-  const transaction = transactions.find((t) => t.id === editId) ?? null;
-  const meta = transactionMeta[editId] ?? null;
-
-  if (!transaction) {
+  if (!liveTxn) {
     return (
       <EditUnavailable
         body="이미 삭제됐거나 다른 우리집의 거래일 수 있어요."
@@ -181,18 +199,15 @@ function TransactionFormRoute({ editId }: { editId: string | null }) {
       />
     );
   }
-  if (!meta) {
-    // No concurrency token -> a safe edit is impossible. Never open the form.
-    return (
-      <EditUnavailable
-        body="잠시 후 다시 시도해 주세요."
-        title="거래 정보를 불러오지 못했어요"
-        onRetry={() => void refresh()}
-      />
-    );
-  }
-
-  return <TransactionForm key={editId} mode={{ kind: 'edit', transaction, meta }} />;
+  // liveTxn exists but no meta -> a safe concurrency-guarded edit is
+  // impossible; never open the form.
+  return (
+    <EditUnavailable
+      body="잠시 후 다시 시도해 주세요."
+      title="거래 정보를 불러오지 못했어요"
+      onRetry={() => void refresh()}
+    />
+  );
 }
 
 function EditUnavailable({

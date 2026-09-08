@@ -76,6 +76,28 @@ function CardFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
   const { status, error, cards, cardMeta, refresh } = useFinanceRead();
 
+  // STEP 16-G3-B2 §17-21: once this edit session has resolved to a real
+  // card + concurrency token, FREEZE that snapshot. A later Realtime /
+  // foreground refresh that drops the row (the other member soft-deleted
+  // it) must NOT yank the open form and lose the user's in-progress draft —
+  // the save's own optimistic-concurrency check (0-row reselect ->
+  // deleted / gone / conflict) is what decides the outcome.
+  const frozenRef = useRef<{ card: CreditCard; meta: RemoteCardMeta } | null>(null);
+  const liveCard = cards.find((c) => c.id === editId) ?? null;
+  const liveMeta = cardMeta[editId] ?? null;
+  if (!frozenRef.current && liveCard && liveMeta) {
+    frozenRef.current = { card: liveCard, meta: liveMeta };
+  }
+  if (frozenRef.current) {
+    return (
+      <CardForm
+        key={editId}
+        mode={{ kind: 'edit', card: frozenRef.current.card, meta: frozenRef.current.meta }}
+      />
+    );
+  }
+
+  // Never resolved for this session -> the ORIGINAL loading / not-found flow.
   if (status !== 'ready') {
     return (
       <ModalScreen title="카드 수정" onClose={() => router.back()} scroll={false}>
@@ -83,11 +105,7 @@ function CardFormRoute({ editId }: { editId: string }) {
       </ModalScreen>
     );
   }
-
-  const card = cards.find((c) => c.id === editId) ?? null;
-  const meta = cardMeta[editId] ?? null;
-
-  if (!card) {
+  if (!liveCard) {
     return (
       <EditUnavailable
         title="카드를 찾을 수 없어요"
@@ -96,18 +114,15 @@ function CardFormRoute({ editId }: { editId: string }) {
       />
     );
   }
-  if (!meta) {
-    // No concurrency token -> a safe edit is impossible. Never open the form.
-    return (
-      <EditUnavailable
-        title="카드 정보를 불러오지 못했어요"
-        body="잠시 후 다시 시도해 주세요."
-        onRetry={() => void refresh()}
-      />
-    );
-  }
-
-  return <CardForm key={editId} mode={{ kind: 'edit', card, meta }} />;
+  // liveCard exists but no meta -> a safe concurrency-guarded write is
+  // impossible; never open the form.
+  return (
+    <EditUnavailable
+      title="카드 정보를 불러오지 못했어요"
+      body="잠시 후 다시 시도해 주세요."
+      onRetry={() => void refresh()}
+    />
+  );
 }
 
 function EditUnavailable({
