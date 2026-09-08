@@ -19,6 +19,15 @@
  * is intentionally read-only; see src/services/remoteFinance.ts for the
  * SELECT-only fetch layer and src/lib/remoteFinanceMapping.ts for the
  * remote -> local-domain-type transform this wraps in React state.
+ *
+ * STEP 16-G3-B1: refresh sequencing (single-flight per scope, monotonic
+ * generation so an old same-scope response can't overwrite a newer one,
+ * dirty-trailing coalescing, stale-scope discard) is delegated to the pure
+ * `createRefreshScheduler` state machine (src/lib/remoteFinanceRefreshScheduler.ts).
+ * This provider only supplies its `fetchSnapshot` (the existing SELECT
+ * layer) and `commit` (the existing setState), plus one AppState
+ * background->foreground authoritative refresh through the SAME scheduler.
+ * No realtime, no polling — that is STEP 16-G3-B2.
  */
 import {
   createContext,
@@ -30,11 +39,16 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
 
 import {
   mapRemoteFinanceToReadModel,
   type RemoteFinanceData,
 } from '@/lib/remoteFinanceMapping';
+import {
+  createRefreshScheduler,
+  type RefreshScheduler,
+} from '@/lib/remoteFinanceRefreshScheduler';
 import { fetchHouseholdFinanceSnapshot } from '@/services/remoteFinance';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
@@ -81,51 +95,64 @@ export function RemoteFinanceProvider({ children }: { children: ReactNode }) {
   const [loadedForUserId, setLoadedForUserId] = useState<string | null>(null);
 
   const mountedRef = useRef(true);
-  // Imperative-only bookkeeping (STEP 16-E's `latestUserIdRef` pattern):
-  // identifies which (user, household) pair the in-flight fetch was
-  // issued for. A response is applied ONLY if this still matches when it
-  // resolves — if the user switches household (or account) while a fetch
-  // for the PREVIOUS one is still in flight, that late response is simply
-  // dropped instead of being shown under the new household (STEP 16-G1A
-  // §4's "A household fetch 도중 B household로 바뀌면 A 응답을 무시").
-  const requestKeyRef = useRef<string | null>(null);
+  // The `${userId}:${householdId}` a successful commit was last applied for.
+  // Distinguishes an INITIAL load (no snapshot on screen yet -> a failure
+  // must surface as an error state) from a BACKGROUND refresh (a snapshot is
+  // already on screen -> a failure keeps it, silently; the next write /
+  // foreground retries). Reset synchronously whenever the scope changes.
+  const lastGoodScopeKeyRef = useRef<string | null>(null);
 
-  const runFetch = useCallback(async (forHouseholdId: string, forUserId: string) => {
-    const key = `${forUserId}:${forHouseholdId}`;
-    requestKeyRef.current = key;
-    setLoading(true);
-    setError(null);
-
-    const result = await fetchHouseholdFinanceSnapshot(forHouseholdId);
-
-    if (!mountedRef.current) return;
-    if (requestKeyRef.current !== key) return; // stale — household/user moved on
-
-    if (!result.ok) {
-      setError(result.message);
-      setData(null);
-      setLoading(false);
-      // loadedForHouseholdId/loadedForUserId intentionally left untouched:
-      // this fetch did not produce confirmed data for this (user,
-      // household) pair (STEP 16-G1A §8 — partial/failed fetches are
-      // never presented as ready).
-      return;
-    }
-
-    setData(mapRemoteFinanceToReadModel(result.raw));
-    // Always set together, in the same update — STEP 16-G1A-HARDEN §1.
-    setLoadedForHouseholdId(forHouseholdId);
-    setLoadedForUserId(forUserId);
-    setLoading(false);
+  // STEP 16-G3-B1: the refresh state machine. Created once per provider
+  // instance in an effect (so a dev/StrictMode remount gets a fresh, not a
+  // permanently-disposed, one) and disposed on real unmount.
+  const schedulerRef = useRef<RefreshScheduler | null>(null);
+  useEffect(() => {
+    const scheduler = createRefreshScheduler<RemoteFinanceData>({
+      fetchSnapshot: async (scope) => {
+        const res = await fetchHouseholdFinanceSnapshot(scope.householdId);
+        return res.ok
+          ? { ok: true, data: mapRemoteFinanceToReadModel(res.raw) }
+          : { ok: false, message: res.message };
+      },
+      commit: (scope, outcome) => {
+        if (!mountedRef.current) return;
+        const scopeKey = `${scope.userId}:${scope.householdId}`;
+        setLoading(false);
+        if (outcome.ok) {
+          // Atomic swap — never a `setData(null)` blink for a same-scope
+          // background refresh (STEP 16-G3-B1 §8). Always set together
+          // (STEP 16-G1A-HARDEN §1).
+          setData(outcome.data);
+          setLoadedForHouseholdId(scope.householdId);
+          setLoadedForUserId(scope.userId);
+          setError(null);
+          lastGoodScopeKeyRef.current = scopeKey;
+          return;
+        }
+        // A background refresh of a scope whose snapshot is already on
+        // screen must NOT blank it to an error state — keep the last good
+        // snapshot; the next write / foreground refresh retries (§9).
+        if (lastGoodScopeKeyRef.current === scopeKey) return;
+        // Initial load failed: surface it (STEP 16-G1A §8).
+        setError(outcome.message);
+        setData(null);
+      },
+    });
+    schedulerRef.current = scheduler;
+    return () => {
+      scheduler.dispose();
+      schedulerRef.current = null;
+    };
   }, []);
 
-  // Household/account switch: invalidate immediately, then fetch fresh.
-  // Runs on sign-out too (userId becomes null), clearing everything.
+  // Household/account switch: reset the visible state to "initial load",
+  // then point the scheduler at the new scope (it starts the initial fetch
+  // itself). A late response for the OLD scope is discarded inside the
+  // scheduler and never reaches `commit`. Runs on sign-out too (userId ->
+  // null), clearing everything.
   useEffect(() => {
     mountedRef.current = true;
-    // Step 1 (STEP 16-G1A §4): stop trusting whatever the previous
-    // household's data was, synchronously, before any new fetch starts.
-    requestKeyRef.current = null;
+    lastGoodScopeKeyRef.current = null;
     setData(null);
     setLoadedForHouseholdId(null);
     setLoadedForUserId(null);
@@ -133,22 +160,48 @@ export function RemoteFinanceProvider({ children }: { children: ReactNode }) {
 
     if (!householdId || !userId) {
       setLoading(false);
-      return;
+      schedulerRef.current?.setScope(null);
+      return () => {
+        mountedRef.current = false;
+      };
     }
 
-    void runFetch(householdId, userId);
+    setLoading(true);
+    schedulerRef.current?.setScope({ userId, householdId });
     return () => {
       mountedRef.current = false;
     };
-  }, [householdId, userId, runFetch]);
+  }, [householdId, userId]);
+
+  // STEP 16-G3-B1 §10: background/inactive -> active. One authoritative
+  // refresh of the current scope, through the SAME scheduler (no separate
+  // fetch path). A cold start is already 'active', and the initial mount
+  // fires no 'change' event, so only a genuine return-from-background
+  // transition triggers this.
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      const prev = appStateRef.current;
+      appStateRef.current = next;
+      if (
+        next === 'active' &&
+        (prev === 'background' || prev === 'inactive') &&
+        userId &&
+        householdId
+      ) {
+        void schedulerRef.current?.request();
+      }
+    });
+    return () => sub.remove();
+  }, [userId, householdId]);
 
   const refreshRemoteFinance = useCallback(async () => {
-    if (!householdId || !userId) return;
-    await runFetch(householdId, userId);
-  }, [householdId, userId, runFetch]);
+    await schedulerRef.current?.request();
+  }, []);
 
   const clearRemoteFinance = useCallback(() => {
-    requestKeyRef.current = null;
+    lastGoodScopeKeyRef.current = null;
+    schedulerRef.current?.setScope(null);
     setData(null);
     setLoadedForHouseholdId(null);
     setLoadedForUserId(null);
