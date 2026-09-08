@@ -135,6 +135,24 @@ export interface RemotePlannedMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one RECURRING RULE — STEP 16-G2-D2.
+ *
+ * Keyed by the recurring-rule id, parallel to `RemoteFinanceData.recurring`.
+ * Only ACTIVE (non-soft-deleted) rules appear here (the SELECT filters
+ * `deleted_at IS NULL`; a soft-deleted rule has no entry — note this is
+ * unrelated to the rule's own `active` on/off flag). `updatedAt` is the
+ * opaque optimistic-concurrency token for recurring edit / active-toggle /
+ * soft-delete — the RAW PostgREST string, never re-serialised. `createdBy`
+ * is author bookkeeping only (the 23505 idempotency check on CREATE). The
+ * `RecurringRule` domain type stays free of this metadata, and `last_run`
+ * is never written by any client path in this STEP.
+ */
+export interface RemoteRecurringMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -152,6 +170,8 @@ export interface RemoteFinanceData {
   /** custom category id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-C4-B. */
   categoryMeta: Record<string, RemoteCategoryMeta>;
   recurring: RecurringRule[];
+  /** recurring-rule id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D2. */
+  recurringMeta: Record<string, RemoteRecurringMeta>;
   planned: PlannedExpense[];
   /** planned-expense id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D1. */
   plannedMeta: Record<string, RemotePlannedMeta>;
@@ -307,6 +327,13 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     lastRun: r.last_run ?? undefined,
   }));
 
+  // Parallel to `recurring`, keyed by id. `updatedAt` stored verbatim — an
+  // opaque concurrency token, never formatted/re-parsed (STEP 16-G2-D2).
+  const recurringMeta: Record<string, RemoteRecurringMeta> = {};
+  for (const r of raw.recurringRules) {
+    recurringMeta[r.id] = { updatedAt: r.updated_at, createdBy: r.created_by };
+  }
+
   const planned: PlannedExpense[] = raw.plannedExpenses.map((p) => ({
     id: p.id,
     name: p.name,
@@ -359,6 +386,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     budgetMeta,
     categoryMeta,
     recurring,
+    recurringMeta,
     planned,
     plannedMeta,
     goals,

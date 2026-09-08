@@ -1,5 +1,15 @@
-import { useEffect, useState, type ReactNode } from 'react';
-import { Keyboard, Platform, Pressable, ScrollView, Text, View } from 'react-native';
+import { useEffect, useState, type ReactNode, type Ref } from 'react';
+import {
+  Keyboard,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+  type LayoutChangeEvent,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppIcon } from '@/components/AppIcon';
@@ -17,6 +27,25 @@ interface ModalScreenProps {
   scroll?: boolean;
   /** Pinned below the scroll body, above the safe area (e.g. a custom keypad). */
   footer?: ReactNode;
+  /**
+   * Optional ref to the internal scroll body. Lets a screen with a custom
+   * (non-OS-keyboard) input — e.g. the app's NumPad — programmatically
+   * scroll a lower field into view when its pad opens. No effect unless
+   * `scroll` is true. Purely additive: omitting it changes nothing.
+   */
+  scrollRef?: Ref<ScrollView>;
+  /**
+   * Optional passthrough of the internal scroll body's `onLayout` — a
+   * screen uses this to learn the CURRENT viewport height (it shrinks when
+   * `footer` opens). Purely additive; omitting it changes nothing.
+   */
+  onScrollViewLayout?: (e: LayoutChangeEvent) => void;
+  /**
+   * Optional passthrough of the internal scroll body's `onScroll` — a
+   * screen uses this to track the current scroll offset. Wires
+   * `scrollEventThrottle` only when provided. Purely additive.
+   */
+  onScrollViewScroll?: (e: NativeSyntheticEvent<NativeScrollEvent>) => void;
 }
 
 /**
@@ -32,6 +61,9 @@ export function ModalScreen({
   children,
   scroll = true,
   footer,
+  scrollRef,
+  onScrollViewLayout,
+  onScrollViewScroll,
 }: ModalScreenProps) {
   const insets = useSafeAreaInsets();
   const [kb, setKb] = useState(0);
@@ -85,6 +117,10 @@ export function ModalScreen({
 
       {scroll ? (
         <ScrollView
+          ref={scrollRef}
+          onLayout={onScrollViewLayout}
+          onScroll={onScrollViewScroll}
+          scrollEventThrottle={onScrollViewScroll ? 16 : undefined}
           style={{ flex: 1, marginBottom: kb }}
           contentContainerStyle={{ paddingBottom: insets.bottom + 32 + (kb > 0 ? 24 : 0) }}
           showsVerticalScrollIndicator={false}

@@ -27,6 +27,7 @@ import type {
   RemoteCardMeta,
   RemoteCategoryMeta,
   RemotePlannedMeta,
+  RemoteRecurringMeta,
   RemoteTransactionMeta,
 } from '@/lib/remoteFinanceMapping';
 import { useAuth } from '@/store/auth';
@@ -74,6 +75,14 @@ export interface FinanceReadResult {
    */
   categoryMeta: Record<string, RemoteCategoryMeta>;
   recurring: RecurringRule[];
+  /**
+   * recurring-rule id -> remote-only metadata (updatedAt concurrency token
+   * + createdBy). STEP 16-G2-D2. `{}` while not ready. Kept separate from
+   * `recurring` so the RecurringRule domain type stays free of sync
+   * metadata. Only non-soft-deleted rules appear (unrelated to the rule's
+   * own `active` flag).
+   */
+  recurringMeta: Record<string, RemoteRecurringMeta>;
   planned: PlannedExpense[];
   /**
    * planned-expense id -> remote-only metadata (updatedAt concurrency token
@@ -100,6 +109,7 @@ const EMPTY_SLICES = {
   budgetMeta: {} as Record<string, RemoteBudgetMeta>,
   categoryMeta: {} as Record<string, RemoteCategoryMeta>,
   recurring: [] as RecurringRule[],
+  recurringMeta: {} as Record<string, RemoteRecurringMeta>,
   planned: [] as PlannedExpense[],
   plannedMeta: {} as Record<string, RemotePlannedMeta>,
   goals: [] as Goal[],
@@ -141,6 +151,7 @@ export function useFinanceRead(): FinanceReadResult {
         budgetMeta: data.budgetMeta,
         categoryMeta: data.categoryMeta,
         recurring: data.recurring,
+        recurringMeta: data.recurringMeta,
         planned: data.planned,
         plannedMeta: data.plannedMeta,
         goals: data.goals,

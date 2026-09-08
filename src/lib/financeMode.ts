@@ -1,12 +1,12 @@
 /**
  * STEP 16-G1B / 16-G2-A / 16-G2-B / 16-G2-C2 / 16-G2-C3-B / 16-G2-C4-B /
- * 16-G2-D1 — household finance write gating.
+ * 16-G2-D1 / 16-G2-D2 — household finance write gating.
  *
  * `REMOTE_FINANCE_READ_ONLY` stays `true` and keeps its exact original
  * meaning: every OTHER mutation screen still renders <ReadOnlyRouteNotice/>
- * instead of its real form — recurring-add, goal-add, loan-add. Those
- * files check this constant directly (not `REMOTE_FINANCE_WRITE`), so they
- * stay closed. (`planned-add` no longer checks it — see below.)
+ * instead of its real form — goal-add, loan-add. Those files check this
+ * constant directly (not `REMOTE_FINANCE_WRITE`), so they stay closed.
+ * (`planned-add` and `recurring-add` no longer check it — see below.)
  *
  * `REMOTE_FINANCE_WRITE` is the one greppable place that says which
  * financial writes are open:
@@ -33,9 +33,19 @@
  *     UPDATE deleted_at, keyed on `(household_id, id)` with a client
  *     `p-...` id; `type` is immutable after create; NO "complete to a real
  *     transaction" step, NO `transactions` write, no RPC, no hard DELETE).
- * `card-add`, `budget-add`, `categories` and `planned-add` are the former
- * `REMOTE_FINANCE_READ_ONLY` routes that now check `REMOTE_FINANCE_WRITE.*`
- * instead. Everything else — recurring, goals, loans — remains closed.
+ *   - recurring-rule CREATE / EDIT / ACTIVE-TOGGLE / (soft) DELETE —
+ *     STEP 16-G2-D2, via src/services/remoteRecurringWrite.ts (direct
+ *     `public.recurring_rules` INSERT / conditional UPDATE of
+ *     name·amount·category·frequency·day_of_month·day_of_week / conditional
+ *     UPDATE of `active` alone / UPDATE deleted_at, keyed on
+ *     `(household_id, id)` with a client `rec-...` id; `type` is immutable
+ *     after create; `active` is NEVER in the edit payload — it has its own
+ *     `setRecurringActive`; `last_run` is NEVER written; NO transaction
+ *     auto-generation, NO `transactions` write, no RPC, no hard DELETE).
+ * `card-add`, `budget-add`, `categories`, `planned-add` and `recurring-add`
+ * are the former `REMOTE_FINANCE_READ_ONLY` routes that now check
+ * `REMOTE_FINANCE_WRITE.*` instead. Everything else — goals, loans —
+ * remains closed.
  */
 export const REMOTE_FINANCE_READ_ONLY = true as const;
 
@@ -56,4 +66,8 @@ export const REMOTE_FINANCE_WRITE = {
   plannedCreate: true,
   plannedEdit: true,
   plannedDelete: true,
+  recurringCreate: true,
+  recurringEdit: true,
+  recurringToggle: true,
+  recurringDelete: true,
 } as const;

@@ -1,8 +1,10 @@
+import * as Haptics from 'expo-haptics';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Keyboard, Pressable, Text, View } from 'react-native';
+import { Alert, Keyboard, Pressable, ScrollView, Text, View, type LayoutChangeEvent } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
 import {
   ChipSelect,
@@ -14,15 +16,47 @@ import {
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
-import { EXPENSE_CATS, INCOME_CATS, type TxnType } from '@/data/categories';
-import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
+import { getAllCats, type TxnType } from '@/data/categories';
+import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum } from '@/lib/format';
-import { useStore } from '@/store/store';
+import { uid } from '@/lib/id';
+import type { RemoteRecurringMeta } from '@/lib/remoteFinanceMapping';
+import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
+import {
+  createRecurring,
+  softDeleteRecurring,
+  updateRecurring,
+} from '@/services/remoteRecurringWrite';
+import { useAuth } from '@/store/auth';
+import { useFinanceRead } from '@/store/financeRead';
+import { useHousehold } from '@/store/household';
+import type { Frequency, RecurringRule } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
-import type { Frequency } from '@/store/types';
 
 const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
+
+/**
+ * Custom-NumPad scroll assist (STEP 16-G2-D2 UX fix).
+ *
+ * The NumPad is a `footer` sibling of ModalScreen's ScrollView, so opening
+ * it shrinks the scroll viewport but fires no OS-keyboard event — nothing
+ * auto-scrolls the tapped field into view.
+ *
+ * We scroll the MINIMUM amount: only when the tapped field's bottom (plus
+ * `NUMPAD_FIELD_BOTTOM_MARGIN` breathing room) would sit below the shrunk
+ * viewport, and then by exactly that overflow — so the field lands just
+ * above the pad, never pinned to the top, and an already-visible field
+ * doesn't move at all.
+ *
+ * `NUMPAD_SCROLL_CLEARANCE` is a small conditional bottom spacer: it only
+ * exists so `scrollTo` has enough scrollable content below the LAST field
+ * to actually reach that target (RN clamps scrollTo to
+ * contentSize - viewport). It is NOT part of the scroll-amount maths and
+ * collapses to 0 once the pad closes, so no lasting mid-screen gap.
+ */
+const NUMPAD_SCROLL_CLEARANCE = 160;
+const NUMPAD_FIELD_BOTTOM_MARGIN = 24;
 
 /** Digit-entry rules — identical to the main expense keypad (app/input.tsx). */
 function applyDigit(amount: string, k: string): string {
@@ -34,8 +68,8 @@ function applyDigit(amount: string, k: string): string {
 
 /**
  * Day-of-month entry for the 매월 며칠 field: 1–2 digits, no leading zero.
- * The 1–31 clamp still happens only at save (`save()` below is unchanged), so
- * this only affects what you can type, not what gets stored.
+ * The 1–31 clamp still happens only at save (`buildDraft` below), so this
+ * only affects what you can type, not what gets stored.
  */
 function applyDayDigit(cur: string, k: string): string {
   if (k === 'back') return cur.slice(0, -1);
@@ -43,33 +77,227 @@ function applyDayDigit(cur: string, k: string): string {
   return cur.length >= 2 ? cur : (cur === '0' ? '' : cur) + k;
 }
 
-export default function RecurringAdd() {
-  // STEP 16-G1B: see app/input.tsx's identical guard comment.
-  if (REMOTE_FINANCE_READ_ONLY) return <ReadOnlyRouteNotice title="반복 항목" />;
+/**
+ * Route entry for /recurring-add — STEP 16-G2-D2.
+ *
+ *   /recurring-add             -> new recurring-rule form (recurringCreate)
+ *   /recurring-add?id=<rid>    -> edit form               (recurringEdit)
+ *
+ * Either capability off -> ReadOnlyRouteNotice. Capability + param checks
+ * live in this thin wrapper (planned-add / card-add pattern) so
+ * RecurringForm keeps an unconditional hook order. Expo Router can hand
+ * back `string | string[]`, so both are handled. `?type=` seeds only the
+ * NEW-form's initial tab.
+ */
+export default function RecurringAddRoute() {
+  const params = useLocalSearchParams<{ id?: string | string[]; type?: string | string[] }>();
+  const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
+  const typeParam = Array.isArray(params.type) ? params.type[0] : params.type;
 
+  if (idParam) {
+    if (!REMOTE_FINANCE_WRITE.recurringEdit) return <ReadOnlyRouteNotice title="반복 항목 수정" />;
+    return <RecurringFormRoute editId={idParam} />;
+  }
+  if (!REMOTE_FINANCE_WRITE.recurringCreate) return <ReadOnlyRouteNotice title="반복 항목" />;
+  return (
+    <RecurringForm
+      key="create"
+      mode={{ kind: 'create', initialType: typeParam === 'income' ? 'income' : 'expense' }}
+    />
+  );
+}
+
+type FormMode =
+  | { kind: 'create'; initialType: TxnType }
+  | { kind: 'edit'; rule: RecurringRule; meta: RemoteRecurringMeta };
+
+/**
+ * Resolves the edit target and its concurrency metadata from
+ * useFinanceRead() — NEVER useStore(). The form only mounts once its
+ * `mode` is fully known, so its hooks stay unconditional; the `key` forces
+ * a clean remount when the target changes. A stale/unknown id shows a safe
+ * notice — it never silently falls back to create mode.
+ */
+function RecurringFormRoute({ editId }: { editId: string }) {
+  const router = useRouter();
+  const { status, error, recurring, recurringMeta, refresh } = useFinanceRead();
+
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title="반복 항목 수정" onClose={() => router.back()} scroll={false}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
+  const target = recurring.find((r) => r.id === editId) ?? null;
+  const meta = recurringMeta[editId] ?? null;
+
+  if (!target) {
+    return (
+      <EditUnavailable
+        body="이미 삭제됐거나 다른 우리집의 반복 항목일 수 있어요."
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+  if (!meta) {
+    // No concurrency token -> a safe edit is impossible. Never open the form.
+    return <EditUnavailable body="잠시 후 다시 시도해 주세요." onRetry={() => void refresh()} />;
+  }
+
+  return <RecurringForm key={editId} mode={{ kind: 'edit', rule: target, meta }} />;
+}
+
+function EditUnavailable({ body, onRetry }: { body: string; onRetry: () => void }) {
+  const router = useRouter();
+  return (
+    <ModalScreen title="반복 항목 수정" onClose={() => router.back()} scroll={false}>
+      <View
+        style={{
+          flex: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          paddingHorizontal: spacing.xl,
+          gap: spacing.md,
+        }}
+      >
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+          반복 항목을 찾을 수 없어요
+        </Text>
+        <Text
+          style={{
+            fontFamily: fontFamily.regular,
+            fontSize: 13,
+            color: colors.textSub,
+            textAlign: 'center',
+            lineHeight: 19,
+          }}
+        >
+          {body}
+        </Text>
+        <Pressable onPress={onRetry} hitSlop={8}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+            다시 불러오기
+          </Text>
+        </Pressable>
+        <Pressable onPress={() => router.back()} hitSlop={8}>
+          <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.textSub }}>
+            목록으로 돌아가기
+          </Text>
+        </Pressable>
+      </View>
+    </ModalScreen>
+  );
+}
+
+function RecurringForm({ mode }: { mode: FormMode }) {
   const router = useRouter();
   const toast = useToast();
   const insets = useSafeAreaInsets();
-  const { addRecurring } = useStore();
 
-  // 반복 목록에서 넘어온 현재 탭 타입을 신규 추가의 기본값으로만 사용.
-  // (param이 없으면 기존 기본값 expense 유지. 사용자는 화면 안에서 자유롭게 전환 가능.)
-  const params = useLocalSearchParams<{ type?: string }>();
-  const [type, setType] = useState<TxnType>(params.type === 'income' ? 'income' : 'expense');
-  const [name, setName] = useState('');
-  const [amount, setAmount] = useState('');
-  const [category, setCategory] = useState('subscribe');
-  const [frequency, setFrequency] = useState<Frequency>('monthly');
-  const [dayOfMonth, setDayOfMonth] = useState('1');
-  const [dayOfWeek, setDayOfWeek] = useState('1');
+  const { session } = useAuth();
+  const { activeHousehold } = useHousehold();
+  // Household finance READ values come ONLY from the remote read-only
+  // source — never useStore(). No local addRecurring/updateRecurring/
+  // toggleRecurring/deleteRecurring is ever called from this screen.
+  const { status, error, customCats, catOrder, refresh } = useFinanceRead();
+
+  const editing = mode.kind === 'edit' ? mode.rule : null;
+  const isEdit = mode.kind === 'edit';
+
+  // Concurrency token captured ONCE at mount from the meta this form was
+  // built with — a later background refresh must never swap it out
+  // (STEP 16-G2-D2 §6).
+  const expectedUpdatedAtRef = useRef(mode.kind === 'edit' ? mode.meta.updatedAt : null);
+  // Client-generated id for CREATE only, minted ONCE per form mount and
+  // reused on every retry (23505-hardened idempotency in createRecurring()).
+  const recurringIdRef = useRef(uid('rec'));
+
+  // `type` is fixed for the life of a rule: create can choose it, edit shows
+  // it read-only and never sends it in the PATCH body (STEP 16-G2-D2 §0.3).
+  const [type, setType] = useState<TxnType>(
+    editing?.type ?? (mode.kind === 'create' ? mode.initialType : 'expense'),
+  );
+  const [name, setName] = useState(editing?.name ?? '');
+  const [amount, setAmount] = useState(editing ? String(editing.amount) : '');
+  // Prefill the RAW stored category id (even one whose custom category was
+  // later deleted). ChipSelect just won't highlight a missing option; on
+  // save we send whatever is in state, so an unchanged category is never
+  // silently rewritten (STEP 16-G2-D2 §10 / same as planned §10).
+  const [category, setCategory] = useState(editing?.category ?? 'subscribe');
+  const [frequency, setFrequency] = useState<Frequency>(editing?.frequency ?? 'monthly');
+  const [dayOfMonth, setDayOfMonth] = useState(
+    editing?.dayOfMonth != null ? String(editing.dayOfMonth) : '1',
+  );
+  const [dayOfWeek, setDayOfWeek] = useState(
+    editing?.dayOfWeek != null ? String(editing.dayOfWeek) : '1',
+  );
   // 금액·매월 며칠은 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)를 공유해서 입력.
-  // (loan-add.tsx의 activeField 방식과 동일 — 하나의 NumPad를 전환하며 사용)
   const [activeField, setActiveField] = useState<'amount' | 'day' | null>(null);
 
-  const cats = useMemo(() => (type === 'income' ? INCOME_CATS : EXPENSE_CATS), [type]);
+  // ---- Scroll assist for the custom NumPad (see the module constants) ----
+  const scrollRef = useRef<ScrollView>(null);
+  // Live scroll offset (from onScroll) — a ref: high-frequency, no re-render.
+  const scrollYRef = useRef(0);
+  // Current scroll viewport height — STATE, because it shrinks when the
+  // NumPad footer opens and the scroll effect must re-run with the new value.
+  const [viewportH, setViewportH] = useState(0);
+  // { y, height } of each NumPad-backed field within the scroll content.
+  const fieldRectRef = useRef<Record<'amount' | 'day', { y: number; h: number }>>({
+    amount: { y: 0, h: 0 },
+    day: { y: 0, h: 0 },
+  });
+  const onFieldLayout =
+    (key: 'amount' | 'day') =>
+    (e: LayoutChangeEvent) => {
+      const { y, height } = e.nativeEvent.layout;
+      fieldRectRef.current[key] = { y, h: height };
+    };
+
+  // Opening the custom NumPad fires no OS-keyboard event, so nothing
+  // auto-scrolls the tapped field into view. Scroll the MINIMUM: only if the
+  // field's bottom + margin would fall below the (already shrunk) viewport,
+  // and then by exactly that overflow. Re-runs when `viewportH` changes
+  // (i.e. right after the footer opens and shrinks the ScrollView) so the
+  // maths always uses the real viewport. Closing the pad does nothing.
   useEffect(() => {
-    if (!cats.some((c) => c.id === category)) setCategory(cats[0].id);
-  }, [cats, category]);
+    if (!activeField || viewportH <= 0) return;
+    const t = setTimeout(() => {
+      const sv = scrollRef.current;
+      if (!sv) return;
+      const { y: fieldY, h: fieldH } = fieldRectRef.current[activeField];
+      if (fieldH <= 0) return;
+      const fieldBottom = fieldY + fieldH;
+      const visibleBottom = scrollYRef.current + viewportH;
+      const overflow = fieldBottom + NUMPAD_FIELD_BOTTOM_MARGIN - visibleBottom;
+      if (overflow > 1) {
+        sv.scrollTo({ y: scrollYRef.current + overflow, animated: true });
+      }
+      // overflow <= 1: field already fully visible with margin -> don't move.
+    }, 50);
+    return () => clearTimeout(t);
+  }, [activeField, viewportH]);
+
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const deletingRef = useRef(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const cats = useMemo(
+    () => getAllCats(type, customCats, catOrder),
+    [type, customCats, catOrder],
+  );
+
+  // CREATE only: switching 지출 <-> 수입 changes the category list, so drop a
+  // now-invalid selection to the first option. EDIT never runs this (type is
+  // immutable) so a raw/deleted category id is preserved untouched.
+  const catIds = cats.map((c) => c.id).join(',');
+  const prevCatIdsRef = useRef(catIds);
+  if (mode.kind === 'create' && prevCatIdsRef.current !== catIds) {
+    prevCatIdsRef.current = catIds;
+    if (!cats.some((c) => c.id === category)) setCategory(cats[0]?.id ?? 'subscribe');
+  }
 
   const onKey = (k: string) => {
     if (activeField === 'amount') setAmount((a) => applyDigit(a, k));
@@ -81,36 +309,166 @@ export default function RecurringAdd() {
   };
 
   const canSave = name.trim().length > 0 && parseNum(amount) > 0;
+  const busy = submitting || deleting;
 
-  // A double-tap here would create a duplicate rule (→ duplicate auto txns
-  // every period), so latch after the first valid submit.
-  const submitting = useRef(false);
+  /** Draft-state -> NewRecurringDraft, or null when the form isn't valid. */
+  const buildDraft = (): NewRecurringDraft | null => {
+    // Defensive re-validation — do NOT lean on the DB CHECK for UX.
+    const n = name.trim();
+    if (n.length === 0) return null;
+    const amt = parseNum(amount);
+    if (!Number.isFinite(amt) || amt <= 0) return null;
+    if (!category) return null;
 
-  const save = () => {
-    if (submitting.current || !canSave) return;
-    submitting.current = true;
-    addRecurring({
-      type,
-      name: name.trim(),
-      amount: parseNum(amount),
-      category,
-      frequency,
-      dayOfMonth:
-        frequency === 'monthly'
-          ? Math.min(31, Math.max(1, parseInt(dayOfMonth, 10) || 1))
-          : undefined,
-      dayOfWeek: frequency === 'weekly' ? parseInt(dayOfWeek, 10) : undefined,
+    if (frequency === 'monthly') {
+      const dom = Math.min(31, Math.max(1, parseInt(dayOfMonth, 10) || 1));
+      return { type, name: n, amount: amt, category, frequency, dayOfMonth: dom, dayOfWeek: null };
+    }
+    const dow = parseInt(dayOfWeek, 10);
+    if (!Number.isInteger(dow) || dow < 0 || dow > 6) return null;
+    return { type, name: n, amount: amt, category, frequency, dayOfMonth: null, dayOfWeek: dow };
+  };
+
+  const save = async () => {
+    if (submittingRef.current || deletingRef.current || !canSave) return;
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+
+    const draft = buildDraft();
+    if (!draft) {
+      toast.show('반복 항목 정보를 확인해 주세요.');
+      return;
+    }
+
+    submittingRef.current = true;
+    setSubmitting(true);
+
+    if (mode.kind === 'create') {
+      const res = await createRecurring({
+        id: recurringIdRef.current, // unchanged on retry — reuses the same id
+        householdId: activeHousehold.id,
+        expectedUserId: session.user.id,
+        draft,
+      });
+      if (!res.ok) {
+        submittingRef.current = false;
+        setSubmitting(false);
+        toast.show(res.message);
+        return;
+      }
+      await refresh();
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show('반복 항목을 추가했어요');
+      router.back();
+      return;
+    }
+
+    // ---- edit ---- expectedUpdatedAt is the token captured at MOUNT.
+    const token = expectedUpdatedAtRef.current;
+    if (!token) {
+      submittingRef.current = false;
+      setSubmitting(false);
+      toast.show('반복 항목 정보를 다시 불러와 주세요.');
+      return;
+    }
+    const res = await updateRecurring({
+      id: mode.rule.id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: token,
+      draft,
     });
-    toast.show('추가했어요');
+    if (!res.ok) {
+      submittingRef.current = false;
+      setSubmitting(false);
+      if (res.reason === 'identity' || res.reason === 'error' || res.reason === 'invalid') {
+        toast.show(res.message); // keep the form open with the user's input
+        return;
+      }
+      // conflict / deleted / gone — reload authoritative data and leave the
+      // stale form rather than let it overwrite.
+      await refresh();
+      toast.show(res.message);
+      router.back();
+      return;
+    }
+    await refresh();
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    toast.show('반복 항목을 수정했어요');
     router.back();
   };
 
+  const confirmDelete = () => {
+    if (mode.kind !== 'edit' || submittingRef.current || deletingRef.current) return;
+    Alert.alert('반복 항목을 삭제할까요?', '이미 기록된 거래에는 영향을 주지 않아요.', [
+      { text: '취소', style: 'cancel' },
+      { text: '삭제', style: 'destructive', onPress: () => void doDelete() },
+    ]);
+  };
+
+  const doDelete = async () => {
+    if (mode.kind !== 'edit' || submittingRef.current || deletingRef.current) return;
+    if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
+    const token = expectedUpdatedAtRef.current;
+    if (!token) {
+      toast.show('반복 항목 정보를 다시 불러와 주세요.');
+      return;
+    }
+
+    deletingRef.current = true;
+    setDeleting(true);
+
+    const res = await softDeleteRecurring({
+      id: mode.rule.id,
+      householdId: activeHousehold.id,
+      expectedUserId: session.user.id,
+      expectedUpdatedAt: token,
+    });
+
+    if (res.ok) {
+      await refresh();
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show('반복 항목을 삭제했어요');
+      router.back();
+      return;
+    }
+
+    deletingRef.current = false;
+    setDeleting(false);
+    if (res.reason === 'identity' || res.reason === 'error') {
+      toast.show(res.message);
+      return;
+    }
+    await refresh();
+    toast.show(res.message);
+    router.back();
+  };
+
+  // Same finance-read gate as every other remote finance screen.
+  if (status !== 'ready') {
+    return (
+      <ModalScreen title={isEdit ? '반복 항목 수정' : '반복 항목 추가'} onClose={() => router.back()} scroll={false}>
+        <FinanceLoadState status={status} error={error} onRetry={() => void refresh()} />
+      </ModalScreen>
+    );
+  }
+
   return (
     <ModalScreen
-      title="반복 항목 추가"
+      title={isEdit ? '반복 항목 수정' : '반복 항목 추가'}
       closeIcon="x"
       onClose={() => router.back()}
-      right={<HeaderTextButton label="저장" onPress={save} disabled={!canSave} />}
+      scrollRef={scrollRef}
+      onScrollViewLayout={(e) => setViewportH(e.nativeEvent.layout.height)}
+      onScrollViewScroll={(e) => {
+        scrollYRef.current = e.nativeEvent.contentOffset.y;
+      }}
+      right={
+        <HeaderTextButton
+          label={submitting ? '저장 중…' : '저장'}
+          onPress={() => void save()}
+          disabled={!canSave || busy}
+        />
+      }
       footer={
         activeField ? (
           <NumPad
@@ -123,15 +481,53 @@ export default function RecurringAdd() {
       }
     >
       <View style={{ paddingHorizontal: spacing.xl, paddingTop: spacing.xs }}>
-        <SegmentedTabs
-          value={type}
-          onChange={setType}
-          options={[
-            { value: 'expense', label: '지출', tone: 'expense' },
-            { value: 'income', label: '수입', tone: 'income' },
-          ]}
-          style={{ marginBottom: spacing.lg }}
-        />
+        {isEdit && (
+          <View style={{ alignItems: 'flex-end', marginBottom: spacing.xs }}>
+            <Pressable
+              onPress={confirmDelete}
+              disabled={busy}
+              hitSlop={10}
+              style={{ padding: 4, opacity: busy ? 0.4 : 1 }}
+            >
+              <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.expenseText }}>
+                {deleting ? '삭제 중…' : '삭제'}
+              </Text>
+            </Pressable>
+          </View>
+        )}
+
+        {isEdit ? (
+          // type is immutable after create — show it, don't let it change.
+          <View
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              paddingVertical: 10,
+              paddingHorizontal: 14,
+              marginBottom: spacing.lg,
+              backgroundColor: colors.track,
+              borderRadius: radii.md,
+            }}
+          >
+            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>
+              {type === 'income' ? '수입' : '지출'}
+            </Text>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted }}>
+              유형은 수정할 수 없어요
+            </Text>
+          </View>
+        ) : (
+          <SegmentedTabs
+            value={type}
+            onChange={setType}
+            options={[
+              { value: 'expense', label: '지출', tone: 'expense' },
+              { value: 'income', label: '수입', tone: 'income' },
+            ]}
+            style={{ marginBottom: spacing.lg }}
+          />
+        )}
 
         <Field label="이름">
           <TextField
@@ -142,14 +538,16 @@ export default function RecurringAdd() {
             maxLength={30}
           />
         </Field>
-        <Field label="금액">
-          <NumFieldRow
-            value={amount ? fmt(Number(amount)) : ''}
-            suffix="원"
-            active={activeField === 'amount'}
-            onPress={() => openField('amount')}
-          />
-        </Field>
+        <View onLayout={onFieldLayout('amount')}>
+          <Field label="금액">
+            <NumFieldRow
+              value={amount ? fmt(Number(amount)) : ''}
+              suffix="원"
+              active={activeField === 'amount'}
+              onPress={() => openField('amount')}
+            />
+          </Field>
+        </View>
         <Field label="카테고리">
           <ChipSelect
             value={category}
@@ -173,14 +571,16 @@ export default function RecurringAdd() {
           />
         </Field>
         {frequency === 'monthly' ? (
-          <Field label="매월 며칠" hint="1~31 사이로 정해요">
-            <NumFieldRow
-              value={dayOfMonth}
-              suffix="일"
-              active={activeField === 'day'}
-              onPress={() => openField('day')}
-            />
-          </Field>
+          <View onLayout={onFieldLayout('day')}>
+            <Field label="매월 며칠" hint="1~31 사이로 정해요">
+              <NumFieldRow
+                value={dayOfMonth}
+                suffix="일"
+                active={activeField === 'day'}
+                onPress={() => openField('day')}
+              />
+            </Field>
+          </View>
         ) : (
           <Field label="매주 요일">
             <ChipSelect
@@ -190,6 +590,10 @@ export default function RecurringAdd() {
             />
           </Field>
         )}
+
+        {/* Reserve scroll room so a lower numeric field can be lifted clear
+            of the custom NumPad; collapses to 0 once the pad is closed. */}
+        <View style={{ height: activeField ? NUMPAD_SCROLL_CLEARANCE : 0 }} />
       </View>
     </ModalScreen>
   );

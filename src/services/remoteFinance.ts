@@ -79,6 +79,12 @@ import { supabase } from '@/lib/supabase';
  * `updated_at`, routed into a separate `plannedMeta` map keyed by the
  * planned-expense id (the PlannedExpense domain type is untouched). Same
  * opaque-token rule for `updated_at`.
+ *
+ * STEP 16-G2-D2: `recurring_rules` additionally selects `created_by` and
+ * `updated_at`, routed into a separate `recurringMeta` map keyed by the
+ * recurring-rule id (the RecurringRule domain type is untouched). Same
+ * opaque-token rule for `updated_at`. `last_run` stays domain-only and is
+ * NEVER written by any client path in this STEP.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -130,6 +136,16 @@ export interface RemoteRecurringRule {
   active: boolean;
   last_run: string | null;
   created_at: string;
+  /**
+   * STEP 16-G2-D2 — routed to `recurringMeta`, NOT the RecurringRule domain
+   * type. `updated_at` is the optimistic-concurrency token for recurring
+   * edit / active-toggle / soft-delete (compared with an exact
+   * `.eq('updated_at', …)`), so it must travel as the RAW PostgREST string
+   * — never re-parsed through Date/toISOString anywhere. `created_by` is
+   * author bookkeeping only (the 23505-idempotency check on CREATE).
+   */
+  created_by: string | null;
+  updated_at: string;
 }
 
 export interface RemotePlannedExpense {
@@ -306,7 +322,7 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('recurring_rules')
-      .select('id,type,name,amount,category,frequency,day_of_month,day_of_week,active,last_run,created_at')
+      .select('id,type,name,amount,category,frequency,day_of_month,day_of_week,active,last_run,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
