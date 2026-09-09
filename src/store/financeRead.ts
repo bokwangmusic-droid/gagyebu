@@ -190,12 +190,29 @@ export interface FinanceReadResult {
   categoryManagementRows: CustomCatMap;
   /**
    * custom category id -> its pending offline-op state, for the row label /
-   * read-only gate on the category-management screen. Mirrors `pendingCardOps`.
-   * `reason` only set when `failed` is true.
+   * read-only gate on the category-management screen. Mirrors `pendingCardOps`,
+   * plus (STEP 16-H2-C2-B2 conflict-UX):
+   *   - `queueId`        — the durable record's id, so the row's "변경 버리기"
+   *                        can call `discardPending(queueId)`.
+   *   - `synthetic`      — the row has NO authoritative server category behind
+   *                        it (pending/failed CREATE, or a failed UPDATE whose
+   *                        server row is gone) -> exclude from the sortable
+   *                        list / `saveCategoryOrder` payload.
+   *   - `attemptedName`  — for a terminal-failed UPDATE, the name the user
+   *                        tried; conflict metadata ONLY (the displayed row is
+   *                        the authoritative server name when it still exists).
+   * `reason` / `attemptedName` are only set when `failed` is true.
    */
   pendingCategoryOps: ReadonlyMap<
     string,
-    { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+    {
+      op: 'create' | 'update' | 'delete';
+      failed: boolean;
+      reason?: WriteConflictReason;
+      queueId?: string;
+      synthetic: boolean;
+      attemptedName?: string;
+    }
   >;
 
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
@@ -309,15 +326,32 @@ export function useFinanceRead(): FinanceReadResult {
         : data.customCats;
       const pendingCategoryOps = new Map<
         string,
-        { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+        {
+          op: 'create' | 'update' | 'delete';
+          failed: boolean;
+          reason?: WriteConflictReason;
+          queueId?: string;
+          synthetic: boolean;
+          attemptedName?: string;
+        }
       >();
       if (composedResult) {
-        for (const [id, op] of composedResult.categoryManagement.opById) {
-          const isFailed = composedResult.categoryManagement.failedIds.has(id);
+        const cm = composedResult.categoryManagement;
+        for (const [id, op] of cm.opById) {
+          const isFailed = cm.failedIds.has(id);
+          // `providerCategoryOps` is the durable `PendingWrite[]` — one op per
+          // (entity,id) by the dedup rule, so `find` gives the queueId for
+          // "변경 버리기".
+          const rec = providerCategoryOps.find((o) => o.entityId === id);
           pendingCategoryOps.set(id, {
             op,
             failed: isFailed,
+            synthetic: cm.syntheticIds.has(id),
+            ...(rec ? { queueId: rec.queueId } : {}),
             ...(isFailed ? { reason: categoryFailedReasons.get(id) } : {}),
+            ...(isFailed && cm.attemptedNameById.has(id)
+              ? { attemptedName: cm.attemptedNameById.get(id) }
+              : {}),
           });
         }
       }

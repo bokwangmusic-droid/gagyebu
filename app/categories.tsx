@@ -34,6 +34,7 @@ import { uid } from '@/lib/id';
 import { pendingCategoryRowLabel } from '@/lib/pendingCategoryLabel';
 import {
   isCategoryNameTaken,
+  MAX_CATEGORY_NAME,
   type NewCustomCategoryDraft,
 } from '@/lib/remoteCategoryWriteMapping';
 import type { RemoteBudgetMeta, RemoteCategoryMeta } from '@/lib/remoteFinanceMapping';
@@ -142,26 +143,51 @@ function CategoriesManager({
   const reorderBusyRef = useRef(false);
 
   // STEP 16-H2-C2-B2 §8: the MANAGEMENT list renders `categoryManagementRows`
-  // (server customCats + pending CREATE synthetic + pending UPDATE overlay −
-  // pending DELETE + failed local orphan). Every OTHER consumer keeps using
-  // `customCats` (authoritative). A pending CREATE id is not in `catOrder`, so
-  // it naturally sorts to the end of the list.
+  // (server customCats + pending CREATE synthetic + NOT-failed pending UPDATE
+  // overlay − pending DELETE + failed-orphan synthetic). Every OTHER consumer
+  // keeps using `customCats` (authoritative). A synthetic row (no `catOrder`
+  // entry) naturally sorts to the end.
   const allCats = getAllCats(tab, categoryManagementRows, catOrder);
   const customIds = new Set(categoryManagementRows[tab].map((c) => c.id));
 
-  // A row carrying an un-sent offline op — read-only everywhere: no edit
-  // sheet, no delete, and excluded from reorder (§12).
+  // Any row carrying an un-sent offline op — no edit sheet / no delete while
+  // in flight or held-failed (discard first).
+  const opFor = (id: string) => pendingCategoryOps.get(id);
   const isPendingRow = (id: string) => pendingCategoryOps.has(id);
-  // STEP 16-H2-C2-B2 §13: reorder is online-only LWW and a pending category id
-  // must NEVER reach `saveCategoryOrder`. Simplest structural guarantee — the
-  // whole tab's reorder is disabled while ANY of its rows carries a pending /
-  // failed op; `saveCategoryOrder` then simply never runs.
-  const tabHasPendingCategory = categoryManagementRows[tab].some((c) => isPendingRow(c.id));
+  // SYNTHETIC = present only because of an op, no authoritative server row
+  // behind it (pending/failed CREATE, failed UPDATE whose server row is gone).
+  // These must NEVER reach `saveCategoryOrder` (§6/§13). A terminal-failed
+  // UPDATE whose authoritative row STILL EXISTS is NOT synthetic — that row
+  // stays a normal, reorderable category (conflict-UX fix).
+  const isSyntheticRow = (id: string) => opFor(id)?.synthetic === true;
 
   const canCreate = REMOTE_FINANCE_WRITE.categoryCreate;
   const canEdit = REMOTE_FINANCE_WRITE.categoryEdit;
   const canDelete = REMOTE_FINANCE_WRITE.categoryDelete;
-  const canReorder = REMOTE_FINANCE_WRITE.categoryReorder && !tabHasPendingCategory;
+  const canReorder = REMOTE_FINANCE_WRITE.categoryReorder;
+
+  /** "변경 버리기" — drop the local failed UPDATE record; the authoritative
+   *  server category is never touched (§3). */
+  const discardFailed = (queueId: string) => {
+    Alert.alert(
+      '실패한 수정 내용을 버릴까요?',
+      '다른 기기에 저장된 최신 카테고리는 그대로 유지됩니다.',
+      [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '버리기',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              const r = await pending.discardPending(queueId);
+              if (r.ok) toast.show('실패한 수정 내용을 버렸어요');
+              else toast.show('변경을 버리지 못했어요. 잠시 후 다시 시도해주세요.');
+            })();
+          },
+        },
+      ],
+    );
+  };
 
   /**
    * STEP 16-H2-C2-B2 §4: a durable-enqueue that itself failed — the change is
@@ -424,11 +450,11 @@ function CategoriesManager({
   const onReorder = (rawOrderedIds: string[]) => {
     if (!canReorder || reorderBusyRef.current) return;
     if (!ready || !session?.user?.id || !activeHousehold) return;
-    // STEP 16-H2-C2-B2 §13: a pending / failed category id must NEVER reach
-    // `saveCategoryOrder` (it isn't a real server row yet). `canReorder` is
-    // already false whenever the tab has one, so this filter is belt-and-
-    // suspenders — it also means `saveCategoryOrder`'s own logic is untouched.
-    const orderedIds = rawOrderedIds.filter((id) => !isPendingRow(id));
+    // STEP 16-H2-C2-B2 §6/§13: only a SYNTHETIC row id (pending/failed CREATE,
+    // failed-orphan UPDATE — no authoritative server row) is stripped here; a
+    // terminal-failed UPDATE whose real server row exists stays in the order
+    // like any category. `saveCategoryOrder`'s own logic is untouched.
+    const orderedIds = rawOrderedIds.filter((id) => !isSyntheticRow(id));
     // §26 validation: non-empty strings, no dupes.
     if (
       orderedIds.length === 0 ||
@@ -507,12 +533,8 @@ function CategoriesManager({
           marginBottom: spacing.sm,
         }}
       >
-        {tabHasPendingCategory
-          ? '전송 대기 중인 카테고리가 있어요 · 반영된 뒤 순서를 바꿀 수 있어요'
-          : '입력 시 이 순서대로 나타나요 · '}
-        {!tabHasPendingCategory && (
-          <Text style={{ color: colors.primaryStrong }}>오른쪽 ⋮⋮ 손잡이를 끌어서 이동</Text>
-        )}
+        입력 시 이 순서대로 나타나요 ·{' '}
+        <Text style={{ color: colors.primaryStrong }}>오른쪽 ⋮⋮ 손잡이를 끌어서 이동</Text>
       </Text>
 
       <DragList
@@ -524,6 +546,7 @@ function CategoriesManager({
         onReorder={canReorder ? onReorder : undefined}
         onEdit={canEdit ? openEdit : undefined}
         onDelete={canDelete ? confirmDelete : undefined}
+        onDiscard={discardFailed}
       />
 
       <View
@@ -643,12 +666,12 @@ function CategorySheet({
         </Text>
       </View>
 
-      <Field label="이름" hint="최대 12자">
+      <Field label="이름" hint={`최대 ${MAX_CATEGORY_NAME}자`}>
         <TextField
           value={name}
-          onChangeText={(t) => setName(t.slice(0, 12))}
+          onChangeText={(t) => setName(t.slice(0, MAX_CATEGORY_NAME))}
           placeholder="예: 반려동물, 자기계발, 커피"
-          maxLength={12}
+          maxLength={MAX_CATEGORY_NAME}
           autoFocus={mode === 'create'}
         />
       </Field>
@@ -722,7 +745,7 @@ function CategorySheet({
           canSave &&
           onSubmit({
             type,
-            name: trimmed.slice(0, 12),
+            name: trimmed.slice(0, MAX_CATEGORY_NAME),
             icon,
             bg: pair.bg,
             color: pair.color,
@@ -748,16 +771,19 @@ function DragList({
   onReorder,
   onEdit,
   onDelete,
+  onDiscard,
 }: {
   cats: Category[];
   customIds: Set<string>;
   deletingId: string | null;
   /** STEP 16-H2-C2-B2 — category id -> its un-sent offline op state, for the
-   *  row label + read-only gate. Rows in this map are excluded from reorder. */
+   *  row label, read-only gate, drag gate and "변경 버리기". */
   pendingOps: FinanceReadResult['pendingCategoryOps'];
   onReorder?: (ids: string[]) => void;
   onEdit?: (cat: Category) => void;
   onDelete?: (id: string, name: string) => void;
+  /** drop a terminal-failed UPDATE's local record ("변경 버리기"). */
+  onDiscard: (queueId: string) => void;
 }) {
   const [data, setData] = useState<Category[]>(cats);
   const draggingRef = useRef(false);
@@ -798,6 +824,13 @@ function DragList({
     >
       {data.map((c, index) => {
         const pendingOp = pendingOps.get(c.id);
+        // Draggable when: no op, OR a terminal-failed UPDATE whose real server
+        // row exists (NOT synthetic, IS failed). A still-pending op or a
+        // synthetic row is pinned so a non-authoritative id can't reach
+        // `commit` / `saveCategoryOrder` (§6).
+        const reorderable =
+          !!onReorder &&
+          (!pendingOp || (pendingOp.failed && !pendingOp.synthetic));
         return (
           <DragRow
             key={c.id}
@@ -807,13 +840,13 @@ function DragList({
             custom={customIds.has(c.id)}
             dimmed={deletingId === c.id}
             pendingLabel={pendingOp ? pendingCategoryRowLabel(pendingOp) : null}
+            discardQueueId={pendingOp?.failed && pendingOp.queueId ? pendingOp.queueId : null}
+            onDiscard={onDiscard}
             activeIndex={activeIndex}
             dragY={dragY}
             onEdit={onEdit}
             onDelete={onDelete}
-            // §12: a pending / failed row is never a drag target (belt to the
-            // tab-level `canReorder` gate) — a pending id must not reach commit.
-            reorderable={!!onReorder && !pendingOp}
+            reorderable={reorderable}
             onDragStart={() => setDragging(true)}
             onCommit={(from, to) => {
               commit(from, to);
@@ -833,6 +866,8 @@ function DragRow({
   custom,
   dimmed,
   pendingLabel,
+  discardQueueId,
+  onDiscard,
   activeIndex,
   dragY,
   onEdit,
@@ -847,8 +882,11 @@ function DragRow({
   custom: boolean;
   dimmed: boolean;
   /** STEP 16-H2-C2-B2 — non-null when this row carries an un-sent offline op:
-   *  the small muted status line, and the row is read-only. */
+   *  the small muted status line, and no edit/delete while it's set. */
   pendingLabel: string | null;
+  /** non-null on a terminal-failed op -> show the "변경 버리기" action. */
+  discardQueueId: string | null;
+  onDiscard: (queueId: string) => void;
   activeIndex: { value: number };
   dragY: { value: number };
   onEdit?: (cat: Category) => void;
@@ -1016,6 +1054,28 @@ function DragRow({
             }}
           >
             <AppIcon name="trash" size={13} color={colors.expenseText} />
+          </Pressable>
+        )}
+
+        {/* STEP 16-H2-C2-B2 conflict-UX — "변경 버리기": drop the failed local
+            UPDATE record. NOT a category delete. Mutually exclusive with the
+            trash button (that only shows when there's no pending op). */}
+        {discardQueueId && (
+          <Pressable
+            onPress={() => onDiscard(discardQueueId)}
+            hitSlop={8}
+            style={{
+              paddingHorizontal: 8,
+              paddingVertical: 5,
+              borderRadius: radii.sm,
+              borderWidth: 1,
+              borderColor: colors.border,
+              backgroundColor: colors.white,
+            }}
+          >
+            <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>
+              변경 버리기
+            </Text>
           </Pressable>
         )}
 

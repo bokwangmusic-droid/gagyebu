@@ -228,12 +228,25 @@ export interface PendingWriteCoordinator {
     entityId: string;
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
+  /**
+   * STEP 16-H2-C2-B2 conflict-UX — permanently DROP one queued record by its
+   * `queueId` ("변경 버리기" for a terminal-failed UPDATE). This is NOT a
+   * server delete: it only removes the local un-sent write + its
+   * failed/ack/reason state; the authoritative server row is never touched.
+   * Refuses a `queueId` that isn't in the CURRENT scope (never touches another
+   * account/household's pending writes). Awaits durable persistence.
+   */
+  discardPending(queueId: string): Promise<DiscardOutcome>;
   /** Ask for a flush. `includeFailed` first clears the terminal-failed set so
    *  those ops get one more attempt (manual "다시 시도"). */
   requestFlush(opts?: { includeFailed?: boolean }): void;
   dispose(): void;
   getState(): CoordinatorState;
 }
+
+export type DiscardOutcome =
+  | { ok: true }
+  | { ok: false; reason: 'not-hydrated' | 'not-found' | 'scope' | 'persist' };
 
 const scopeKeyOf = (s: CoordinatorScope | null): string | null =>
   s ? `${s.userId}:${s.householdId}` : null;
@@ -702,6 +715,41 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  async function discardPending(queueId: string): Promise<DiscardOutcome> {
+    if (disposed) return { ok: false, reason: 'not-hydrated' };
+    if (hydration !== 'ready' || !controller.isHydrated()) {
+      return { ok: false, reason: 'not-hydrated' };
+    }
+    const rec = controller.read().find((r) => r.queueId === queueId);
+    if (!rec) return { ok: false, reason: 'not-found' };
+    // Scope safety (§4): never remove a record that belongs to another
+    // account / household. `queueId` is globally unique, but this is the
+    // explicit guard.
+    if (
+      !scope ||
+      rec.scope.userId !== scope.userId ||
+      rec.scope.householdId !== scope.householdId
+    ) {
+      return { ok: false, reason: 'scope' };
+    }
+    const out = await controller.mutate(
+      (cur) => ({ next: cur.filter((r) => r.queueId !== queueId), result: 0 }),
+      deps.storage,
+    );
+    if (out.blockedNotHydrated) return { ok: false, reason: 'not-hydrated' };
+    if (!out.persist.ok) return { ok: false, reason: 'persist' };
+    // Drop the local failed / ack / reason state for this op's key ONLY when
+    // no other record for the same `${entity}:${entityId}` remains.
+    awaitingAck.delete(queueId);
+    const key = opKey(rec.entity, rec.entityId);
+    if (!controller.read().some((r) => opKey(r.entity, r.entityId) === key)) {
+      failedIds.delete(key);
+      failedReasons.delete(key);
+    }
+    emit();
+    return { ok: true };
+  }
+
   function requestFlush(opts?: { includeFailed?: boolean }): void {
     if (disposed) return;
     if (opts?.includeFailed) {
@@ -779,6 +827,7 @@ export function createPendingWriteCoordinator(
     enqueueCategoryCreate,
     enqueueCategoryUpdate,
     enqueueCategoryDelete,
+    discardPending,
     requestFlush,
     dispose,
     getState,

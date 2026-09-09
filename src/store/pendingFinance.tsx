@@ -33,6 +33,7 @@ import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
   createPendingWriteCoordinator,
   type CoordinatorScope,
+  type DiscardOutcome,
   type EnqueueOutcome,
   type Hydration,
   type PendingOpKind,
@@ -129,6 +130,9 @@ interface PendingFinanceValue {
     entityId: string;
     expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-C2-B2 conflict-UX — drop ONE queued record by `queueId`
+   *  ("변경 버리기"). NOT a server delete; scope-guarded; awaits persistence. */
+  discardPending: (queueId: string) => Promise<DiscardOutcome>;
   /** Ask for a flush now (e.g. pull-to-refresh). `includeFailed` retries held ops. */
   requestFlush: (opts?: { includeFailed?: boolean }) => void;
 }
@@ -281,6 +285,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueCategoryCreate: coord.enqueueCategoryCreate,
       enqueueCategoryUpdate: coord.enqueueCategoryUpdate,
       enqueueCategoryDelete: coord.enqueueCategoryDelete,
+      discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
     }),
     // state is a fresh object each render; that's exactly when something changed

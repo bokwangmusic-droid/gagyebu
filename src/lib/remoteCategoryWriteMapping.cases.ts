@@ -13,6 +13,8 @@ import {
   buildCustomCategoryUpdate,
   isCategoryNameTaken,
   isValidCustomCategoryDraft,
+  MAX_CATEGORY_NAME,
+  normalizeCategoryName,
   type CustomCategoryInsertRow,
   type NewCustomCategoryDraft,
 } from '@/lib/remoteCategoryWriteMapping';
@@ -114,20 +116,73 @@ export function runCategoryMapperCases(): {
         !('deleted_at' in row),
     );
   }
+  // CATEGORY NAME MAX LENGTH FIX — the cap is 20, single-sourced from
+  // MAX_CATEGORY_NAME (used by app/categories.tsx AND the mappers here).
   {
+    check('MAX_CATEGORY_NAME is 20', MAX_CATEGORY_NAME === 20, String(MAX_CATEGORY_NAME));
+  }
+  {
+    // 25-char name, whitespace-padded -> trimmed then capped at 20.
+    const raw = '가'.repeat(25);
     const draft: NewCustomCategoryDraft = {
       type: 'expense',
-      name: '  반려동물자기계발커피취미생활  ',
+      name: `  ${raw}  `,
       icon: 'coffee',
       bg: VIOLET.bg,
       color: VIOLET.color,
     };
     const row = buildCustomCategoryInsert(draft, { id: CID, householdId: HID });
     check(
-      'INSERT · name trimmed + capped at 12 chars',
-      row.name === '반려동물자기계발커피취미' && row.name.length === 12,
-      `name=${JSON.stringify(row.name)} len=${row.name.length}`,
+      'INSERT · name trimmed + capped at MAX_CATEGORY_NAME (20)',
+      row.name === '가'.repeat(20) && row.name.length === 20,
+      `name.len=${row.name.length}`,
     );
+  }
+  {
+    // Exactly 12 chars -> preserved unchanged (existing data / short names).
+    const twelve = '반려동물자기계발커피취미';
+    check(
+      'normalize · 12-char name preserved verbatim',
+      normalizeCategoryName(twelve) === twelve && twelve.length === 12,
+      normalizeCategoryName(twelve),
+    );
+  }
+  {
+    // Exactly 20 chars -> preserved unchanged.
+    const twenty = '가'.repeat(20);
+    check(
+      'normalize · 20-char name preserved verbatim',
+      normalizeCategoryName(twenty) === twenty && normalizeCategoryName(twenty).length === 20,
+      String(normalizeCategoryName(twenty).length),
+    );
+  }
+  {
+    // 21 chars -> truncated to 20; leading/trailing whitespace still trimmed.
+    check(
+      'normalize · 21-char name -> 20; whitespace trimmed',
+      normalizeCategoryName('  ' + '나'.repeat(21) + '  ') === '나'.repeat(20),
+      String(normalizeCategoryName('나'.repeat(21)).length),
+    );
+  }
+  {
+    // whitespace-only stays invalid (min = non-empty after trim).
+    check(
+      'normalize · whitespace-only -> "" (still invalid)',
+      normalizeCategoryName('     ') === '' &&
+        isValidCustomCategoryDraft({ type: 'expense', name: '   ', icon: 'heart', bg: VIOLET.bg, color: VIOLET.color }) === false,
+      '',
+    );
+  }
+  {
+    // UPDATE mapper also preserves a full 20-char name.
+    const row = buildCustomCategoryUpdate({
+      type: 'expense',
+      name: '다'.repeat(20),
+      icon: 'utensils',
+      bg: VIOLET.bg,
+      color: VIOLET.color,
+    });
+    check('UPDATE · 20-char name preserved', row.name === '다'.repeat(20) && row.name.length === 20, String(row.name.length));
   }
 
   /* ---- UPDATE ---- */

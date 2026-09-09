@@ -981,15 +981,23 @@ export function serverCategoryConfirmsUpdate(
 export interface CategoryManagementView {
   /**
    * The custom categories to render on the CATEGORY-management screen ONLY:
-   * authoritative server customCats, with a pending UPDATE overlaid, plus a
-   * synthetic entry for a pending/failed CREATE, plus a synthetic entry for a
-   * FAILED UPDATE whose server row is gone, minus a not-failed pending DELETE.
+   * authoritative server customCats, with a NOT-failed pending UPDATE
+   * overlaid, plus a synthetic entry for a pending/failed CREATE, plus a
+   * synthetic entry for a FAILED UPDATE whose server row is GONE, minus a
+   * not-failed pending DELETE.
+   *
+   * STEP 16-H2-C2-B2 conflict-UX fix: a TERMINAL-failed UPDATE whose
+   * authoritative server row STILL EXISTS keeps the AUTHORITATIVE row verbatim
+   * (the other device won) — the stale local draft is NEVER used to replace
+   * it. The attempted local name is exposed via `attemptedNameById` as
+   * conflict metadata only, and the row id is in `failedIds` so the UI can
+   * offer "변경 버리기".
+   *
    * DELIBERATELY separate from `data.customCats` (§12/§13) so the
    * transaction/planned/recurring/budget category pickers, stats name
    * resolution, backup and household-import only ever see authoritative server
-   * categories — no cross-entity chaining is possible. Same `{ expense, income }`
-   * shape as `data.customCats`. Equals `data.customCats` when there are no
-   * category ops.
+   * categories. Same `{ expense, income }` shape; equals `data.customCats`
+   * when there are no category ops.
    */
   rows: CustomCatMap;
   /** category id -> the pending op that produced or marks it. */
@@ -998,6 +1006,22 @@ export interface CategoryManagementView {
   failedIds: ReadonlySet<string>;
   /** server category ids hidden from `rows` by a not-failed pending DELETE. */
   hiddenIds: string[];
+  /**
+   * row ids that are SYNTHETIC — present in `rows` only because of an op, with
+   * no authoritative server category behind them (pending/failed CREATE, and
+   * a failed UPDATE whose server row is gone). The category-management screen
+   * must exclude these from the sortable drag list / `saveCategoryOrder`
+   * payload (§6). A failed UPDATE whose server row EXISTS is NOT here — its
+   * authoritative row stays a normal, reorderable category.
+   */
+  syntheticIds: ReadonlySet<string>;
+  /**
+   * category id -> the name the user attempted in a TERMINAL-failed UPDATE.
+   * Conflict metadata ONLY — never used to replace the displayed row when the
+   * authoritative row exists (§2/§5). Present for both the "row exists" and
+   * the orphan case.
+   */
+  attemptedNameById: ReadonlyMap<string, string>;
 }
 
 function composeCategoryManagement(
@@ -1008,12 +1032,14 @@ function composeCategoryManagement(
   const opById = new Map<string, 'create' | 'update' | 'delete'>();
   const failedIds = new Set<string>();
   const hiddenIds: string[] = [];
+  const syntheticIds = new Set<string>();
+  const attemptedNameById = new Map<string, string>();
   const catOps = ops.filter(
     (o): o is PendingCategoryCreate | PendingCategoryUpdate | PendingCategoryDelete =>
       o.entity === 'category',
   );
   if (catOps.length === 0) {
-    return { rows: serverCats, opById, failedIds, hiddenIds };
+    return { rows: serverCats, opById, failedIds, hiddenIds, syntheticIds, attemptedNameById };
   }
 
   const failed = (id: string) => !!failedCategoryIds?.has(id);
@@ -1034,23 +1060,36 @@ function composeCategoryManagement(
       if (hit) continue; // the flush already landed — no marker
       rows[op.payload.type].push(categoryDraftToDomain(op));
       opById.set(op.entityId, 'create');
+      syntheticIds.add(op.entityId); // no authoritative row behind it
       if (failed(op.entityId)) failedIds.add(op.entityId);
       continue;
     }
 
     if (op.op === 'update') {
       if (hit) {
+        if (failed(op.entityId)) {
+          // TERMINAL-failed UPDATE + authoritative row still on the server
+          // (the other device won). KEEP the authoritative row verbatim — the
+          // stale local draft must NOT replace it. Mark it + keep the
+          // attempted name as conflict metadata for the UI's "변경 버리기".
+          opById.set(op.entityId, 'update');
+          failedIds.add(op.entityId);
+          attemptedNameById.set(op.entityId, op.payload.name);
+          continue;
+        }
+        // still-pending (non-terminal) UPDATE -> overlay the draft (unchanged).
         hit.list[hit.idx] = applyCategoryUpdate(hit.list[hit.idx], op.payload);
         opById.set(op.entityId, 'update');
-        if (failed(op.entityId)) failedIds.add(op.entityId);
         continue;
       }
-      // server row gone: only a TERMINAL-failed UPDATE gets a display-only
+      // server row GONE: only a TERMINAL-failed UPDATE gets a display-only
       // synthetic row (a not-failed one just waits — like transactions/cards).
       if (failed(op.entityId)) {
         rows[op.payload.type].push(categoryDraftToDomain(op));
         opById.set(op.entityId, 'update');
         failedIds.add(op.entityId);
+        syntheticIds.add(op.entityId); // no authoritative row behind it
+        attemptedNameById.set(op.entityId, op.payload.name);
       }
       continue;
     }
@@ -1069,7 +1108,7 @@ function composeCategoryManagement(
     }
   }
 
-  return { rows, opById, failedIds, hiddenIds };
+  return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedNameById };
 }
 
 export interface CardManagementView {

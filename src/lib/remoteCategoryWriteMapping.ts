@@ -36,8 +36,15 @@ export interface NewCustomCategoryDraft {
   color: string;
 }
 
-/** Same 12-char cap the add UI has always enforced. */
-export const MAX_CATEGORY_NAME = 12;
+/**
+ * Max custom-category name length — the SINGLE SOURCE OF TRUTH for both the
+ * add/edit UI (`app/categories.tsx` imports this constant) and the
+ * normalize/build mappers here, so the two can't drift. 20 matches every
+ * other user-named entity in the app (card / goal / household / loan lender /
+ * profile). `public.custom_categories.name` is `text` with no DB length
+ * constraint, so this is purely a client cap.
+ */
+export const MAX_CATEGORY_NAME = 20;
 
 export function normalizeCategoryName(raw: string): string {
   return raw.trim().slice(0, MAX_CATEGORY_NAME);

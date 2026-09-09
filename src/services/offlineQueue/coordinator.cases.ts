@@ -2186,6 +2186,104 @@ export async function runCoordinatorCases(): Promise<{
     );
   }
 
+  /* ===== STEP 16-H2-C2-B2 conflict-UX — discardPending ("변경 버리기") ===== */
+
+  /** enqueue a category UPDATE that terminal-fails (conflict); return its queueId. */
+  const seedFailedCatUpdate = async (h: Harness, id: string): Promise<string> => {
+    h.catServerPut(id, catDraft({ name: 'B-edit' }));
+    h.setCatUpdate(() => Promise.resolve(KU_CONFLICT));
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: id, payload: catDraft({ name: 'A-edit' }), expectedUpdatedAt: 'V1' });
+    await settle(6);
+    return h.coord.getState().category.scopeOps.find((o) => o.entityId === id)?.queueId ?? '';
+  };
+
+  // D1 — discard a terminal-failed UPDATE: exact queueId removed, failed
+  // marker cleared, queue shrinks, server row untouched.
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    const qid = await seedFailedCatUpdate(h, 'cat-d1');
+    const before = h.coord.getState();
+    const res = await h.coord.discardPending(qid);
+    const after = h.coord.getState();
+    check(
+      'D1 discardPending -> ok; queueId gone; failed marker cleared; server row (B-edit) kept',
+      before.category.failedIds.has('cat-d1') &&
+        res.ok === true &&
+        after.category.scopeOps.some((o) => o.queueId === qid) === false &&
+        after.category.failedIds.has('cat-d1') === false &&
+        after.category.opByEntity.has('cat-d1') === false &&
+        after.pendingCount === before.pendingCount - 1 &&
+        h.catServer.get('cat-d1')?.name === 'B-edit',
+      `res=${JSON.stringify(res)} pending ${before.pendingCount}->${after.pendingCount}`,
+    );
+  }
+  // D2 — discard unknown queueId -> not-found, no state change
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    await seedFailedCatUpdate(h, 'cat-d2');
+    const before = h.coord.getState().pendingCount;
+    const res = await h.coord.discardPending('q-does-not-exist');
+    check(
+      'D2 discardPending(unknown) -> not-found, queue unchanged',
+      res.ok === false && res.reason === 'not-found' &&
+        h.coord.getState().pendingCount === before,
+      JSON.stringify(res),
+    );
+  }
+  // D3 — scope isolation: a queueId enqueued under A cannot be discarded under B
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    const qid = await seedFailedCatUpdate(h, 'cat-d3');
+    h.setScope(B);
+    const underB = await h.coord.discardPending(qid);
+    h.setScope(A);
+    const underA = h.coord.getState();
+    check(
+      'D3 discardPending scope-isolated: refused under B (reason=scope); record survives; visible again under A',
+      underB.ok === false && underB.reason === 'scope' &&
+        underA.category.scopeOps.some((o) => o.queueId === qid) &&
+        underA.category.failedIds.has('cat-d3'),
+      JSON.stringify(underB),
+    );
+  }
+  // D4 — discard removes ONLY the target; a second failed UPDATE is untouched
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    const q1 = await seedFailedCatUpdate(h, 'cat-d4a');
+    const q2 = await seedFailedCatUpdate(h, 'cat-d4b');
+    await h.coord.discardPending(q1);
+    const st = h.coord.getState();
+    check(
+      'D4 discardPending removes only the target; the other failed UPDATE + its marker remain',
+      st.category.scopeOps.some((o) => o.queueId === q1) === false &&
+        st.category.scopeOps.some((o) => o.queueId === q2) === true &&
+        st.category.failedIds.has('cat-d4a') === false &&
+        st.category.failedIds.has('cat-d4b') === true,
+      `q1gone=${!st.category.scopeOps.some((o) => o.queueId === q1)} d4b-failed=${st.category.failedIds.has('cat-d4b')}`,
+    );
+  }
+  // D5 — discard is NOT a flush/retry and never re-runs the write
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    const qid = await seedFailedCatUpdate(h, 'cat-d5');
+    const updatesBefore = h.catUpdateLog.length;
+    await h.coord.discardPending(qid);
+    h.coord.requestFlush();
+    await settle(6);
+    check(
+      'D5 discardPending never re-runs the write; nothing left to flush',
+      h.catUpdateLog.length === updatesBefore &&
+        h.coord.getState().category.scopeOps.length === 0 &&
+        h.catServer.get('cat-d5')?.name === 'B-edit',
+      `updates ${updatesBefore}->${h.catUpdateLog.length}`,
+    );
+  }
+
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };
 }

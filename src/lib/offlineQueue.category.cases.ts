@@ -317,12 +317,15 @@ export async function runOfflineQueueCategoryCases(): Promise<{
     const { data, categoryManagement } = composeFinance(server, [op]);
     const row = categoryManagement.rows.expense.find((c) => c.id === 'cat-1')!;
     check(
-      '20/21 pending category UPDATE -> overlay on management row; data.customCats + categoryMeta untouched',
+      '20/21 pending (NOT failed) category UPDATE -> overlay; NOT synthetic; no attempted-name metadata; authoritative untouched',
       row.name === 'Edited' && row.icon === 'coffee' &&
         data.customCats.expense.find((c) => c.id === 'cat-1')!.name === 'Old' && // authoritative unchanged
         data.categoryMeta === server.categoryMeta &&
         data.catOrder === server.catOrder &&
-        categoryManagement.opById.get('cat-1') === 'update',
+        categoryManagement.opById.get('cat-1') === 'update' &&
+        categoryManagement.failedIds.has('cat-1') === false &&
+        categoryManagement.syntheticIds.has('cat-1') === false &&
+        categoryManagement.attemptedNameById.has('cat-1') === false,
       JSON.stringify(row),
     );
   }
@@ -346,37 +349,72 @@ export async function runOfflineQueueCategoryCases(): Promise<{
     const op = makePendingCategoryCreate({ scope: A, entityId: 'cat-fc', payload: kd({ type: 'income', name: 'FC' }), queueId: 'q1' });
     const { data, categoryManagement } = composeFinance(server, [op], undefined, undefined, new Set(['cat-fc']));
     check(
-      '24 failed category CREATE -> synthetic management row + failed marker; NOT in data.customCats',
+      '24 failed category CREATE -> synthetic management row + failed + syntheticIds; NOT in data.customCats',
       categoryManagement.rows.income.some((c) => c.id === 'cat-fc' && c.name === 'FC') &&
         categoryManagement.failedIds.has('cat-fc') &&
+        categoryManagement.syntheticIds.has('cat-fc') &&
         !data.customCats.income.some((c) => c.id === 'cat-fc'),
       `rows=${categoryManagement.rows.income.map((c) => c.id)}`,
     );
   }
-  // 25 — FAILED category UPDATE, server row exists: management draft overlay + failed
+  // 24b — pending (not-failed) CREATE is also SYNTHETIC (no server row) -> excluded from reorder
   {
-    const server = financeWith([serverCat('cat-fu', { name: 'srv' })]);
-    const op = makePendingCategoryUpdate({ scope: A, entityId: 'cat-fu', payload: kd({ name: 'Local' }), expectedUpdatedAt: 'V1', queueId: 'q1' });
-    const { categoryManagement } = composeFinance(server, [op], undefined, undefined, new Set(['cat-fu']));
+    const server = financeWith([serverCat('srv')]);
+    const op = makePendingCategoryCreate({ scope: A, entityId: 'cat-pc', payload: kd({ name: 'PC' }), queueId: 'q1' });
+    const { categoryManagement } = composeFinance(server, [op]);
+    check(
+      '24b pending category CREATE -> syntheticIds (no authoritative row); visible',
+      categoryManagement.syntheticIds.has('cat-pc') &&
+        categoryManagement.rows.expense.some((c) => c.id === 'cat-pc'),
+      `synthetic=${[...categoryManagement.syntheticIds]}`,
+    );
+  }
+  // 25 — FAILED category UPDATE, server row EXISTS (conflict, other device won):
+  // AUTHORITATIVE server name is displayed (NOT the stale local draft); the
+  // attempted name is exposed as conflict metadata; the row is NOT synthetic.
+  {
+    const server = financeWith([serverCat('cat-fu', { name: 'B-edit' })]);
+    const op = makePendingCategoryUpdate({ scope: A, entityId: 'cat-fu', payload: kd({ name: 'A-edit' }), expectedUpdatedAt: 'V1', queueId: 'q1' });
+    const { data, categoryManagement } = composeFinance(server, [op], undefined, undefined, new Set(['cat-fu']));
     const row = categoryManagement.rows.expense.find((c) => c.id === 'cat-fu')!;
     check(
-      '25 failed category UPDATE (server row exists) -> draft overlay + failed marker',
-      row.name === 'Local' && categoryManagement.opById.get('cat-fu') === 'update' && categoryManagement.failedIds.has('cat-fu'),
+      '25 failed category UPDATE (server row exists) -> AUTHORITATIVE name wins for display; NOT synthetic',
+      row.name === 'B-edit' &&
+        categoryManagement.opById.get('cat-fu') === 'update' &&
+        categoryManagement.failedIds.has('cat-fu') &&
+        categoryManagement.syntheticIds.has('cat-fu') === false &&
+        categoryManagement.attemptedNameById.get('cat-fu') === 'A-edit' &&
+        data.customCats.expense.find((c) => c.id === 'cat-fu')!.name === 'B-edit',
       JSON.stringify(row),
     );
   }
-  // 26 — FAILED category UPDATE + server row GONE: display-only synthetic, NOT in data.customCats
+  // 25b — attempted local name is conflict METADATA only (never row content)
+  {
+    const server = financeWith([serverCat('cat-m', { name: 'srv-name' })]);
+    const op = makePendingCategoryUpdate({ scope: A, entityId: 'cat-m', payload: kd({ name: 'my-attempt' }), expectedUpdatedAt: 'V1', queueId: 'q1' });
+    const { categoryManagement } = composeFinance(server, [op], undefined, undefined, new Set(['cat-m']));
+    check(
+      '25b attempted local name only in attemptedNameById, not in the displayed row',
+      categoryManagement.rows.expense.find((c) => c.id === 'cat-m')!.name === 'srv-name' &&
+        categoryManagement.attemptedNameById.get('cat-m') === 'my-attempt',
+      '',
+    );
+  }
+  // 26 — FAILED category UPDATE + server row GONE: display-only synthetic, IS
+  // synthetic, NOT in data.customCats
   {
     const server = financeWith([]); // deleted elsewhere
     const op = makePendingCategoryUpdate({ scope: A, entityId: 'cat-gone', payload: kd({ type: 'expense', name: 'Local Edit' }), expectedUpdatedAt: 'V1', queueId: 'q1' });
     const { data, categoryManagement } = composeFinance(server, [op], undefined, undefined, new Set(['cat-gone']));
     const row = categoryManagement.rows.expense.find((c) => c.id === 'cat-gone');
     check(
-      '26 failed category UPDATE + row gone -> display-only synthetic; NOT in data.customCats',
+      '26 failed category UPDATE + row gone -> display-only synthetic; syntheticIds; NOT in data.customCats',
       !!row && row.name === 'Local Edit' &&
         !data.customCats.expense.some((c) => c.id === 'cat-gone') &&
         categoryManagement.opById.get('cat-gone') === 'update' &&
-        categoryManagement.failedIds.has('cat-gone'),
+        categoryManagement.failedIds.has('cat-gone') &&
+        categoryManagement.syntheticIds.has('cat-gone') &&
+        categoryManagement.attemptedNameById.get('cat-gone') === 'Local Edit',
       `row=${JSON.stringify(row)}`,
     );
   }
