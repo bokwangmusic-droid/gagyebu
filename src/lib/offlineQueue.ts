@@ -1,22 +1,31 @@
 /**
- * Offline Write Queue — pure core. STEP 16-H2-A1, widened in STEP 16-H2-B1.
+ * Offline Write Queue — pure core. STEP 16-H2-A1, widened in H2-B1 and again
+ * in STEP 16-H2-C2-A1.
  *
  * NO Supabase, NO AsyncStorage, NO React. Just the record shapes, the
- * validator, the FIFO / idempotent enqueue, the scope filter, and the
- * transaction read overlay. Storage side-effects live in
+ * validator, the FIFO / idempotent enqueue, the scope filter, and the read
+ * overlay. Storage side-effects live in
  * src/services/offlineQueue/persistence.ts; server replay in
  * .../runOp.ts; sequencing in .../flusher.ts.
  *
- * Scope: transaction CREATE (H2-A1) + transaction UPDATE + soft DELETE
- * (H2-B1, engine only — no enqueue API / UI wiring yet). `entity` stays the
- * literal `'transaction'`; `op` is now a 3-way union. `schemaVersion` stays
- * 1 — the CREATE record shape is unchanged, so H2-A2 devices' stored
- * CREATE-only queues load without a migration.
+ * Scope: transaction CREATE/UPDATE/soft-DELETE (H2-A/B) + card
+ * CREATE/UPDATE/soft-DELETE (H2-C2-A1, engine only — no enqueue-from-UI
+ * wiring). `entity` is now `'transaction' | 'card'`; `op` is a 3-way union
+ * per entity. `schemaVersion` STAYS 1 — the transaction record shapes are
+ * byte-identical, so an H2-B device's stored transaction-only queue loads
+ * with no migration; a card record simply has `entity:'card'`.
+ *
+ * IMPORTANT (H2-C2-A1 §8/§9/§15): a pending/failed CARD is NEVER folded into
+ * `RemoteFinanceData.cards`. `composeFinance` returns card display rows in a
+ * SEPARATE `cardManagement` collection so the transaction card picker,
+ * backup and household-import snapshots only ever see authoritative server
+ * cards — no cross-entity chaining is structurally possible.
  */
+import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { Transaction } from '@/store/types';
+import type { CreditCard, Transaction } from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
@@ -43,13 +52,15 @@ export interface PendingWriteScope {
  * optimistic-concurrency token lives in `expectedUpdatedAt` (UPDATE/DELETE),
  * NOT in `payload`.
  */
+export type PendingEntity = 'transaction' | 'card';
+
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
   queueId: string;
   schemaVersion: typeof QUEUE_SCHEMA_VERSION;
   scope: PendingWriteScope;
-  entity: 'transaction';
-  /** The client-stable `txn-…` id of the transaction this op targets. */
+  entity: PendingEntity;
+  /** The client-stable `txn-…` / `card-…` id of the row this op targets. */
   entityId: string;
   enqueuedAt: string;
   attemptCount: number;
@@ -67,6 +78,7 @@ interface PendingWriteBase {
 
 /** `payload` is exactly what `createTransaction()` is re-handed. */
 export interface PendingTransactionCreate extends PendingWriteBase {
+  entity: 'transaction';
   op: 'create';
   payload: NewTransactionDraft;
 }
@@ -82,6 +94,7 @@ export interface PendingTransactionCreate extends PendingWriteBase {
  * card link; `null` when the row had no card.
  */
 export interface PendingTransactionUpdate extends PendingWriteBase {
+  entity: 'transaction';
   op: 'update';
   payload: NewTransactionDraft;
   expectedUpdatedAt: string;
@@ -94,6 +107,38 @@ export interface PendingTransactionUpdate extends PendingWriteBase {
  * to store.
  */
 export interface PendingTransactionDelete extends PendingWriteBase {
+  entity: 'transaction';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
+/* -------------------- card records (STEP 16-H2-C2-A1) -------------------- */
+
+/** `payload` is exactly what `createCard({ draft })` is re-handed. `entityId`
+ *  is the SAME client `card-…` id the direct `createCard` used, so a
+ *  lost-response replay hits the service's 23505 idempotency path (§3). */
+export interface PendingCardCreate extends PendingWriteBase {
+  entity: 'card';
+  op: 'create';
+  payload: NewCardDraft;
+}
+
+/** `payload` is what `updateCard({ draft })` is re-handed. `expectedUpdatedAt`
+ *  is FROZEN from the `cardMeta.updatedAt` the edit screen opened against and
+ *  is NEVER refreshed (§4) — a stale token is what turns a concurrent edit
+ *  into a `conflict` instead of a blind overwrite. Cards have no
+ *  `originalRawCardId` analogue. */
+export interface PendingCardUpdate extends PendingWriteBase {
+  entity: 'card';
+  op: 'update';
+  payload: NewCardDraft;
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeleteCard` guarded on the FROZEN `expectedUpdatedAt`
+ *  (§5). NO `payload`. Never a hard DELETE. */
+export interface PendingCardDelete extends PendingWriteBase {
+  entity: 'card';
   op: 'delete';
   expectedUpdatedAt: string;
 }
@@ -101,7 +146,10 @@ export interface PendingTransactionDelete extends PendingWriteBase {
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
-  | PendingTransactionDelete;
+  | PendingTransactionDelete
+  | PendingCardCreate
+  | PendingCardUpdate
+  | PendingCardDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -145,13 +193,47 @@ function isValidDraft(p: unknown): p is NewTransactionDraft {
   return true;
 }
 
+/**
+ * Structural validity for a stored `NewCardDraft`. Only the user-editable
+ * shape; any server/identity/timestamp field present -> reject (§6).
+ */
+function isValidCardDraft(p: unknown): p is NewCardDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (!isNonEmptyString(d.name)) return false;
+  if (d.color !== undefined) {
+    const c = d.color as Record<string, unknown>;
+    if (c == null || typeof c !== 'object') return false;
+    if (!isNonEmptyString(c.bg) || !isNonEmptyString(c.color)) return false;
+  }
+  if (d.paymentDay !== undefined && (!isFiniteNumber(d.paymentDay) || d.paymentDay < 1 || d.paymentDay > 31)) {
+    return false;
+  }
+  if (d.closingDay !== undefined && (!isFiniteNumber(d.closingDay) || d.closingDay < 1 || d.closingDay > 31)) {
+    return false;
+  }
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
   const r = x as Record<string, unknown>;
   if (r.schemaVersion !== QUEUE_SCHEMA_VERSION) return null;
   if (!isNonEmptyString(r.queueId)) return null;
-  if (r.entity !== 'transaction') return null;
+  if (r.entity !== 'transaction' && r.entity !== 'card') return null;
   if (r.op !== 'create' && r.op !== 'update' && r.op !== 'delete') return null;
   if (!isNonEmptyString(r.entityId)) return null;
   const scope = r.scope as Record<string, unknown> | undefined;
@@ -166,7 +248,6 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     queueId: r.queueId,
     schemaVersion: QUEUE_SCHEMA_VERSION as typeof QUEUE_SCHEMA_VERSION,
     scope: { userId: scope.userId, householdId: scope.householdId },
-    entity: 'transaction' as const,
     entityId: r.entityId,
     enqueuedAt: r.enqueuedAt,
     attemptCount: r.attemptCount,
@@ -177,9 +258,27 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
       : {}),
   };
 
+  if (r.entity === 'card') {
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token (§6)
+      if (!isValidCardDraft(r.payload)) return null;
+      return { ...base, entity: 'card', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (!isValidCardDraft(r.payload)) return null;
+      return { ...base, entity: 'card', op: 'update', payload: r.payload, expectedUpdatedAt: r.expectedUpdatedAt };
+    }
+    // card delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload (§6)
+    return { ...base, entity: 'card', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  // ---- transaction ----
   if (r.op === 'create') {
     if (!isValidDraft(r.payload)) return null;
-    return { ...base, op: 'create', payload: r.payload };
+    return { ...base, entity: 'transaction', op: 'create', payload: r.payload };
   }
 
   if (r.op === 'update') {
@@ -188,6 +287,7 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     if (!isValidDraft(r.payload)) return null;
     return {
       ...base,
+      entity: 'transaction',
       op: 'update',
       payload: r.payload,
       expectedUpdatedAt: r.expectedUpdatedAt,
@@ -195,10 +295,10 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     };
   }
 
-  // delete
+  // transaction delete
   if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
   if ('payload' in r) return null; // a DELETE carries no user payload (STEP 16-H2-B1 §7)
-  return { ...base, op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  return { ...base, entity: 'transaction', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
 }
 
 /** Drop invalid entries, keep valid ones in order. Never throws. */
@@ -293,7 +393,73 @@ export function makePendingTransactionDelete(args: {
   };
 }
 
-/** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity. */
+export function makePendingCardCreate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewCardDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingCardCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'card',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingCardUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewCardDraft;
+  /** FROZEN — the `cardMeta.updatedAt` the edit screen opened against. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingCardUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'card',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingCardDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingCardDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'card',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+/** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
+ *  `entity` is part of the key, so a card op and a transaction op that happen
+ *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
 function dedupKey(w: Pick<PendingWrite, 'scope' | 'entity' | 'op' | 'entityId'>): string {
   return `${w.scope.userId}|${w.scope.householdId}|${w.entity}|${w.op}|${w.entityId}`;
 }
@@ -323,25 +489,52 @@ function draftEqual(a: NewTransactionDraft, b: NewTransactionDraft): boolean {
   );
 }
 
+/** Structural equality of two card drafts (name / colour / days). */
+function cardDraftEqual(a: NewCardDraft, b: NewCardDraft): boolean {
+  return (
+    a.name === b.name &&
+    (a.color?.bg ?? null) === (b.color?.bg ?? null) &&
+    (a.color?.color ?? null) === (b.color?.color ?? null) &&
+    (a.paymentDay ?? null) === (b.paymentDay ?? null) &&
+    (a.closingDay ?? null) === (b.closingDay ?? null)
+  );
+}
+
 /**
  * Is `b` the EXACT SAME request as `a` — safe to treat a re-enqueue as an
- * idempotent no-op? Same dedup identity is assumed. CREATE: yes by identity
- * alone (STEP 16-H2-A1 §12). UPDATE: also same frozen `expectedUpdatedAt`,
- * same `originalRawCardId`, same draft. DELETE: also same frozen
- * `expectedUpdatedAt`.
+ * idempotent no-op? Same dedup identity (scope+entity+op+entityId) is assumed.
+ *   - transaction CREATE: yes by identity alone (STEP 16-H2-A1 §12).
+ *   - transaction UPDATE: also same frozen `expectedUpdatedAt`, same
+ *     `originalRawCardId`, same draft.
+ *   - card CREATE: identity AND same draft — a DIFFERING card CREATE for the
+ *     same id is `existing-pending`, never a silent overwrite (§7/§10).
+ *   - card UPDATE: same frozen `expectedUpdatedAt` AND same draft.
+ *   - DELETE (either entity): same frozen `expectedUpdatedAt`.
  */
 function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
-  if (a.op !== b.op) return false;
-  if (a.op === 'create') return true;
-  if (a.op === 'update' && b.op === 'update') {
-    return (
-      a.expectedUpdatedAt === b.expectedUpdatedAt &&
-      a.originalRawCardId === b.originalRawCardId &&
-      draftEqual(a.payload, b.payload)
-    );
+  if (a.entity !== b.entity || a.op !== b.op) return false;
+
+  if (a.entity === 'card' && b.entity === 'card') {
+    if (a.op === 'create' && b.op === 'create') return cardDraftEqual(a.payload, b.payload);
+    if (a.op === 'update' && b.op === 'update') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt && cardDraftEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
   }
-  if (a.op === 'delete' && b.op === 'delete') {
-    return a.expectedUpdatedAt === b.expectedUpdatedAt;
+
+  if (a.entity === 'transaction' && b.entity === 'transaction') {
+    if (a.op === 'create') return true;
+    if (a.op === 'update' && b.op === 'update') {
+      return (
+        a.expectedUpdatedAt === b.expectedUpdatedAt &&
+        a.originalRawCardId === b.originalRawCardId &&
+        draftEqual(a.payload, b.payload)
+      );
+    }
+    if (a.op === 'delete' && b.op === 'delete') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    }
   }
   return false;
 }
@@ -357,10 +550,12 @@ export type EnqueueResult =
  *    exists:
  *      · if it is the EXACT same request (`sameRequest`) -> idempotent
  *        no-op: queue unchanged, EXISTING record returned, `deduped: true`.
- *      · otherwise (a DIFFERING pending UPDATE/DELETE for the same
- *        transaction) -> REFUSED with `reason: 'existing-pending'`. The
- *        existing record is NEVER silently overwritten or dropped, and no
- *        compaction is attempted (STEP 16-H2-B1 §8/§20).
+ *      · otherwise (a DIFFERING pending op for the same row — a changed
+ *        UPDATE/DELETE token or payload, or a differing card CREATE draft)
+ *        -> REFUSED with `reason: 'existing-pending'`. The existing record is
+ *        NEVER silently overwritten or dropped, and no compaction across ops
+ *        (CREATE→UPDATE, UPDATE→DELETE, …) is attempted (H2-B1 §8/§20,
+ *        H2-C2-A1 §7).
  *  - Cap: at `MAX_PENDING_WRITES` a genuinely new record is refused
  *    (`reason: 'cap'`) — the oldest entry is NEVER evicted.
  */
@@ -515,10 +710,136 @@ export function serverRowConfirmsUpdate(
   return true;
 }
 
+function cardDraftToDomain(op: PendingCardCreate | PendingCardUpdate): CreditCard {
+  const d = op.payload;
+  return {
+    id: op.entityId,
+    name: d.name,
+    ...(d.color !== undefined ? { color: d.color } : {}),
+    ...(d.paymentDay !== undefined ? { paymentDay: d.paymentDay } : {}),
+    ...(d.closingDay !== undefined ? { closingDay: d.closingDay } : {}),
+    createdAt: op.enqueuedAt, // synthetic — the row is read-only, never re-edited
+  };
+}
+
+/** Overlay a card UPDATE draft onto an existing domain card. `id` /
+ *  `createdAt` (server identity) are preserved; a cleared colour becomes
+ *  `undefined` — the same "feature off => cleared" rule `buildCardUpdate` uses. */
+function applyCardUpdate(row: CreditCard, d: NewCardDraft): CreditCard {
+  return {
+    ...row,
+    name: d.name,
+    color: d.color,
+    paymentDay: d.paymentDay,
+    closingDay: d.closingDay,
+  };
+}
+
+/**
+ * Does an authoritative server card already reflect a queued card UPDATE's
+ * desired draft? STEP 16-H2-C2-A1 §23/§25 — the confirmation before a durable
+ * ack. Mirrors the write service's own `cardFieldsMatch` field set at the
+ * READ-MODEL level: name / colour(bg+fg) / paymentDay / closingDay, compared
+ * strictly (absent === null). No `JSON.stringify`. Also used for the CREATE
+ * ack (§22): id present AND fields match. Pure.
+ */
+export function serverCardConfirmsUpdate(serverRow: CreditCard, draft: NewCardDraft): boolean {
+  if (serverRow.name !== draft.name) return false;
+  if ((serverRow.color?.bg ?? null) !== (draft.color?.bg ?? null)) return false;
+  if ((serverRow.color?.color ?? null) !== (draft.color?.color ?? null)) return false;
+  if ((serverRow.paymentDay ?? null) !== (draft.paymentDay ?? null)) return false;
+  if ((serverRow.closingDay ?? null) !== (draft.closingDay ?? null)) return false;
+  return true;
+}
+
+export interface CardManagementView {
+  /**
+   * The cards to render on the card-management screen ONLY: authoritative
+   * server cards, with a pending UPDATE overlaid, plus a synthetic row for a
+   * pending/failed CREATE, plus a synthetic row for a FAILED UPDATE whose
+   * server card is gone, minus a not-failed pending DELETE. This array is
+   * DELIBERATELY separate from `data.cards` (§8/§9/§15) so the transaction
+   * card picker, backup and household-import never see an un-sent card and
+   * no cross-entity chaining is possible.
+   */
+  rows: CreditCard[];
+  /** row id -> the pending op that produced or marks it (for the label / read-only gate). */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** row ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server card ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+}
+
+function composeCardManagement(
+  serverCards: readonly CreditCard[],
+  ops: readonly PendingWrite[],
+  failedCardIds?: ReadonlySet<string>,
+): CardManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const cardOps = ops.filter(
+    (o): o is PendingCardCreate | PendingCardUpdate | PendingCardDelete => o.entity === 'card',
+  );
+  if (cardOps.length === 0) {
+    return { rows: serverCards.slice(), opById, failedIds, hiddenIds };
+  }
+
+  const failed = (id: string) => !!failedCardIds?.has(id);
+  const rows = serverCards.slice(); // never mutates serverCards
+  const idxOf = (id: string) => rows.findIndex((c) => c.id === id);
+
+  for (const op of cardOps) {
+    const idx = idxOf(op.entityId);
+
+    if (op.op === 'create') {
+      if (idx !== -1) continue; // the flush already landed — no marker
+      rows.push(cardDraftToDomain(op));
+      opById.set(op.entityId, 'create');
+      if (failed(op.entityId)) failedIds.add(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (idx !== -1) {
+        rows[idx] = applyCardUpdate(rows[idx], op.payload);
+        opById.set(op.entityId, 'update');
+        if (failed(op.entityId)) failedIds.add(op.entityId);
+        continue;
+      }
+      // server card gone: only a TERMINAL-failed UPDATE gets a display-only
+      // synthetic row here (a not-failed one just waits — like transactions).
+      if (failed(op.entityId)) {
+        rows.push(cardDraftToDomain(op));
+        opById.set(op.entityId, 'update');
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (idx !== -1) {
+        opById.set(op.entityId, 'delete'); // keep the server card visible, mark it failed
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+    if (idx !== -1) {
+      rows.splice(idx, 1);
+      hiddenIds.push(op.entityId);
+    }
+  }
+
+  return { rows, opById, failedIds, hiddenIds };
+}
+
 export interface ComposedFinance {
   /** `serverData` with pending overlays applied. A NEW object when anything
    *  changed; the SAME reference when nothing applied. `serverData` and its
-   *  arrays/maps are never mutated. */
+   *  arrays/maps are never mutated. NOTE: `data.cards` is NEVER touched by a
+   *  card op — see `cardManagement`. */
   data: RemoteFinanceData;
   /** transaction ids present in `data.transactions` ONLY because of a pending
    *  CREATE / UPDATE overlay, plus failed-DELETE ids whose server row is
@@ -537,6 +858,12 @@ export interface ComposedFinance {
    * when there are none.
    */
   orphanedFailedUpdates: Transaction[];
+  /**
+   * STEP 16-H2-C2-A1 — DISPLAY-ONLY card rows + markers for the
+   * card-management screen. NEVER merged into `data.cards`. Empty view when
+   * there are no card ops.
+   */
+  cardManagement: CardManagementView;
 }
 
 /**
@@ -561,16 +888,22 @@ export interface ComposedFinance {
  *    changes DELETE behaviour (failed -> keep visible) and routes an
  *    otherwise-lost failed UPDATE into `orphanedFailedUpdates`. A failed
  *    CREATE still overlays via the normal CREATE path (unchanged).
- *  - Ops are applied in enqueue order. Non-transaction ops are ignored.
+ *  - Ops are applied in enqueue order.
+ *  - CARD ops NEVER touch `data.cards` — they feed `cardManagement` only
+ *    (STEP 16-H2-C2-A1 §8/§9/§15). `failedCardIds` is a bare card-id set
+ *    (the coordinator maps its internal `${entity}:${entityId}` keys down).
  */
 export function composeFinance(
   serverData: RemoteFinanceData,
   ops: readonly PendingWrite[],
   failedTransactionIds?: ReadonlySet<string>,
+  failedCardIds?: ReadonlySet<string>,
 ): ComposedFinance {
+  const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
+
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
-    return { data: serverData, pendingIds: [], hiddenIds: [], orphanedFailedUpdates: [] };
+    return { data: serverData, pendingIds: [], hiddenIds: [], orphanedFailedUpdates: [], cardManagement };
   }
 
   let txns: Transaction[] | null = null; // lazily copied on first change
@@ -637,7 +970,7 @@ export function composeFinance(
   }
 
   if (!txns && !meta) {
-    return { data: serverData, pendingIds, hiddenIds, orphanedFailedUpdates };
+    return { data: serverData, pendingIds, hiddenIds, orphanedFailedUpdates, cardManagement };
   }
 
   return {
@@ -649,5 +982,6 @@ export function composeFinance(
     pendingIds,
     hiddenIds,
     orphanedFailedUpdates,
+    cardManagement,
   };
 }

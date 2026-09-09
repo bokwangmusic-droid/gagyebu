@@ -9,7 +9,13 @@
  * `Map<id, Transaction>` of ACTIVE rows). No React, no Supabase.
  */
 import { QUEUE_SCHEMA_VERSION, type PendingTransactionCreate } from '@/lib/offlineQueue';
+import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type {
+  CreateCardResult,
+  SoftDeleteCardResult,
+  UpdateCardResult,
+} from '@/services/remoteCardWrite';
 import type {
   CreateTransactionResult,
   SoftDeleteResult,
@@ -20,7 +26,7 @@ import {
   type CoordinatorScope,
 } from '@/services/offlineQueue/coordinator';
 import type { QueueStorage } from '@/services/offlineQueue/persistence';
-import type { Transaction } from '@/store/types';
+import type { CreditCard, Transaction } from '@/store/types';
 
 export interface CaseResult {
   name: string;
@@ -83,10 +89,15 @@ interface Harness {
   /** trusted server snapshot's ACTIVE transactions, keyed by id. */
   server: Map<string, Transaction>;
   cards: Set<string>;
+  /** trusted server snapshot's ACTIVE cards, keyed by id (STEP 16-H2-C2-A1). */
+  cardServer: Map<string, CreditCard>;
   storage: ReturnType<typeof memStorage>;
   createLog: { id: string; householdId: string; expectedUserId: string; knownCardIds: ReadonlySet<string> }[];
   updateLog: HUpdateArgs[];
   deleteLog: HDeleteArgs[];
+  cardCreateLog: HCardCreateArgs[];
+  cardUpdateLog: HCardUpdateArgs[];
+  cardDeleteLog: HCardDeleteArgs[];
   maxConcurrentCreates: number;
   timers: { id: number; fn: () => void; ms: number; cancelled: boolean }[];
   setScope: (s: CoordinatorScope | null) => void;
@@ -94,13 +105,32 @@ interface Harness {
   setCreate: (f: (args: HCreateArgs) => Promise<CreateTransactionResult>) => void;
   setUpdate: (f: (args: HUpdateArgs) => Promise<UpdateTransactionResult>) => void;
   setDelete: (f: (args: HDeleteArgs) => Promise<SoftDeleteResult>) => void;
+  setCardCreate: (f: (args: HCardCreateArgs) => Promise<CreateCardResult>) => void;
+  setCardUpdate: (f: (args: HCardUpdateArgs) => Promise<UpdateCardResult>) => void;
+  setCardDelete: (f: (args: HCardDeleteArgs) => Promise<SoftDeleteCardResult>) => void;
   /** put/replace a server row (id present + fields set). */
   serverPut: (id: string, d: NewTransactionDraft) => void;
   /** remove a server row (id absent == deleted/gone in the read model). */
   serverDelete: (id: string) => void;
+  cardServerPut: (id: string, d: NewCardDraft) => void;
+  cardServerDelete: (id: string) => void;
   runTimers: () => void;
   refreshes: () => number;
 }
+
+const cardDraft = (over: Partial<NewCardDraft> = {}): NewCardDraft => ({ name: 'Visa', ...over });
+const draftToCard = (id: string, d: NewCardDraft): CreditCard => ({
+  id,
+  name: d.name,
+  ...(d.color !== undefined ? { color: d.color } : {}),
+  ...(d.paymentDay !== undefined ? { paymentDay: d.paymentDay } : {}),
+  ...(d.closingDay !== undefined ? { closingDay: d.closingDay } : {}),
+  createdAt: '2026-09-10T00:00:00.000Z',
+});
+
+type HCardCreateArgs = { id: string; householdId: string; expectedUserId: string; draft: NewCardDraft };
+type HCardUpdateArgs = HCardCreateArgs & { expectedUpdatedAt: string };
+type HCardDeleteArgs = { id: string; householdId: string; expectedUserId: string; expectedUpdatedAt: string };
 
 type HCreateArgs = {
   id: string;
@@ -139,6 +169,10 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   const createLog: Harness['createLog'] = [];
   const updateLog: HUpdateArgs[] = [];
   const deleteLog: HDeleteArgs[] = [];
+  const cardServer = new Map<string, CreditCard>();
+  const cardCreateLog: HCardCreateArgs[] = [];
+  const cardUpdateLog: HCardUpdateArgs[] = [];
+  const cardDeleteLog: HCardDeleteArgs[] = [];
   let inFlight = 0;
 
   const h = {} as Harness;
@@ -175,12 +209,33 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     return { ok: true };
   };
 
+  // default card services: "server accepted + snapshot reflects it"
+  let cardCreateImpl = async (args: HCardCreateArgs): Promise<CreateCardResult> => {
+    cardCreateLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    cardServer.set(args.id, draftToCard(args.id, args.draft));
+    return { ok: true, id: args.id };
+  };
+  let cardUpdateImpl = async (args: HCardUpdateArgs): Promise<UpdateCardResult> => {
+    cardUpdateLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    cardServer.set(args.id, draftToCard(args.id, args.draft));
+    return { ok: true, updatedAt: '2026-09-11T00:00:00.000Z' };
+  };
+  let cardDeleteImpl = async (args: HCardDeleteArgs): Promise<SoftDeleteCardResult> => {
+    cardDeleteLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    cardServer.delete(args.id);
+    return { ok: true };
+  };
+
   const coord = createPendingWriteCoordinator({
     storage: storage as unknown as QueueStorage,
     getScope: () => scope,
     getRemoteReady: () => remoteReady,
     getKnownCardIds: () => cards,
     getServerTransactions: () => server,
+    getServerCards: () => cardServer,
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();
@@ -189,6 +244,9 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     createTransaction: (args) => createImpl(args as HCreateArgs),
     updateTransaction: (args) => updateImpl(args as HUpdateArgs),
     softDeleteTransaction: (args) => deleteImpl(args as HDeleteArgs),
+    createCard: (args) => cardCreateImpl(args as HCardCreateArgs),
+    updateCard: (args) => cardUpdateImpl(args as HCardUpdateArgs),
+    softDeleteCard: (args) => cardDeleteImpl(args as HCardDeleteArgs),
     schedule: (fn, ms) => {
       const id = ++timerSeq;
       timers.push({ id, fn, ms, cancelled: false });
@@ -204,10 +262,14 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   h.coord = coord;
   h.server = server;
   h.cards = cards;
+  h.cardServer = cardServer;
   h.storage = storage;
   h.createLog = createLog;
   h.updateLog = updateLog;
   h.deleteLog = deleteLog;
+  h.cardCreateLog = cardCreateLog;
+  h.cardUpdateLog = cardUpdateLog;
+  h.cardDeleteLog = cardDeleteLog;
   h.maxConcurrentCreates = 0;
   h.timers = timers;
   h.setScope = (s) => {
@@ -226,11 +288,26 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   h.setDelete = (f) => {
     deleteImpl = f;
   };
+  h.setCardCreate = (f) => {
+    cardCreateImpl = f;
+  };
+  h.setCardUpdate = (f) => {
+    cardUpdateImpl = f;
+  };
+  h.setCardDelete = (f) => {
+    cardDeleteImpl = f;
+  };
   h.serverPut = (id, d) => {
     server.set(id, draftToTxn(id, d));
   };
   h.serverDelete = (id) => {
     server.delete(id);
+  };
+  h.cardServerPut = (id, d) => {
+    cardServer.set(id, draftToCard(id, d));
+  };
+  h.cardServerDelete = (id) => {
+    cardServer.delete(id);
   };
   h.runTimers = () => {
     const due = timers.filter((t) => !t.cancelled);
@@ -1371,6 +1448,351 @@ export async function runCoordinatorCases(): Promise<{
       st.failedIds.has('txn-51') && st.failedReasons.get('txn-51') === 'gone' &&
         st.opByEntity.get('txn-51') === 'update' && st.pendingCount === 1,
       `reason=${st.failedReasons.get('txn-51')}`,
+    );
+  }
+
+  /* ================================================================= *
+   * STEP 16-H2-C2-A1 — CARD enqueue / runOp forwarding / ack / scope
+   * ================================================================= */
+
+  const CU_TRANSPORT: UpdateCardResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const CU_CONFLICT: UpdateCardResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' };
+  const CC_TRANSPORT: CreateCardResult = { ok: false, message: 'net', transport: true };
+  const CD_TRANSPORT: SoftDeleteCardResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const CD_CONFLICT: SoftDeleteCardResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' };
+
+  // C1 (§28.25) — CREATE forwards exact id / draft / scope
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    await h.coord.enqueueCardCreate({ scope: A, entityId: 'card-c1', payload: cardDraft({ name: 'C1', paymentDay: 7 }) });
+    await settle(6);
+    const a = h.cardCreateLog[0];
+    check(
+      'C1 card CREATE runOp forwards exact id/draft/scope',
+      h.cardCreateLog.length === 1 && a.id === 'card-c1' && a.householdId === A.householdId &&
+        a.expectedUserId === A.userId && a.draft.name === 'C1' && a.draft.paymentDay === 7,
+      JSON.stringify(a),
+    );
+  }
+
+  // C2 (§28.26/27) — CREATE success -> acked (fields match) ; CREATE transport -> pending
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    const enq = await h.coord.enqueueCardCreate({ scope: A, entityId: 'card-c2', payload: cardDraft({ name: 'C2' }) });
+    await settle(8);
+    check(
+      'C2 card CREATE online -> server has it + fields match -> queue empty',
+      enq.ok === true && h.cardServer.get('card-c2')?.name === 'C2' &&
+        h.coord.getState().card.pendingIds.size === 0 && h.coord.getState().pendingCount === 0,
+      `present=${h.cardServer.has('card-c2')} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCardCreate(() => Promise.resolve(CC_TRANSPORT));
+    const enq = await h.coord.enqueueCardCreate({ scope: A, entityId: 'card-c2t', payload: cardDraft() });
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'C2t card CREATE transport -> pending card op, not on server',
+      enq.ok === true && st.card.pendingIds.has('card-c2t') &&
+        st.card.opByEntity.get('card-c2t') === 'create' && !h.cardServer.has('card-c2t'),
+      `pending=${[...st.card.pendingIds]}`,
+    );
+  }
+
+  // C3 (§28.28) — UPDATE forwards the FROZEN token verbatim; (§28.29) success; (§28.30) transport
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c3', cardDraft({ name: 'old' }));
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c3', payload: cardDraft({ name: 'new' }), expectedUpdatedAt: 'FROZEN-1' });
+    await settle(8);
+    check(
+      'C3 card UPDATE forwards frozen token; applied; acked',
+      h.cardUpdateLog.length === 1 && h.cardUpdateLog[0].expectedUpdatedAt === 'FROZEN-1' &&
+        h.cardServer.get('card-c3')?.name === 'new' && h.coord.getState().pendingCount === 0,
+      JSON.stringify(h.cardUpdateLog[0]),
+    );
+  }
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c3t', cardDraft());
+    h.setCardUpdate((args) => { h.cardUpdateLog.push(args); return Promise.resolve(CU_TRANSPORT); });
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c3t', payload: cardDraft({ name: 'x' }), expectedUpdatedAt: 'V1' });
+    await settle();
+    h.runTimers();
+    await settle(6);
+    check(
+      'C3t card UPDATE transport -> every replay reuses the SAME frozen token',
+      h.cardUpdateLog.length >= 2 && h.cardUpdateLog.every((u) => u.expectedUpdatedAt === 'V1'),
+      JSON.stringify(h.cardUpdateLog.map((u) => u.expectedUpdatedAt)),
+    );
+  }
+
+  // C4 (§28.31) — UPDATE conflict reason preserved, retained, no auto-retry
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c4', cardDraft({ name: 'B-won' }));
+    let calls = 0;
+    h.setCardUpdate(() => { calls += 1; return Promise.resolve(CU_CONFLICT); });
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c4', payload: cardDraft({ name: 'A' }), expectedUpdatedAt: 'V1' });
+    await settle(6);
+    const after = calls;
+    h.coord.requestFlush();
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'C4 card UPDATE conflict -> failed + reason=conflict, B row untouched, no auto-retry',
+      st.card.failedIds.has('card-c4') && st.card.failedReasons.get('card-c4') === 'conflict' &&
+        h.cardServer.get('card-c4')?.name === 'B-won' && after === 1 && calls === 1 &&
+        st.card.opByEntity.get('card-c4') === 'update',
+      `reason=${st.card.failedReasons.get('card-c4')} calls=${calls}`,
+    );
+  }
+
+  // C5 (§28.32–35) — DELETE forwards frozen token; success; transport; conflict reason
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c5', cardDraft());
+    await h.coord.enqueueCardDelete({ scope: A, entityId: 'card-c5', expectedUpdatedAt: 'DEL-FROZEN' });
+    await settle(8);
+    check(
+      'C5 card DELETE forwards frozen token; row gone; acked',
+      h.cardDeleteLog.length === 1 && h.cardDeleteLog[0].expectedUpdatedAt === 'DEL-FROZEN' &&
+        !h.cardServer.has('card-c5') && h.coord.getState().pendingCount === 0,
+      JSON.stringify(h.cardDeleteLog[0]),
+    );
+  }
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c5c', cardDraft());
+    h.setCardDelete(() => Promise.resolve(CD_CONFLICT));
+    await h.coord.enqueueCardDelete({ scope: A, entityId: 'card-c5c', expectedUpdatedAt: 'V1' });
+    await settle(6);
+    const st = h.coord.getState();
+    check(
+      'C5c card DELETE conflict -> failed + reason=conflict, card still on server',
+      st.card.failedIds.has('card-c5c') && st.card.failedReasons.get('card-c5c') === 'conflict' &&
+        h.cardServer.has('card-c5c') && st.pendingCount === 1,
+      `reason=${st.card.failedReasons.get('card-c5c')}`,
+    );
+  }
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c5t', cardDraft());
+    h.setCardDelete(() => Promise.resolve(CD_TRANSPORT));
+    const enq = await h.coord.enqueueCardDelete({ scope: A, entityId: 'card-c5t', expectedUpdatedAt: 'V1' });
+    await settle();
+    check(
+      'C5t card DELETE transport -> pending delete op',
+      enq.ok === true && h.coord.getState().card.opByEntity.get('card-c5t') === 'delete' &&
+        h.coord.getState().card.pendingIds.has('card-c5t'),
+      '',
+    );
+  }
+
+  // C6 (§28.36) — CREATE ack: id exists but fields MISMATCH -> NOT acked (replays)
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    let applied = false;
+    h.setCardCreate(async (args) => {
+      h.cardCreateLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      // server ends up with a DIFFERENT card for this id until `applied`
+      h.cardServer.set(args.id, draftToCard(args.id, cardDraft({ name: applied ? args.draft.name : 'WRONG' })));
+      return { ok: true, id: args.id };
+    });
+    await h.coord.enqueueCardCreate({ scope: A, entityId: 'card-c6', payload: cardDraft({ name: 'RIGHT' }) });
+    await settle(8);
+    const stalePending = h.coord.getState().pendingCount === 1;
+    applied = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'C6 card CREATE ack requires FIELD match, not just id -> stale mismatch replays, then acks',
+      stalePending && h.cardServer.get('card-c6')?.name === 'RIGHT' && h.coord.getState().pendingCount === 0,
+      `stalePending=${stalePending} name=${h.cardServer.get('card-c6')?.name}`,
+    );
+  }
+
+  // C7 (§28.38/39) — UPDATE ack: stale fields -> no ack; match -> ack
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c7', cardDraft({ name: 'v0' }));
+    let applied = false;
+    h.setCardUpdate(async (args) => {
+      h.cardUpdateLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      if (applied) h.cardServerPut(args.id, args.draft);
+      return { ok: true, updatedAt: 'V2' };
+    });
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c7', payload: cardDraft({ name: 'v9' }), expectedUpdatedAt: 'V1' });
+    await settle(8);
+    const stale = h.coord.getState().pendingCount === 1;
+    applied = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'C7 card UPDATE ack: stale snapshot -> replays; acked once fields match',
+      stale && h.cardServer.get('card-c7')?.name === 'v9' && h.coord.getState().pendingCount === 0,
+      `stale=${stale}`,
+    );
+  }
+
+  // C8 (§28.40/41) — DELETE ack: still active -> no ack; absent -> ack
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c8', cardDraft());
+    let reallyDelete = false;
+    h.setCardDelete(async (args) => {
+      h.cardDeleteLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      if (reallyDelete) h.cardServerDelete(args.id);
+      return { ok: true };
+    });
+    await h.coord.enqueueCardDelete({ scope: A, entityId: 'card-c8', expectedUpdatedAt: 'V1' });
+    await settle(8);
+    const stillPending = h.coord.getState().pendingCount === 1;
+    reallyDelete = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'C8 card DELETE ack: not acked while card still present; acked once absent',
+      stillPending && !h.cardServer.has('card-c8') && h.coord.getState().pendingCount === 0,
+      `stillPending=${stillPending}`,
+    );
+  }
+
+  // C9 (§28.42) — untrusted remote -> no ack (queue retained)
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c9', cardDraft({ name: 'old' }));
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c9', payload: cardDraft({ name: 'new' }), expectedUpdatedAt: 'V1' });
+    // flush ran (updateLog) but make remote untrusted before the reconcile can ack
+    h.setRemoteReady(false);
+    await settle(8);
+    check(
+      'C9 card op settled but remote untrusted -> NOT acked, queue retained',
+      h.cardUpdateLog.length >= 1 && h.coord.getState().pendingCount === 1,
+      `updates=${h.cardUpdateLog.length} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // C10 (§28.44–46) — scope isolation: A's pending card op invisible + not flushed under B; resumes under A
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c10', cardDraft());
+    h.setCardUpdate(() => Promise.resolve(CU_TRANSPORT));
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c10', payload: cardDraft({ name: 'x' }), expectedUpdatedAt: 'V1' });
+    await settle();
+    h.setScope(B);
+    const underB = h.coord.getState();
+    const beforeB = h.cardUpdateLog.length;
+    h.setCardUpdate((args) => { h.cardUpdateLog.push(args); h.cardServerPut(args.id, args.draft); return Promise.resolve({ ok: true, updatedAt: 'V2' }); });
+    h.coord.requestFlush();
+    await settle(8);
+    const ranUnderB = h.cardUpdateLog.slice(beforeB).some((u) => u.id === 'card-c10');
+    h.setScope(A);
+    const underA = h.coord.getState();
+    check(
+      'C10 card op scope-isolated: nothing under B, not flushed under B, resumes under A',
+      underB.card.pendingIds.size === 0 && underB.pendingCount === 0 && ranUnderB === false &&
+        underA.card.pendingIds.has('card-c10') && underA.card.opByEntity.get('card-c10') === 'update',
+      `B.pending=${underB.pendingCount} ranUnderB=${ranUnderB}`,
+    );
+  }
+
+  // C11 (§28.47/48) — restart hydrate restores pending + failed card op with reason
+  {
+    const seed = JSON.stringify([
+      { queueId: 'q-r1', schemaVersion: QUEUE_SCHEMA_VERSION, scope: A, entity: 'card', op: 'update',
+        entityId: 'card-r1', payload: cardDraft({ name: 'restored' }), expectedUpdatedAt: 'V1',
+        enqueuedAt: '2026-09-10T09:00:00.000Z', attemptCount: 0, lastError: 'conflict', lastErrorReason: 'conflict' },
+      { queueId: 'q-r2', schemaVersion: QUEUE_SCHEMA_VERSION, scope: A, entity: 'card', op: 'create',
+        entityId: 'card-r2', payload: cardDraft(), enqueuedAt: '2026-09-10T09:00:00.000Z', attemptCount: 0 },
+    ]);
+    const h = makeHarness({ seed, remoteReady: false });
+    await h.coord.hydrate();
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'C11 restart -> pending card CREATE + terminal-failed card UPDATE(reason) restored',
+      st.card.failedIds.has('card-r1') && st.card.failedReasons.get('card-r1') === 'conflict' &&
+        st.card.opByEntity.get('card-r1') === 'update' &&
+        st.card.pendingIds.has('card-r2') && st.card.opByEntity.get('card-r2') === 'create' &&
+        st.pendingCount === 2,
+      `r1reason=${st.card.failedReasons.get('card-r1')} pending=${st.pendingCount}`,
+    );
+  }
+
+  // C12 (§28.49/50) — transport backoff scheduled; terminal not auto-retried
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.cardServerPut('card-c12', cardDraft());
+    h.setCardUpdate(() => Promise.resolve(CU_TRANSPORT));
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'card-c12', payload: cardDraft({ name: 'x' }), expectedUpdatedAt: 'V1' });
+    await settle();
+    const t = h.timers.find((x) => !x.cancelled && x.ms === 5000);
+    check('C12 card transport -> backoff scheduled at 5000ms', !!t, `timers=${JSON.stringify(h.timers.map((x) => x.ms))}`);
+  }
+
+  // C13 (§28.51) — pending identity collision: same id for a transaction AND a card cannot corrupt state
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('dup-id', draft({ amount: 100 }));       // a transaction with id 'dup-id'
+    h.cardServerPut('dup-id', cardDraft({ name: 'card' })); // a card ALSO with id 'dup-id'
+    h.setUpdate(() => Promise.resolve(U_CONFLICT));       // transaction UPDATE -> terminal conflict
+    h.setCardUpdate(() => Promise.resolve(CU_TRANSPORT)); // card UPDATE -> stays pending (transport)
+    await h.coord.enqueueTransactionUpdate({ scope: A, entityId: 'dup-id', payload: draft({ amount: 9 }), expectedUpdatedAt: 'V1', originalRawCardId: null });
+    await settle(6);
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'dup-id', payload: cardDraft({ name: 'edited' }), expectedUpdatedAt: 'V1' });
+    await settle(4);
+    const st = h.coord.getState();
+    check(
+      'C13 same id across entities: txn UPDATE failed, card UPDATE still pending — no cross-contamination',
+      st.failedIds.has('dup-id') && st.failedReasons.get('dup-id') === 'conflict' &&
+        st.opByEntity.get('dup-id') === 'update' &&
+        st.card.pendingIds.has('dup-id') && st.card.failedIds.has('dup-id') === false &&
+        st.card.opByEntity.get('dup-id') === 'update' &&
+        st.pendingCount === 2,
+      `txnFailed=${st.failedIds.has('dup-id')} cardFailed=${st.card.failedIds.has('dup-id')} pending=${st.pendingCount}`,
+    );
+  }
+
+  // C14 (§28.52) — a card op in the queue does NOT change transaction-only getState views
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCardCreate(() => Promise.resolve(CC_TRANSPORT));
+    h.setCreate(() => Promise.resolve(TRANSPORT));
+    await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-c14', payload: draft() });
+    await settle();
+    await h.coord.enqueueCardCreate({ scope: A, entityId: 'card-c14', payload: cardDraft() });
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'C14 transaction getState views unchanged by a queued card op; pendingCount counts BOTH',
+      st.pendingIds.has('txn-c14') && st.pendingIds.size === 1 &&
+        st.opByEntity.size === 1 && st.opByEntity.get('txn-c14') === 'create' &&
+        st.card.pendingIds.has('card-c14') && st.card.pendingIds.size === 1 &&
+        st.pendingCount === 2,
+      `txnPending=${[...st.pendingIds]} cardPending=${[...st.card.pendingIds]} count=${st.pendingCount}`,
     );
   }
 

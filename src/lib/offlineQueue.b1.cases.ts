@@ -124,7 +124,11 @@ export async function runOfflineQueueB1Cases(): Promise<{
     const v = validatePendingWrite(updateRecObj());
     check(
       'CASE 1 valid UPDATE record accepted',
-      v != null && v.op === 'update' && v.expectedUpdatedAt === FROZEN && v.originalRawCardId === null,
+      v != null &&
+        v.entity === 'transaction' &&
+        v.op === 'update' &&
+        v.expectedUpdatedAt === FROZEN &&
+        v.originalRawCardId === null,
       JSON.stringify(v),
     );
   }

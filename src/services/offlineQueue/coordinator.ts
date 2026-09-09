@@ -25,13 +25,19 @@ import {
   MAX_PENDING_WRITES,
   computeBackoffDelay,
   enqueuePendingWrite,
+  makePendingCardCreate,
+  makePendingCardDelete,
+  makePendingCardUpdate,
   makePendingTransactionCreate,
   makePendingTransactionDelete,
   makePendingTransactionUpdate,
   opsForScope,
+  serverCardConfirmsUpdate,
   serverRowConfirmsUpdate,
+  type PendingEntity,
   type PendingWrite,
 } from '@/lib/offlineQueue';
+import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import {
@@ -43,7 +49,12 @@ import {
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
-import type { Transaction } from '@/store/types';
+import type { CreditCard, Transaction } from '@/store/types';
+
+/** STEP 16-H2-C2-A1 §21 — internal state is keyed by `${entity}:${entityId}`,
+ *  NOT bare `entityId`, so a card op and a transaction op that happen to
+ *  share an id can never corrupt each other's failed / ack / reason state. */
+const opKey = (entity: PendingEntity, entityId: string): string => `${entity}:${entityId}`;
 
 export type Hydration = 'idle' | 'loading' | 'ready' | 'failed';
 
@@ -54,18 +65,34 @@ export interface CoordinatorScope {
 
 export type PendingOpKind = 'create' | 'update' | 'delete';
 
+/** Per-entity view of the current scope's pending/failed ops. Keys are bare
+ *  `entityId` (safe WITHIN one entity). */
+export interface CoordinatorEntityState {
+  /** Current-scope ops for this entity (FIFO). Includes terminal-failed. */
+  scopeOps: PendingWrite[];
+  /** entity ids still waiting to send (not failed). */
+  pendingIds: ReadonlySet<string>;
+  /** entity ids that hit a terminal failure and are held. */
+  failedIds: ReadonlySet<string>;
+  /** entity id -> op kind of its current-scope pending/failed op. */
+  opByEntity: ReadonlyMap<string, PendingOpKind>;
+  /** entity id -> ORIGINAL service reason for a terminal failure. */
+  failedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+}
+
 export interface CoordinatorState {
   hydration: Hydration;
-  /** Current-scope transaction ops (FIFO). Includes terminal-failed. */
+  /** === TRANSACTION view (unchanged public contract) === */
+  /** Current-scope TRANSACTION ops (FIFO). Includes terminal-failed. */
   scopeOps: PendingWrite[];
-  /** `scopeOps` entity ids that are still waiting to send (not failed). */
   pendingIds: ReadonlySet<string>;
-  /** `scopeOps` entity ids that hit a terminal failure and are held. */
   failedIds: ReadonlySet<string>;
-  /** entity id -> the op kind of its current-scope pending/failed op. */
   opByEntity: ReadonlyMap<string, PendingOpKind>;
-  /** entity id -> the ORIGINAL service reason for a terminal failure. */
   failedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  /** STEP 16-H2-C2-A1 — the CARD view (bare card-id keys). */
+  card: CoordinatorEntityState;
+  /** Total pending ops across ALL entities in the current scope (§27 — the
+   *  future household-import guard must see cards too). */
   pendingCount: number;
   lastError: string | null;
   flushing: boolean;
@@ -92,6 +119,13 @@ export interface CoordinatorDeps {
    * the queued draft" (STEP 16-H2-B2 §16/§17).
    */
   getServerTransactions: () => ReadonlyMap<string, Transaction>;
+  /**
+   * Live getter — the trusted server snapshot's ACTIVE cards, keyed by id.
+   * STEP 16-H2-C2-A1 §22/§23/§24: card CREATE ack = id present AND fields
+   * match; card UPDATE ack = row present AND fields match; card DELETE ack =
+   * id absent (the read model already excludes soft-deleted cards).
+   */
+  getServerCards: () => ReadonlyMap<string, CreditCard>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -100,6 +134,9 @@ export interface CoordinatorDeps {
   createTransaction?: RunOpDeps['createTransaction'];
   updateTransaction?: RunOpDeps['updateTransaction'];
   softDeleteTransaction?: RunOpDeps['softDeleteTransaction'];
+  createCard?: RunOpDeps['createCard'];
+  updateCard?: RunOpDeps['updateCard'];
+  softDeleteCard?: RunOpDeps['softDeleteCard'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -133,6 +170,25 @@ export interface PendingWriteCoordinator {
     entityId: string;
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2-C2-A1 — card ops. `expectedUpdatedAt` is FROZEN by the caller
+   *  from the `cardMeta.updatedAt` the edit screen opened against; stored
+   *  verbatim, NEVER re-read. */
+  enqueueCardCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCardDraft;
+  }): Promise<EnqueueOutcome>;
+  enqueueCardUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCardDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueueCardDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
   /** Ask for a flush. `includeFailed` first clears the terminal-failed set so
    *  those ops get one more attempt (manual "다시 시도"). */
   requestFlush(opts?: { includeFailed?: boolean }): void;
@@ -157,11 +213,16 @@ export function createPendingWriteCoordinator(
   let scope: CoordinatorScope | null = deps.getScope();
   let lastError: string | null = null;
 
-  /** queueId -> { entityId, op }: server accepted it, awaiting refresh confirmation. */
-  const awaitingAck = new Map<string, { entityId: string; op: PendingOpKind }>();
-  /** entityId set: terminal failure, retained + excluded from auto-retry. */
+  /** queueId -> op identity: server accepted it, awaiting refresh confirmation.
+   *  Keyed by queueId (globally unique) — `entity`/`entityId`/`op` carried
+   *  for the entity-aware reconcile. */
+  const awaitingAck = new Map<
+    string,
+    { entity: PendingEntity; entityId: string; op: PendingOpKind }
+  >();
+  /** `${entity}:${entityId}` set: terminal failure, retained + excluded from auto-retry. */
   const failedIds = new Set<string>();
-  /** entityId -> original service reason for the terminal failure. */
+  /** `${entity}:${entityId}` -> original service reason for the terminal failure. */
   const failedReasons = new Map<string, WriteConflictReason | undefined>();
 
   let backoffTimer: Timer | null = null;
@@ -178,12 +239,11 @@ export function createPendingWriteCoordinator(
   const flusher = createWriteQueueFlusher({
     getOps: (fs: FlushScope) => {
       if (hydration !== 'ready' || !deps.getRemoteReady()) return [];
-      // Transaction CREATE / UPDATE / DELETE (H2-B1 widened the union — B2
-      // adds the user-facing enqueue APIs; the flusher is already generic).
+      // Every supported entity (transaction + card). The flusher is generic;
+      // `runPendingWrite` dispatches by `op.entity`.
       return opsForScope(controller.read(), fs.userId, fs.householdId).filter(
         (o) =>
-          o.entity === 'transaction' &&
-          !failedIds.has(o.entityId) &&
+          !failedIds.has(opKey(o.entity, o.entityId)) &&
           !awaitingAck.has(o.queueId),
       );
     },
@@ -193,6 +253,9 @@ export function createPendingWriteCoordinator(
         ...(deps.createTransaction ? { createTransaction: deps.createTransaction } : {}),
         ...(deps.updateTransaction ? { updateTransaction: deps.updateTransaction } : {}),
         ...(deps.softDeleteTransaction ? { softDeleteTransaction: deps.softDeleteTransaction } : {}),
+        ...(deps.createCard ? { createCard: deps.createCard } : {}),
+        ...(deps.updateCard ? { updateCard: deps.updateCard } : {}),
+        ...(deps.softDeleteCard ? { softDeleteCard: deps.softDeleteCard } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -200,22 +263,29 @@ export function createPendingWriteCoordinator(
 
       for (const s of result.settled) {
         const rec = controller.read().find((r) => r.queueId === s.queueId);
-        awaitingAck.set(s.queueId, { entityId: s.entityId, op: rec?.op ?? 'create' });
+        awaitingAck.set(s.queueId, {
+          entity: rec?.entity ?? 'transaction',
+          entityId: s.entityId,
+          op: rec?.op ?? 'create',
+        });
         changed = true;
       }
       for (const t of result.terminal) {
-        if (!failedIds.has(t.entityId)) {
-          failedIds.add(t.entityId);
+        const rec = controller.read().find((r) => r.queueId === t.queueId);
+        const key = opKey(rec?.entity ?? 'transaction', t.entityId);
+        if (!failedIds.has(key)) {
+          failedIds.add(key);
           changed = true;
         }
-        failedReasons.set(t.entityId, t.reason);
-        lastError = t.message ?? '전송하지 못한 거래가 있어요';
-        // Persist the terminal marker (message + reason) so a restart shows
-        // the right "전송 실패" copy and never silently auto-retries.
+        failedReasons.set(key, t.reason);
+        lastError = t.message ?? '전송하지 못한 변경이 있어요';
+        // Persist the terminal marker (message + reason) on THIS record only
+        // (by queueId — never `entityId`, which can collide across entities)
+        // so a restart shows the right "전송 실패" copy and never auto-retries.
         const msg = lastError;
         void controller.mutate((cur) => ({
           next: cur.map((r) =>
-            r.entityId === t.entityId
+            r.queueId === t.queueId
               ? {
                   ...r,
                   lastError: r.lastError ?? msg ?? 'terminal',
@@ -260,7 +330,7 @@ export function createPendingWriteCoordinator(
     const anyRetryable =
       awaitingAck.size > 0 ||
       opsForScope(controller.read(), scope.userId, scope.householdId).some(
-        (o) => o.entity === 'transaction' && !failedIds.has(o.entityId),
+        (o) => !failedIds.has(opKey(o.entity, o.entityId)),
       );
     if (!anyRetryable) {
       clearBackoff();
@@ -306,12 +376,27 @@ export function createPendingWriteCoordinator(
         }
 
         const serverRows = deps.getServerTransactions();
+        const serverCards = deps.getServerCards();
         const knownCards = deps.getKnownCardIds();
         const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
-        for (const [queueId, { entityId, op }] of awaitingAck) {
+        for (const [queueId, { entity, entityId, op }] of awaitingAck) {
+          const rec = controller.read().find((r) => r.queueId === queueId);
           let ok: boolean;
-          if (op === 'create') {
+          if (entity === 'card') {
+            // §22/§23/§24
+            if (op === 'delete') {
+              ok = !serverCards.has(entityId);
+            } else {
+              // CREATE + UPDATE: row present AND editable fields match the draft.
+              const card = serverCards.get(entityId);
+              ok =
+                !!card &&
+                (rec?.op === 'create' || rec?.op === 'update') &&
+                rec.entity === 'card' &&
+                serverCardConfirmsUpdate(card, rec.payload);
+            }
+          } else if (op === 'create') {
             ok = serverRows.has(entityId);
           } else if (op === 'delete') {
             // §17: the snapshot's `transactions` already excludes deleted_at;
@@ -321,10 +406,10 @@ export function createPendingWriteCoordinator(
             // §16: id present is NOT enough — the row's fields must reflect
             // the queued desired draft (guards against a still-stale snapshot).
             const row = serverRows.get(entityId);
-            const rec = controller.read().find((r) => r.queueId === queueId);
             ok =
               !!row &&
               rec?.op === 'update' &&
+              rec.entity === 'transaction' &&
               serverRowConfirmsUpdate(row, rec.payload, knownCards);
           }
           if (ok) confirmed.push(queueId);
@@ -350,7 +435,7 @@ export function createPendingWriteCoordinator(
             // reconcile retries the REMOVAL — never re-runs the write.
             for (const q of confirmed) {
               const rec = controller.read().find((r) => r.queueId === q);
-              if (rec) awaitingAck.set(q, { entityId: rec.entityId, op: rec.op });
+              if (rec) awaitingAck.set(q, { entity: rec.entity, entityId: rec.entityId, op: rec.op });
             }
             scheduleBackoff();
           }
@@ -369,8 +454,9 @@ export function createPendingWriteCoordinator(
     failedReasons.clear();
     for (const r of controller.read()) {
       if (r.lastError) {
-        failedIds.add(r.entityId);
-        failedReasons.set(r.entityId, r.lastErrorReason);
+        const key = opKey(r.entity, r.entityId);
+        failedIds.add(key);
+        failedReasons.set(key, r.lastErrorReason);
       }
     }
   }
@@ -480,6 +566,46 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueueCardCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCardDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingCardCreate({ scope: args.scope, entityId: args.entityId, payload: args.payload }),
+    );
+  }
+
+  function enqueueCardUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCardDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingCardUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueCardDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingCardDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
   function requestFlush(opts?: { includeFailed?: boolean }): void {
     if (disposed) return;
     if (opts?.includeFailed) {
@@ -507,30 +633,37 @@ export function createPendingWriteCoordinator(
     clearBackoff();
   }
 
-  function getState(): CoordinatorState {
-    const scopeOps =
-      hydration === 'ready' && scope
-        ? opsForScope(controller.read(), scope.userId, scope.householdId).filter(
-            (o) => o.entity === 'transaction',
-          )
-        : [];
-    const opIds = new Set(scopeOps.map((o) => o.entityId));
-    const scopedFailed = new Set([...failedIds].filter((id) => opIds.has(id)));
-    const pendingIds = new Set([...opIds].filter((id) => !scopedFailed.has(id)));
-    const opByEntity = new Map<string, PendingOpKind>(
-      scopeOps.map((o) => [o.entityId, o.op]),
-    );
+  /** Build a per-entity view from the current-scope ops of ONE entity.
+   *  Keys are bare `entityId`; `failedIds`/`failedReasons` are looked up by
+   *  the `${entity}:${entityId}` opKey and re-exposed bare. */
+  function entityStateOf(entity: PendingEntity, allScopeOps: PendingWrite[]): CoordinatorEntityState {
+    const scopeOps = allScopeOps.filter((o) => o.entity === entity);
+    const ids = new Set(scopeOps.map((o) => o.entityId));
+    const scopedFailed = new Set([...ids].filter((id) => failedIds.has(opKey(entity, id))));
+    const pendingIds = new Set([...ids].filter((id) => !scopedFailed.has(id)));
+    const opByEntity = new Map<string, PendingOpKind>(scopeOps.map((o) => [o.entityId, o.op]));
     const failedReasonsScoped = new Map<string, WriteConflictReason | undefined>(
-      [...scopedFailed].map((id) => [id, failedReasons.get(id)]),
+      [...scopedFailed].map((id) => [id, failedReasons.get(opKey(entity, id))]),
     );
+    return { scopeOps, pendingIds, failedIds: scopedFailed, opByEntity, failedReasons: failedReasonsScoped };
+  }
+
+  function getState(): CoordinatorState {
+    const allScopeOps =
+      hydration === 'ready' && scope
+        ? opsForScope(controller.read(), scope.userId, scope.householdId)
+        : [];
+    const txn = entityStateOf('transaction', allScopeOps);
+    const card = entityStateOf('card', allScopeOps);
     return {
       hydration,
-      scopeOps,
-      pendingIds,
-      failedIds: scopedFailed,
-      opByEntity,
-      failedReasons: failedReasonsScoped,
-      pendingCount: scopeOps.length,
+      scopeOps: txn.scopeOps,
+      pendingIds: txn.pendingIds,
+      failedIds: txn.failedIds,
+      opByEntity: txn.opByEntity,
+      failedReasons: txn.failedReasons,
+      card,
+      pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
     };
@@ -542,6 +675,9 @@ export function createPendingWriteCoordinator(
     enqueueTransactionCreate,
     enqueueTransactionUpdate,
     enqueueTransactionDelete,
+    enqueueCardCreate,
+    enqueueCardUpdate,
+    enqueueCardDelete,
     requestFlush,
     dispose,
     getState,

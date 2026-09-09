@@ -156,6 +156,26 @@ export interface FinanceReadResult {
     reason?: WriteConflictReason;
   }>;
 
+  /**
+   * STEP 16-H2-C2-A1 — the card list for the CARD-MANAGEMENT screen ONLY:
+   * authoritative server cards with a pending UPDATE overlaid, a synthetic row
+   * for a pending/failed CREATE, a synthetic row for a failed UPDATE whose
+   * server card is gone, minus a not-failed pending DELETE. This is
+   * DELIBERATELY separate from `cards` (which stays authoritative-server-only
+   * so the transaction card picker, backup and household-import never see an
+   * un-sent card — §8/§9/§15). Equals `cards` when there are no card ops.
+   */
+  cardManagementRows: CreditCard[];
+  /**
+   * card id -> its pending offline-op state, for the row label / read-only
+   * gate on the card-management screen. Mirrors `pendingTransactionOps`.
+   * `reason` only set when `failed` is true.
+   */
+  pendingCardOps: ReadonlyMap<
+    string,
+    { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+  >;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -184,6 +204,8 @@ const EMPTY_SLICES = {
   failedTransactionIds: new Set<string>() as ReadonlySet<string>,
   pendingTransactionOps: new Map() as FinanceReadResult['pendingTransactionOps'],
   failedLocalTransactions: [] as FinanceReadResult['failedLocalTransactions'],
+  cardManagementRows: [] as CreditCard[],
+  pendingCardOps: new Map() as FinanceReadResult['pendingCardOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -195,6 +217,9 @@ export function useFinanceRead(): FinanceReadResult {
     opByEntity,
     failedReasons,
     failedTransactionIds: providerFailedIds,
+    pendingCardOps: providerCardOps,
+    cardFailedReasons,
+    failedCardIds: providerFailedCardIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -215,10 +240,38 @@ export function useFinanceRead(): FinanceReadResult {
       // mutates `data`; it returns the same reference when nothing applies.
       // `providerFailedIds` (entity-id set) only changes DELETE behaviour —
       // a failed DELETE keeps its server row visible so it can be labelled.
-      const { data: composed, pendingIds, orphanedFailedUpdates } =
-        hydrationReady && providerOps.length > 0
-          ? composeFinance(data, providerOps, providerFailedIds)
-          : { data, pendingIds: [] as string[], orphanedFailedUpdates: [] as Transaction[] };
+      const anyOps = providerOps.length > 0 || providerCardOps.length > 0;
+      const composedResult =
+        hydrationReady && anyOps
+          ? composeFinance(
+              data,
+              [...providerOps, ...providerCardOps],
+              providerFailedIds,
+              providerFailedCardIds,
+            )
+          : null;
+      const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
+        data,
+        pendingIds: [] as string[],
+        orphanedFailedUpdates: [] as Transaction[],
+      };
+      // STEP 16-H2-C2-A1: card display-only surface. `composeFinance` NEVER
+      // put a card row into `composed.cards`; it feeds `cardManagement` only.
+      const cardManagementRows = composedResult ? composedResult.cardManagement.rows : data.cards;
+      const pendingCardOps = new Map<
+        string,
+        { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+      >();
+      if (composedResult) {
+        for (const [id, op] of composedResult.cardManagement.opById) {
+          const isFailed = composedResult.cardManagement.failedIds.has(id);
+          pendingCardOps.set(id, {
+            op,
+            failed: isFailed,
+            ...(isFailed ? { reason: cardFailedReasons.get(id) } : {}),
+          });
+        }
+      }
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -260,6 +313,8 @@ export function useFinanceRead(): FinanceReadResult {
         failedTransactionIds: failed,
         pendingTransactionOps: opStates,
         failedLocalTransactions,
+        cardManagementRows,
+        pendingCardOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -315,5 +370,8 @@ export function useFinanceRead(): FinanceReadResult {
     opByEntity,
     failedReasons,
     providerFailedIds,
+    providerCardOps,
+    cardFailedReasons,
+    providerFailedCardIds,
   ]);
 }

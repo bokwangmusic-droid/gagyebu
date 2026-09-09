@@ -131,15 +131,17 @@ export async function runQueueRunOpCases(): Promise<{
     );
   }
 
-  // CASE 32b — unsupported entity/op -> terminal, service never called
+  // CASE 32b — an UNSUPPORTED entity (not transaction / not card) -> terminal,
+  // service never called. `card` is supported since STEP 16-H2-C2-A1, so this
+  // now uses a genuinely-unsupported entity.
   {
     const sink = { args: null as CreateArgs | null, called: false };
     const out = await runPendingWrite(
-      { ...op(), entity: 'card' as PendingTransactionCreate['entity'] },
+      { ...op(), entity: 'budget' as PendingTransactionCreate['entity'] },
       { knownCardIds: new Set<string>(), createTransaction: fakeCreate({ ok: true, id: 'x' }, sink) },
     );
     check(
-      'CASE 32b unsupported op -> terminal, createTransaction not called',
+      'CASE 32b unsupported entity -> terminal, no service called',
       out.kind === 'terminal' && sink.called === false,
       `out=${JSON.stringify(out)} called=${sink.called}`,
     );

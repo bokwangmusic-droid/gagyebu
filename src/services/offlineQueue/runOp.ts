@@ -19,6 +19,15 @@ import {
   type UpdateTransactionResult,
   type WriteConflictReason,
 } from '@/services/remoteFinanceWrite';
+import {
+  createCard,
+  softDeleteCard,
+  updateCard,
+  type CreateCardResult,
+  type SoftDeleteCardResult,
+  type UpdateCardResult,
+} from '@/services/remoteCardWrite';
+import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { PendingWrite } from '@/lib/offlineQueue';
 
@@ -68,6 +77,26 @@ export interface RunOpDeps {
     expectedUserId: string;
     expectedUpdatedAt: string;
   }) => Promise<SoftDeleteResult>;
+  /** STEP 16-H2-C2-A1 — injected in tests; default to the real card services. */
+  createCard?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    draft: NewCardDraft;
+  }) => Promise<CreateCardResult>;
+  updateCard?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: NewCardDraft;
+  }) => Promise<UpdateCardResult>;
+  softDeleteCard?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteCardResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -77,17 +106,59 @@ export async function runPendingWrite(
   op: PendingWrite,
   deps: RunOpDeps,
 ): Promise<RunOpOutcome> {
-  if (op.entity !== 'transaction') {
-    return { kind: 'terminal', message: `unsupported entity: ${op.entity}` };
-  }
-
-  // Runtime guard for JS callers that bypassed the (required) type — never
-  // silently fall back to an empty Set (STEP 16-H2-A1.1 FIX 2).
-  if (!deps || !isSetLike(deps.knownCardIds)) {
-    return { kind: 'terminal', message: 'internal: runPendingWrite requires deps.knownCardIds' };
+  if (op.entity !== 'transaction' && op.entity !== 'card') {
+    return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
 
   try {
+    // ---- CARD (STEP 16-H2-C2-A1 §16–§18) ----
+    if (op.entity === 'card') {
+      if (op.op === 'create') {
+        const create = deps.createCard ?? createCard;
+        const res = await create({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return { kind: 'terminal', message: res.message }; // CreateCardResult carries no reason
+      }
+      if (op.op === 'update') {
+        const update = deps.updateCard ?? updateCard;
+        const res = await update({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return { kind: 'terminal', reason: res.reason, message: res.message };
+      }
+      // card delete
+      const del = deps.softDeleteCard ?? softDeleteCard;
+      const res = await del({
+        id: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
+    // ---- TRANSACTION ----
+    // Runtime guard for JS callers that bypassed the (required) type — never
+    // silently fall back to an empty Set (STEP 16-H2-A1.1 FIX 2). Only the
+    // transaction path needs `knownCardIds` (the dangling-cardId guard).
+    if (!deps || !isSetLike(deps.knownCardIds)) {
+      return { kind: 'terminal', message: 'internal: runPendingWrite requires deps.knownCardIds' };
+    }
+
     if (op.op === 'create') {
       const create = deps.createTransaction ?? createTransaction;
       const res = await create({

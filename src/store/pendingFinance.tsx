@@ -26,6 +26,7 @@ import {
 import { AppState, type AppStateStatus } from 'react-native';
 
 import type { PendingWrite } from '@/lib/offlineQueue';
+import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
   createPendingWriteCoordinator,
@@ -38,7 +39,7 @@ import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { useRemoteFinance } from '@/store/remoteFinance';
-import type { Transaction } from '@/store/types';
+import type { CreditCard, Transaction } from '@/store/types';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_OPS: PendingWrite[] = [];
@@ -74,6 +75,29 @@ interface PendingFinanceValue {
     originalRawCardId: string | null;
   }) => Promise<EnqueueOutcome>;
   enqueueTransactionDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-C2-A1 — current-scope CARD ops (create/update/delete, incl.
+   *  terminal-failed) for the card-management overlay. Bare card-id keys. */
+  pendingCardOps: PendingWrite[];
+  cardOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  cardFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingCardIds: ReadonlySet<string>;
+  failedCardIds: ReadonlySet<string>;
+  enqueueCardCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCardDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueCardUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCardDraft;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueCardDelete: (args: {
     scope: CoordinatorScope;
     entityId: string;
     expectedUpdatedAt: string;
@@ -124,6 +148,13 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const serverTxnsRef = useRef<ReadonlyMap<string, Transaction>>(serverTxns);
   serverTxnsRef.current = serverTxns;
 
+  const serverCards = useMemo<ReadonlyMap<string, CreditCard>>(
+    () => new Map((rf.data?.cards ?? []).map((c) => [c.id, c])),
+    [rf.data?.cards],
+  );
+  const serverCardsRef = useRef<ReadonlyMap<string, CreditCard>>(serverCards);
+  serverCardsRef.current = serverCards;
+
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
   const coordRef = useRef<ReturnType<typeof createPendingWriteCoordinator> | null>(null);
@@ -133,6 +164,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getRemoteReady: () => remoteReadyRef.current,
       getKnownCardIds: () => knownCardIdsRef.current,
       getServerTransactions: () => serverTxnsRef.current,
+      getServerCards: () => serverCardsRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -186,11 +218,19 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       failedReasons: state.failedReasons.size > 0 ? state.failedReasons : EMPTY_REASON_MAP,
       pendingTransactionIds: state.pendingIds.size > 0 ? state.pendingIds : EMPTY_SET,
       failedTransactionIds: state.failedIds.size > 0 ? state.failedIds : EMPTY_SET,
+      pendingCardOps: state.card.scopeOps.length > 0 ? state.card.scopeOps : EMPTY_OPS,
+      cardOpByEntity: state.card.opByEntity.size > 0 ? state.card.opByEntity : EMPTY_KIND_MAP,
+      cardFailedReasons: state.card.failedReasons.size > 0 ? state.card.failedReasons : EMPTY_REASON_MAP,
+      pendingCardIds: state.card.pendingIds.size > 0 ? state.card.pendingIds : EMPTY_SET,
+      failedCardIds: state.card.failedIds.size > 0 ? state.card.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
       enqueueTransactionUpdate: coord.enqueueTransactionUpdate,
       enqueueTransactionDelete: coord.enqueueTransactionDelete,
+      enqueueCardCreate: coord.enqueueCardCreate,
+      enqueueCardUpdate: coord.enqueueCardUpdate,
+      enqueueCardDelete: coord.enqueueCardDelete,
       requestFlush: coord.requestFlush,
     }),
     // state is a fresh object each render; that's exactly when something changed
