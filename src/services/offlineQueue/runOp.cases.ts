@@ -4,8 +4,17 @@
  * never touches Supabase. Covers STEP 16-H2-A1 §8 and STEP 16-H2-A1.1
  * FIX 2 (knownCardIds is a REQUIRED dependency).
  */
-import { QUEUE_SCHEMA_VERSION, type PendingWrite } from '@/lib/offlineQueue';
-import type { CreateTransactionResult } from '@/services/remoteFinanceWrite';
+import {
+  QUEUE_SCHEMA_VERSION,
+  type PendingTransactionCreate,
+  type PendingTransactionDelete,
+  type PendingTransactionUpdate,
+} from '@/lib/offlineQueue';
+import type {
+  CreateTransactionResult,
+  SoftDeleteResult,
+  UpdateTransactionResult,
+} from '@/services/remoteFinanceWrite';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
 
 export interface CaseResult {
@@ -14,7 +23,7 @@ export interface CaseResult {
   detail: string;
 }
 
-const op = (over: Partial<PendingWrite> = {}): PendingWrite => ({
+const op = (over: Partial<PendingTransactionCreate> = {}): PendingTransactionCreate => ({
   queueId: 'q-1',
   schemaVersion: QUEUE_SCHEMA_VERSION,
   scope: { userId: 'u-A', householdId: 'h-A' },
@@ -37,7 +46,7 @@ type CreateArgs = {
   id: string;
   householdId: string;
   expectedUserId: string;
-  draft: PendingWrite['payload'];
+  draft: PendingTransactionCreate['payload'];
   knownCardIds: ReadonlySet<string>;
 };
 
@@ -126,7 +135,7 @@ export async function runQueueRunOpCases(): Promise<{
   {
     const sink = { args: null as CreateArgs | null, called: false };
     const out = await runPendingWrite(
-      { ...op(), entity: 'card' as PendingWrite['entity'] },
+      { ...op(), entity: 'card' as PendingTransactionCreate['entity'] },
       { knownCardIds: new Set<string>(), createTransaction: fakeCreate({ ok: true, id: 'x' }, sink) },
     );
     check(
@@ -208,6 +217,210 @@ export async function runQueueRunOpCases(): Promise<{
       'CASE F2-D omitted knownCardIds -> terminal internal failure, service not called',
       out.kind === 'terminal' && out.message.includes('knownCardIds') && sink.called === false,
       `out=${JSON.stringify(out)} called=${sink.called}`,
+    );
+  }
+
+  /* ---------------- STEP 16-H2-B1: UPDATE / DELETE adapters ---------------- */
+
+  const upd = (over: Partial<PendingTransactionUpdate> = {}): PendingTransactionUpdate => ({
+    queueId: 'q-u',
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: 'u-A', householdId: 'h-A' },
+    entity: 'transaction',
+    op: 'update',
+    entityId: 'txn-1',
+    payload: { type: 'expense', category: 'food', amount: 1234, memo: 'x', date: '2026-09-10T09:00:00.000Z' },
+    expectedUpdatedAt: 'FROZEN-V1',
+    originalRawCardId: null,
+    enqueuedAt: '2026-09-10T09:00:00.000Z',
+    attemptCount: 0,
+    ...over,
+  });
+  const del = (over: Partial<PendingTransactionDelete> = {}): PendingTransactionDelete => ({
+    queueId: 'q-d',
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: 'u-A', householdId: 'h-A' },
+    entity: 'transaction',
+    op: 'delete',
+    entityId: 'txn-1',
+    expectedUpdatedAt: 'FROZEN-V1',
+    enqueuedAt: '2026-09-10T09:00:00.000Z',
+    attemptCount: 0,
+    ...over,
+  });
+
+  type UpdArgs = {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: PendingTransactionUpdate['payload'];
+    knownCardIds: ReadonlySet<string>;
+    originalRawCardId?: string | null;
+  };
+  type DelArgs = { id: string; householdId: string; expectedUserId: string; expectedUpdatedAt: string };
+
+  const fakeUpdate =
+    (res: UpdateTransactionResult, sink?: { args: UpdArgs | null }): RunOpDeps['updateTransaction'] =>
+    (args) => {
+      if (sink) sink.args = args;
+      return Promise.resolve(res);
+    };
+  const fakeDelete =
+    (res: SoftDeleteResult, sink?: { args: DelArgs | null }): RunOpDeps['softDeleteTransaction'] =>
+    (args) => {
+      if (sink) sink.args = args;
+      return Promise.resolve(res);
+    };
+
+  // CASE 33 — UPDATE forwards the EXACT frozen expectedUpdatedAt + draft + knownCardIds + originalRawCardId
+  {
+    const sink = { args: null as UpdArgs | null };
+    const o = upd({
+      entityId: 'txn-9',
+      scope: { userId: 'u-X', householdId: 'h-Y' },
+      expectedUpdatedAt: 'V1-FROZEN',
+      originalRawCardId: 'card-dead',
+    });
+    await runPendingWrite(o, {
+      knownCardIds: new Set(['card-live']),
+      updateTransaction: fakeUpdate({ ok: true, updatedAt: 'V2' }, sink),
+    });
+    check(
+      'CASE 33 UPDATE runOp forwards frozen token / draft / knownCardIds / originalRawCardId verbatim',
+      !!sink.args &&
+        sink.args.id === 'txn-9' &&
+        sink.args.householdId === 'h-Y' &&
+        sink.args.expectedUserId === 'u-X' &&
+        sink.args.expectedUpdatedAt === 'V1-FROZEN' &&
+        sink.args.draft === o.payload &&
+        sink.args.originalRawCardId === 'card-dead' &&
+        sink.args.knownCardIds.has('card-live'),
+      JSON.stringify(sink.args),
+    );
+  }
+
+  // CASE 34 — UPDATE success normalize
+  {
+    const out = await runPendingWrite(upd(), {
+      knownCardIds: new Set<string>(),
+      updateTransaction: fakeUpdate({ ok: true, updatedAt: 'V2' }),
+    });
+    check('CASE 34 UPDATE {ok:true} -> success', out.kind === 'success', JSON.stringify(out));
+  }
+
+  // CASE 35 — UPDATE transport normalize
+  {
+    const out = await runPendingWrite(upd(), {
+      knownCardIds: new Set<string>(),
+      updateTransaction: fakeUpdate({ ok: false, reason: 'error', message: 'net', transport: true }),
+    });
+    check('CASE 35 UPDATE transport -> {kind:transport}', out.kind === 'transport', JSON.stringify(out));
+  }
+
+  // CASE 36 — UPDATE conflict reason PRESERVED (not collapsed to message)
+  {
+    const out = await runPendingWrite(upd(), {
+      knownCardIds: new Set<string>(),
+      updateTransaction: fakeUpdate({ ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' }),
+    });
+    check(
+      'CASE 36 UPDATE conflict -> {kind:terminal, reason:"conflict"}',
+      out.kind === 'terminal' && out.reason === 'conflict',
+      JSON.stringify(out),
+    );
+  }
+
+  // CASE 37 — UPDATE deleted / gone reasons preserved
+  {
+    const d = await runPendingWrite(upd(), {
+      knownCardIds: new Set<string>(),
+      updateTransaction: fakeUpdate({ ok: false, reason: 'deleted', message: 'x' }),
+    });
+    const g = await runPendingWrite(upd(), {
+      knownCardIds: new Set<string>(),
+      updateTransaction: fakeUpdate({ ok: false, reason: 'gone', message: 'x' }),
+    });
+    check(
+      'CASE 37 UPDATE deleted/gone reasons preserved',
+      d.kind === 'terminal' && d.reason === 'deleted' && g.kind === 'terminal' && g.reason === 'gone',
+      `d=${JSON.stringify(d)} g=${JSON.stringify(g)}`,
+    );
+  }
+
+  // CASE 38 — DELETE forwards the EXACT frozen expectedUpdatedAt; no draft/knownCardIds needed
+  {
+    const sink = { args: null as DelArgs | null };
+    const o = del({ entityId: 'txn-7', scope: { userId: 'u-P', householdId: 'h-Q' }, expectedUpdatedAt: 'DEL-V1' });
+    await runPendingWrite(o, {
+      knownCardIds: new Set<string>(),
+      softDeleteTransaction: fakeDelete({ ok: true }, sink),
+    });
+    check(
+      'CASE 38 DELETE runOp forwards id / household / user / frozen token',
+      !!sink.args &&
+        sink.args.id === 'txn-7' &&
+        sink.args.householdId === 'h-Q' &&
+        sink.args.expectedUserId === 'u-P' &&
+        sink.args.expectedUpdatedAt === 'DEL-V1',
+      JSON.stringify(sink.args),
+    );
+  }
+
+  // CASE 39 — DELETE success normalize (incl. the already-deleted idempotent path,
+  // which the SERVICE surfaces as {ok:true} — runOp just passes it through)
+  {
+    const out = await runPendingWrite(del(), {
+      knownCardIds: new Set<string>(),
+      softDeleteTransaction: fakeDelete({ ok: true }),
+    });
+    check('CASE 39 DELETE {ok:true} (incl. already-deleted) -> success', out.kind === 'success', JSON.stringify(out));
+  }
+
+  // CASE 40 — DELETE transport normalize
+  {
+    const out = await runPendingWrite(del(), {
+      knownCardIds: new Set<string>(),
+      softDeleteTransaction: fakeDelete({ ok: false, reason: 'error', message: 'net', transport: true }),
+    });
+    check('CASE 40 DELETE transport -> {kind:transport}', out.kind === 'transport', JSON.stringify(out));
+  }
+
+  // CASE 41 — DELETE conflict / gone reasons preserved
+  {
+    const c = await runPendingWrite(del(), {
+      knownCardIds: new Set<string>(),
+      softDeleteTransaction: fakeDelete({ ok: false, reason: 'conflict', message: 'x' }),
+    });
+    const g = await runPendingWrite(del(), {
+      knownCardIds: new Set<string>(),
+      softDeleteTransaction: fakeDelete({ ok: false, reason: 'gone', message: 'x' }),
+    });
+    check(
+      'CASE 41 DELETE conflict/gone reasons preserved',
+      c.kind === 'terminal' && c.reason === 'conflict' && g.kind === 'terminal' && g.reason === 'gone',
+      `c=${JSON.stringify(c)} g=${JSON.stringify(g)}`,
+    );
+  }
+
+  // CASE 42 — UPDATE/DELETE: a thrown service is treated as transport (not lost)
+  {
+    const u = await runPendingWrite(upd(), {
+      knownCardIds: new Set<string>(),
+      updateTransaction: () => {
+        throw new Error('boom');
+      },
+    });
+    const d = await runPendingWrite(del(), {
+      knownCardIds: new Set<string>(),
+      softDeleteTransaction: () => {
+        throw new Error('boom');
+      },
+    });
+    check(
+      'CASE 42 thrown UPDATE/DELETE service -> transport (conservative retain)',
+      u.kind === 'transport' && d.kind === 'transport',
+      `${u.kind} ${d.kind}`,
     );
   }
 

@@ -6,7 +6,7 @@
  * timer, a synchronous `requestRefresh`, and a mutable "server snapshot"
  * (set of transaction ids). No React, no Supabase.
  */
-import { QUEUE_SCHEMA_VERSION, type PendingWrite } from '@/lib/offlineQueue';
+import { QUEUE_SCHEMA_VERSION, type PendingTransactionCreate } from '@/lib/offlineQueue';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { CreateTransactionResult } from '@/services/remoteFinanceWrite';
 import {
@@ -163,8 +163,8 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
 const TRANSPORT: CreateTransactionResult = { ok: false, message: 'net', transport: true };
 const TERMINAL: CreateTransactionResult = { ok: false, message: 'identity', transport: false };
 
-const seedWith = (recs: PendingWrite[]) => JSON.stringify(recs);
-const rec = (over: Partial<PendingWrite> = {}): PendingWrite => ({
+const seedWith = (recs: PendingTransactionCreate[]) => JSON.stringify(recs);
+const rec = (over: Partial<PendingTransactionCreate> = {}): PendingTransactionCreate => ({
   queueId: 'q-1',
   schemaVersion: QUEUE_SCHEMA_VERSION,
   scope: A,

@@ -14,6 +14,7 @@ import {
   makePendingTransactionCreate,
   opsForScope,
   validatePendingWrite,
+  type PendingTransactionCreate,
   type PendingWrite,
 } from '@/lib/offlineQueue';
 
@@ -32,7 +33,7 @@ const draft = (over: Partial<NewTransactionDraft> = {}): NewTransactionDraft => 
   ...over,
 });
 
-const rec = (over: Partial<PendingWrite> = {}): PendingWrite => ({
+const rec = (over: Partial<PendingTransactionCreate> = {}): PendingTransactionCreate => ({
   queueId: 'q-1',
   schemaVersion: QUEUE_SCHEMA_VERSION,
   scope: { userId: 'u-A', householdId: 'h-A' },
@@ -196,7 +197,7 @@ export async function runOfflineQueueCases(): Promise<{
 
   // CASE 8b — cap: at MAX_PENDING_WRITES a genuinely new record is refused
   {
-    const q: PendingWrite[] = [];
+    const q: PendingTransactionCreate[] = [];
     for (let i = 0; i < 200; i++) {
       q.push(rec({ queueId: `q-${i}`, entityId: `txn-${i}` }));
     }

@@ -184,12 +184,14 @@ export function useFinanceRead(): FinanceReadResult {
 
   return useMemo<FinanceReadResult>(() => {
     if (trusted && data) {
-      // STEP 16-H2-A2: overlay durable offline transaction CREATEs onto the
-      // authoritative snapshot. `composeFinance` never mutates `data`; it
-      // returns the same reference when nothing applies.
+      // STEP 16-H2-A2/B1: overlay durable offline transaction CREATE/UPDATE/
+      // DELETE ops onto the authoritative snapshot. `composeFinance` never
+      // mutates `data`; it returns the same reference when nothing applies.
+      // `providerFailedIds` (entity-id set) only changes DELETE behaviour —
+      // a failed DELETE keeps its server row visible so it can be labelled.
       const { data: composed, pendingIds } =
         hydrationReady && pendingTransactionCreateOps.length > 0
-          ? composeFinance(data, pendingTransactionCreateOps)
+          ? composeFinance(data, pendingTransactionCreateOps, providerFailedIds)
           : { data, pendingIds: [] as string[] };
       const overlaid = new Set(pendingIds);
       const failed = new Set<string>();

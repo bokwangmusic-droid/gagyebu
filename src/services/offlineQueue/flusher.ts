@@ -18,6 +18,7 @@
  * 23505 / updated_at idempotency in the write service absorbs it.
  */
 import type { PendingWrite } from '@/lib/offlineQueue';
+import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import type { RunOpOutcome } from '@/services/offlineQueue/runOp';
 
 export interface FlushScope {
@@ -30,6 +31,10 @@ export interface FlushItemResult {
   entityId: string;
   outcome: 'success' | 'terminal';
   message?: string;
+  /** STEP 16-H2-B1 §17: the original service reason for a terminal
+   *  UPDATE/DELETE (`conflict` / `deleted` / `gone` / `identity` / `error`),
+   *  passed through un-collapsed. `undefined` for CREATE. */
+  reason?: WriteConflictReason;
 }
 
 export interface FlushPassResult {
@@ -152,6 +157,7 @@ export function createWriteQueueFlusher(cfg: FlusherConfig): WriteQueueFlusher {
               entityId: op.entityId,
               outcome: 'terminal',
               message: outcome.message,
+              ...(outcome.reason ? { reason: outcome.reason } : {}),
             });
             // H2-A1: transaction creates are independent — a terminal on one
             // does not block the rest of the pass. (Dependency-aware halting

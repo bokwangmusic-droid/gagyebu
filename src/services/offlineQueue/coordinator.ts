@@ -80,8 +80,10 @@ export interface CoordinatorDeps {
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
   onChange: () => void;
-  /** Test injection — forwarded to `runPendingWrite`. */
+  /** Test injections — forwarded to `runPendingWrite`. */
   createTransaction?: RunOpDeps['createTransaction'];
+  updateTransaction?: RunOpDeps['updateTransaction'];
+  softDeleteTransaction?: RunOpDeps['softDeleteTransaction'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -141,10 +143,11 @@ export function createPendingWriteCoordinator(
   const flusher = createWriteQueueFlusher({
     getOps: (fs: FlushScope) => {
       if (hydration !== 'ready' || !deps.getRemoteReady()) return [];
+      // Transaction CREATE / UPDATE / DELETE (H2-B1 widened the union — B2
+      // adds the user-facing enqueue APIs; the flusher is already generic).
       return opsForScope(controller.read(), fs.userId, fs.householdId).filter(
         (o) =>
           o.entity === 'transaction' &&
-          o.op === 'create' &&
           !failedIds.has(o.entityId) &&
           !awaitingAck.has(o.queueId),
       );
@@ -153,6 +156,8 @@ export function createPendingWriteCoordinator(
       runPendingWrite(op, {
         knownCardIds: deps.getKnownCardIds(),
         ...(deps.createTransaction ? { createTransaction: deps.createTransaction } : {}),
+        ...(deps.updateTransaction ? { updateTransaction: deps.updateTransaction } : {}),
+        ...(deps.softDeleteTransaction ? { softDeleteTransaction: deps.softDeleteTransaction } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -213,7 +218,7 @@ export function createPendingWriteCoordinator(
     const anyRetryable =
       awaitingAck.size > 0 ||
       opsForScope(controller.read(), scope.userId, scope.householdId).some(
-        (o) => o.entity === 'transaction' && o.op === 'create' && !failedIds.has(o.entityId),
+        (o) => o.entity === 'transaction' && !failedIds.has(o.entityId),
       );
     if (!anyRetryable) {
       clearBackoff();
@@ -397,7 +402,7 @@ export function createPendingWriteCoordinator(
     const scopeOps =
       hydration === 'ready' && scope
         ? opsForScope(controller.read(), scope.userId, scope.householdId).filter(
-            (o) => o.entity === 'transaction' && o.op === 'create',
+            (o) => o.entity === 'transaction',
           )
         : [];
     const opIds = new Set(scopeOps.map((o) => o.entityId));

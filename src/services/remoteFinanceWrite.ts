@@ -59,13 +59,20 @@ export type CreateTransactionResult =
 /** STEP 16-G2-B — every non-ok end state for an edit / soft delete. */
 export type WriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error';
 
+/**
+ * STEP 16-H2-B1 §2/§3: `transport: true` marks a NETWORK/TRANSPORT failure
+ * of the UPDATE / soft-delete request (it never reached a server verdict) —
+ * ONLY set on the `reason: 'error'` primary path, never on a
+ * conflict / deleted / gone / identity / reconcile-read failure. Additive;
+ * existing callers that branch on `res.ok` / `res.reason` are unaffected.
+ */
 export type UpdateTransactionResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: WriteConflictReason; message: string };
+  | { ok: false; reason: WriteConflictReason; message: string; transport?: boolean };
 
 export type SoftDeleteResult =
   | { ok: true }
-  | { ok: false; reason: WriteConflictReason; message: string };
+  | { ok: false; reason: WriteConflictReason; message: string; transport?: boolean };
 
 const GENERIC_ERROR = '거래를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
@@ -79,6 +86,26 @@ function describeWriteError(error: PostgrestError): string {
     return '네트워크 연결을 확인한 뒤 다시 시도해주세요.';
   }
   return GENERIC_ERROR;
+}
+
+/**
+ * Classify the RECONCILE-READ error — the SELECT the write path runs after a
+ * 0-row UPDATE / soft-delete or a 23505 INSERT to work out what actually
+ * happened. STEP 16-H2-B1.1: for the durable offline queue this read's
+ * outcome must not be mistaken for a business verdict. A TRANSPORT failure
+ * here (network dropped mid-reconcile) is NOT evidence the row is gone /
+ * mismatched — it's retryable; anything else is a plain server error.
+ * `undefined` when there was no read error.
+ */
+export function classifyReconcileReadError(
+  readErr: PostgrestError | null,
+): { reason: 'error'; message: string; transport: boolean } | undefined {
+  if (!readErr) return undefined;
+  return {
+    reason: 'error',
+    message: describeWriteError(readErr),
+    transport: isTransportError(readErr),
+  };
 }
 
 /**
@@ -186,8 +213,14 @@ export async function createTransaction(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    // Can't read it back (RLS says it isn't ours, or a transient read error)
-    // -> do NOT treat as success.
+    // A TRANSPORT failure during the reconcile read is retryable — the row
+    // may well be ours; the offline queue should re-attempt, not give up.
+    const readClass = classifyReconcileReadError(readErr);
+    if (readClass?.transport) {
+      return { ok: false, message: readClass.message, transport: true };
+    }
+    // A non-transport read error, or a successful read that returned no row
+    // (RLS says it isn't ours) -> do NOT treat as success. Terminal.
     if (readErr || !existing) {
       return { ok: false, message: GENERIC_ERROR };
     }
@@ -289,7 +322,14 @@ export async function updateTransaction(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      transport: isTransportError(error),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile against the current row (no updated_at / deleted_at filter).
@@ -302,7 +342,20 @@ export async function updateTransaction(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr || !existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
+  // STEP 16-H2-B1.1: a TRANSPORT failure during the reconcile read is NOT
+  // proof the row is gone — it's retryable. A non-transport read error is a
+  // plain server error (also more accurate than 'gone'). Only a SUCCESSFUL
+  // read that returned no row is genuinely 'gone'.
+  const readClass = classifyReconcileReadError(readErr);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
+  if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
   if (existingRow.deleted_at != null) {
@@ -342,7 +395,14 @@ export async function softDeleteTransaction(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      transport: isTransportError(error),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile (no updated_at / deleted_at filter).
@@ -353,7 +413,18 @@ export async function softDeleteTransaction(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr || !existing) return { ok: false, reason: 'gone', message: DELETE_CONFLICT };
+  // STEP 16-H2-B1.1: transport read failure -> retryable error; non-transport
+  // read error -> plain server error; only a successful empty read is 'gone'.
+  const readClass = classifyReconcileReadError(readErr);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
+  if (!existing) return { ok: false, reason: 'gone', message: DELETE_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.
     return { ok: true };

@@ -3,7 +3,7 @@
  * (src/services/offlineQueue/flusher.ts). Fake getOps / runOp / onPass;
  * no Supabase, no persistence.
  */
-import { QUEUE_SCHEMA_VERSION, type PendingWrite } from '@/lib/offlineQueue';
+import { QUEUE_SCHEMA_VERSION, type PendingTransactionCreate } from '@/lib/offlineQueue';
 import {
   createWriteQueueFlusher,
   type FlushPassResult,
@@ -19,7 +19,7 @@ export interface CaseResult {
 
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
-const op = (queueId: string, over: Partial<PendingWrite> = {}): PendingWrite => ({
+const op = (queueId: string, over: Partial<PendingTransactionCreate> = {}): PendingTransactionCreate => ({
   queueId,
   schemaVersion: QUEUE_SCHEMA_VERSION,
   scope: { userId: 'u-A', householdId: 'h-A' },
@@ -36,7 +36,7 @@ const A: FlushScope = { userId: 'u-A', householdId: 'h-A' };
 const B: FlushScope = { userId: 'u-A', householdId: 'h-B' };
 
 interface Harness {
-  queue: PendingWrite[];
+  queue: PendingTransactionCreate[];
   script: Map<string, RunOpOutcome[]>; // queueId -> outcomes per attempt
   runCalls: string[];
   maxConcurrent: number;
@@ -44,7 +44,7 @@ interface Harness {
   flusher: ReturnType<typeof createWriteQueueFlusher>;
 }
 
-function makeHarness(initial: PendingWrite[], script: Record<string, RunOpOutcome | RunOpOutcome[]>): Harness {
+function makeHarness(initial: PendingTransactionCreate[], script: Record<string, RunOpOutcome | RunOpOutcome[]>): Harness {
   const h: Harness = {
     queue: initial.slice(),
     script: new Map(

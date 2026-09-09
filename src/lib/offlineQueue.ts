@@ -1,15 +1,17 @@
 /**
- * Offline Write Queue — pure core. STEP 16-H2-A1.
+ * Offline Write Queue — pure core. STEP 16-H2-A1, widened in STEP 16-H2-B1.
  *
- * NO Supabase, NO AsyncStorage, NO React. Just the record shape, the
+ * NO Supabase, NO AsyncStorage, NO React. Just the record shapes, the
  * validator, the FIFO / idempotent enqueue, the scope filter, and the
- * transaction-CREATE read overlay. Storage side-effects live in
+ * transaction read overlay. Storage side-effects live in
  * src/services/offlineQueue/persistence.ts; server replay in
  * .../runOp.ts; sequencing in .../flusher.ts.
  *
- * Scope of H2-A1: transaction CREATE only. The record `entity`/`op` are
- * literal (`'transaction'` / `'create'`) rather than a wide union — later
- * entity rollouts widen them. Nothing here is wired to the UI.
+ * Scope: transaction CREATE (H2-A1) + transaction UPDATE + soft DELETE
+ * (H2-B1, engine only — no enqueue API / UI wiring yet). `entity` stays the
+ * literal `'transaction'`; `op` is now a 3-way union. `schemaVersion` stays
+ * 1 — the CREATE record shape is unchanged, so H2-A2 devices' stored
+ * CREATE-only queues load without a migration.
  */
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
@@ -34,27 +36,63 @@ export interface PendingWriteScope {
 }
 
 /**
- * ONE queued write. `payload` is exactly what `createTransaction()` will be
- * re-handed (a `NewTransactionDraft` — purely user-editable fields, no
- * id/household/identity/timestamp). Server-derived values are never stored:
- * `created_by` is set by a DB trigger, `household_id` lives only in `scope`,
- * and the client-stable transaction id lives only in `entityId`.
+ * Fields common to every queued transaction write. Server-derived values are
+ * never stored: `created_by` is set by a DB trigger, `household_id` lives
+ * only in `scope`, the transaction id lives only in `entityId`, and the
+ * optimistic-concurrency token lives in `expectedUpdatedAt` (UPDATE/DELETE),
+ * NOT in `payload`.
  */
-export interface PendingWrite {
+interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
   queueId: string;
   schemaVersion: typeof QUEUE_SCHEMA_VERSION;
   scope: PendingWriteScope;
   entity: 'transaction';
-  op: 'create';
-  /** The client-stable `txn-…` id handed to `createTransaction({ id })`. */
+  /** The client-stable `txn-…` id of the transaction this op targets. */
   entityId: string;
-  payload: NewTransactionDraft;
   enqueuedAt: string;
   attemptCount: number;
   lastAttemptAt?: string;
   lastError?: string;
 }
+
+/** `payload` is exactly what `createTransaction()` is re-handed. */
+export interface PendingTransactionCreate extends PendingWriteBase {
+  op: 'create';
+  payload: NewTransactionDraft;
+}
+
+/**
+ * `payload` is exactly what `updateTransaction({ draft })` is re-handed.
+ * `expectedUpdatedAt` is FROZEN at enqueue time — the server version the
+ * user was editing — and is NEVER refreshed to a newer token (STEP 16-H2-B1
+ * §5); a stale token is what lets a genuine concurrent edit surface as a
+ * conflict instead of being silently overwritten. `originalRawCardId` is the
+ * transaction's raw DB `card_id` at enqueue time (`transactionMeta.rawCardId`)
+ * — needed by `buildTransactionUpdate` to preserve a dangling soft-deleted
+ * card link; `null` when the row had no card.
+ */
+export interface PendingTransactionUpdate extends PendingWriteBase {
+  op: 'update';
+  payload: NewTransactionDraft;
+  expectedUpdatedAt: string;
+  originalRawCardId: string | null;
+}
+
+/**
+ * A soft delete — `UPDATE deleted_at` guarded on `expectedUpdatedAt`
+ * (frozen, same rule as UPDATE). NO `payload`: there is nothing user-shaped
+ * to store.
+ */
+export interface PendingTransactionDelete extends PendingWriteBase {
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
+export type PendingWrite =
+  | PendingTransactionCreate
+  | PendingTransactionUpdate
+  | PendingTransactionDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -104,29 +142,50 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
   const r = x as Record<string, unknown>;
   if (r.schemaVersion !== QUEUE_SCHEMA_VERSION) return null;
   if (!isNonEmptyString(r.queueId)) return null;
-  if (r.entity !== 'transaction' || r.op !== 'create') return null;
+  if (r.entity !== 'transaction') return null;
+  if (r.op !== 'create' && r.op !== 'update' && r.op !== 'delete') return null;
   if (!isNonEmptyString(r.entityId)) return null;
   const scope = r.scope as Record<string, unknown> | undefined;
   if (scope == null || !isNonEmptyString(scope.userId) || !isNonEmptyString(scope.householdId)) return null;
-  if (!isValidDraft(r.payload)) return null;
   if (!isNonEmptyString(r.enqueuedAt)) return null;
   if (typeof r.attemptCount !== 'number' || !Number.isInteger(r.attemptCount) || r.attemptCount < 0) return null;
   if (r.lastAttemptAt !== undefined && typeof r.lastAttemptAt !== 'string') return null;
   if (r.lastError !== undefined && typeof r.lastError !== 'string') return null;
 
-  return {
+  const base = {
     queueId: r.queueId,
-    schemaVersion: QUEUE_SCHEMA_VERSION,
+    schemaVersion: QUEUE_SCHEMA_VERSION as typeof QUEUE_SCHEMA_VERSION,
     scope: { userId: scope.userId, householdId: scope.householdId },
-    entity: 'transaction',
-    op: 'create',
+    entity: 'transaction' as const,
     entityId: r.entityId,
-    payload: r.payload,
     enqueuedAt: r.enqueuedAt,
     attemptCount: r.attemptCount,
     ...(r.lastAttemptAt !== undefined ? { lastAttemptAt: r.lastAttemptAt as string } : {}),
     ...(r.lastError !== undefined ? { lastError: r.lastError as string } : {}),
   };
+
+  if (r.op === 'create') {
+    if (!isValidDraft(r.payload)) return null;
+    return { ...base, op: 'create', payload: r.payload };
+  }
+
+  if (r.op === 'update') {
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if (!(r.originalRawCardId === null || typeof r.originalRawCardId === 'string')) return null;
+    if (!isValidDraft(r.payload)) return null;
+    return {
+      ...base,
+      op: 'update',
+      payload: r.payload,
+      expectedUpdatedAt: r.expectedUpdatedAt,
+      originalRawCardId: r.originalRawCardId as string | null,
+    };
+  }
+
+  // delete
+  if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+  if ('payload' in r) return null; // a DELETE carries no user payload (STEP 16-H2-B1 §7)
+  return { ...base, op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
 }
 
 /** Drop invalid entries, keep valid ones in order. Never throws. */
@@ -152,13 +211,15 @@ function defaultQueueId(): string {
   return `q-${Date.now()}-${localSeq.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const nowIso = () => new Date().toISOString();
+
 export function makePendingTransactionCreate(args: {
   scope: PendingWriteScope;
   entityId: string;
   payload: NewTransactionDraft;
   queueId?: string;
   now?: () => string;
-}): PendingWrite {
+}): PendingTransactionCreate {
   return {
     queueId: args.queueId ?? defaultQueueId(),
     schemaVersion: QUEUE_SCHEMA_VERSION,
@@ -167,7 +228,54 @@ export function makePendingTransactionCreate(args: {
     op: 'create',
     entityId: args.entityId,
     payload: args.payload,
-    enqueuedAt: (args.now ?? (() => new Date().toISOString()))(),
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingTransactionUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewTransactionDraft;
+  /** FROZEN — the server version the user was editing. Never refreshed. */
+  expectedUpdatedAt: string;
+  /** transactionMeta.rawCardId at enqueue time; `null` if the row had no card. */
+  originalRawCardId: string | null;
+  queueId?: string;
+  now?: () => string;
+}): PendingTransactionUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'transaction',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    originalRawCardId: args.originalRawCardId,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingTransactionDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingTransactionDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'transaction',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
     attemptCount: 0,
   };
 }
@@ -177,17 +285,69 @@ function dedupKey(w: Pick<PendingWrite, 'scope' | 'entity' | 'op' | 'entityId'>)
   return `${w.scope.userId}|${w.scope.householdId}|${w.entity}|${w.op}|${w.entityId}`;
 }
 
+/** Structural equality of two update payloads (order-significant splits). */
+function draftEqual(a: NewTransactionDraft, b: NewTransactionDraft): boolean {
+  if (
+    a.type !== b.type ||
+    a.category !== b.category ||
+    Number(a.amount) !== Number(b.amount) ||
+    a.memo !== b.memo ||
+    new Date(a.date).getTime() !== new Date(b.date).getTime() ||
+    (a.paymentMethod ?? null) !== (b.paymentMethod ?? null) ||
+    (a.cardId ?? null) !== (b.cardId ?? null) ||
+    (a.installment?.months ?? null) !== (b.installment?.months ?? null)
+  ) {
+    return false;
+  }
+  const sa = a.splits ?? [];
+  const sb = b.splits ?? [];
+  if (sa.length !== sb.length) return false;
+  return sa.every(
+    (s, i) =>
+      s.category === sb[i].category &&
+      Number(s.amount) === Number(sb[i].amount) &&
+      (s.memo ?? null) === (sb[i].memo ?? null),
+  );
+}
+
+/**
+ * Is `b` the EXACT SAME request as `a` — safe to treat a re-enqueue as an
+ * idempotent no-op? Same dedup identity is assumed. CREATE: yes by identity
+ * alone (STEP 16-H2-A1 §12). UPDATE: also same frozen `expectedUpdatedAt`,
+ * same `originalRawCardId`, same draft. DELETE: also same frozen
+ * `expectedUpdatedAt`.
+ */
+function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
+  if (a.op !== b.op) return false;
+  if (a.op === 'create') return true;
+  if (a.op === 'update' && b.op === 'update') {
+    return (
+      a.expectedUpdatedAt === b.expectedUpdatedAt &&
+      a.originalRawCardId === b.originalRawCardId &&
+      draftEqual(a.payload, b.payload)
+    );
+  }
+  if (a.op === 'delete' && b.op === 'delete') {
+    return a.expectedUpdatedAt === b.expectedUpdatedAt;
+  }
+  return false;
+}
+
 export type EnqueueResult =
   | { ok: true; queue: PendingWrite[]; record: PendingWrite; deduped: boolean }
-  | { ok: false; reason: 'cap'; queue: PendingWrite[] };
+  | { ok: false; reason: 'cap' | 'existing-pending'; queue: PendingWrite[] };
 
 /**
  * Append `record` to `queue` (FIFO). Pure — returns a new array.
  *
- *  - Idempotent: if an entry with the same dedup identity (or the same
- *    `queueId`) already exists, the queue is unchanged and the EXISTING
- *    record is returned with `deduped: true`. A retry of the same create
- *    never produces a second entry (STEP 16-H2-A1 §12).
+ *  - An entry with the same `queueId` OR the same dedup identity already
+ *    exists:
+ *      · if it is the EXACT same request (`sameRequest`) -> idempotent
+ *        no-op: queue unchanged, EXISTING record returned, `deduped: true`.
+ *      · otherwise (a DIFFERING pending UPDATE/DELETE for the same
+ *        transaction) -> REFUSED with `reason: 'existing-pending'`. The
+ *        existing record is NEVER silently overwritten or dropped, and no
+ *        compaction is attempted (STEP 16-H2-B1 §8/§20).
  *  - Cap: at `MAX_PENDING_WRITES` a genuinely new record is refused
  *    (`reason: 'cap'`) — the oldest entry is NEVER evicted.
  */
@@ -198,7 +358,10 @@ export function enqueuePendingWrite(
   const key = dedupKey(record);
   const existing = queue.find((q) => q.queueId === record.queueId || dedupKey(q) === key);
   if (existing) {
-    return { ok: true, queue: queue.slice(), record: existing, deduped: true };
+    if (sameRequest(existing, record)) {
+      return { ok: true, queue: queue.slice(), record: existing, deduped: true };
+    }
+    return { ok: false, reason: 'existing-pending', queue: queue.slice() };
   }
   if (queue.length >= MAX_PENDING_WRITES) {
     return { ok: false, reason: 'cap', queue: queue.slice() };
@@ -227,10 +390,11 @@ export function opsForScope(
 }
 
 /* ------------------------------------------------------------------ *
- * Read overlay — transaction CREATE only
+ * Read overlay — transaction CREATE / UPDATE / DELETE
  * ------------------------------------------------------------------ */
 
-function pendingTransactionToDomain(op: PendingWrite): Transaction {
+/** A CREATE payload -> a synthetic domain `Transaction` row. */
+function createDraftToDomain(op: PendingTransactionCreate): Transaction {
   const d = op.payload;
   return {
     id: op.entityId,
@@ -246,7 +410,32 @@ function pendingTransactionToDomain(op: PendingWrite): Transaction {
   };
 }
 
-function pendingTransactionMeta(op: PendingWrite): RemoteTransactionMeta {
+/**
+ * Apply an UPDATE payload onto an existing domain row — the SAME "feature
+ * OFF => cleared" semantics `buildTransactionUpdate` uses. Server-locked
+ * provenance (`fromRecurring` / `fromPlanned`) and un-editable
+ * (`tags` / `memberId`) fields are preserved from `row`. `id` is unchanged.
+ *
+ * `cardId` shows the user's selection directly; the authoritative flush
+ * still applies the real dangling-soft-deleted-card rule via
+ * `originalRawCardId`, and the post-flush refresh reconciles any difference.
+ */
+function applyUpdateDraft(row: Transaction, d: NewTransactionDraft): Transaction {
+  return {
+    ...row,
+    type: d.type,
+    category: d.category,
+    amount: d.amount,
+    memo: d.memo,
+    date: d.date,
+    paymentMethod: d.paymentMethod,
+    cardId: d.cardId,
+    installment: d.installment,
+    splits: d.splits && d.splits.length > 0 ? d.splits : undefined,
+  };
+}
+
+function createSyntheticMeta(op: PendingTransactionCreate): RemoteTransactionMeta {
   return {
     updatedAt: op.enqueuedAt,
     createdBy: op.scope.userId,
@@ -259,52 +448,99 @@ export interface ComposedFinance {
    *  changed; the SAME reference when nothing applied. `serverData` and its
    *  arrays/maps are never mutated. */
   data: RemoteFinanceData;
-  /** entity ids that exist only because of a pending create — for a future
-   *  "전송 대기" marker. Not wired to any UI in this step. */
+  /** transaction ids added by a pending CREATE or patched by a pending
+   *  UPDATE, plus failed-DELETE ids whose server row is being shown again —
+   *  i.e. every row that carries a "전송 대기" / "전송 실패" marker. */
   pendingIds: string[];
+  /** transaction ids currently HIDDEN by a not-failed pending DELETE. */
+  hiddenIds: string[];
 }
 
 /**
- * Overlay pending transaction CREATEs onto an authoritative snapshot.
+ * Overlay pending transaction ops onto an authoritative snapshot. PURE —
+ * `serverData` and its arrays/maps are never mutated.
  *
- *  - A pending create whose `entityId` is ALREADY in `serverData.transactions`
- *    is skipped (the server row won — flush landed; no duplicate).
- *  - Otherwise a synthetic domain row + a synthetic meta are appended, in
- *    enqueue order.
- *  - Non-transaction / non-create ops are ignored (later rollouts handle them).
- *  - `recentTransactions` (src/lib/aggregate.ts) stays compatible: a pending
- *    row carries its real `txn-<ms>-…` id and real `date`, so it sorts
- *    deterministically alongside server rows.
+ *  - CREATE: `entityId` not on the server -> append a synthetic row + meta.
+ *    Already on the server -> skip (the flush landed).
+ *  - UPDATE: `entityId` on the server (or a just-overlaid CREATE) -> replace
+ *    that row with `applyUpdateDraft`. The server `transactionMeta[id]` is
+ *    PRESERVED — its `updatedAt` is the real optimistic-concurrency token and
+ *    must not be replaced with a fake `enqueuedAt` (STEP 16-H2-B1 §9). Not on
+ *    the server -> skip.
+ *  - DELETE: not failed -> remove the row from the composed list and its
+ *    `transactionMeta` entry (`hiddenIds`). Failed -> DO NOT hide; the server
+ *    row stays visible so a screen can label it "삭제 전송 실패" (`pendingIds`).
+ *  - `failedTransactionIds` (entity-id set; ≤1 pending op per id by dedup)
+ *    only changes DELETE behaviour — a failed CREATE/UPDATE still overlays so
+ *    the user's row/edit never vanishes.
+ *  - Ops are applied in enqueue order. Non-transaction ops are ignored.
  */
 export function composeFinance(
   serverData: RemoteFinanceData,
   ops: readonly PendingWrite[],
+  failedTransactionIds?: ReadonlySet<string>,
 ): ComposedFinance {
-  const creates = ops.filter((o) => o.entity === 'transaction' && o.op === 'create');
-  if (creates.length === 0) return { data: serverData, pendingIds: [] };
+  const txnOps = ops.filter((o) => o.entity === 'transaction');
+  if (txnOps.length === 0) return { data: serverData, pendingIds: [], hiddenIds: [] };
 
-  const serverIds = new Set(serverData.transactions.map((t) => t.id));
-  const added = new Set<string>();
-  const extraTxns: Transaction[] = [];
-  const extraMeta: Record<string, RemoteTransactionMeta> = {};
+  let txns: Transaction[] | null = null; // lazily copied on first change
+  let meta: Record<string, RemoteTransactionMeta> | null = null;
   const pendingIds: string[] = [];
+  const hiddenIds: string[] = [];
+  const failed = (id: string) => !!failedTransactionIds?.has(id);
 
-  for (const op of creates) {
-    if (serverIds.has(op.entityId) || added.has(op.entityId)) continue;
-    added.add(op.entityId);
-    extraTxns.push(pendingTransactionToDomain(op));
-    extraMeta[op.entityId] = pendingTransactionMeta(op);
-    pendingIds.push(op.entityId);
+  const list = () => txns ?? serverData.transactions;
+  const ensureTxns = () => {
+    if (!txns) txns = serverData.transactions.slice();
+    return txns;
+  };
+  const ensureMeta = () => {
+    if (!meta) meta = { ...serverData.transactionMeta };
+    return meta;
+  };
+
+  for (const op of txnOps) {
+    const idx = list().findIndex((t) => t.id === op.entityId);
+
+    if (op.op === 'create') {
+      if (idx !== -1) continue; // server (or an earlier overlay) already has it
+      ensureTxns().push(createDraftToDomain(op));
+      ensureMeta()[op.entityId] = createSyntheticMeta(op);
+      pendingIds.push(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (idx === -1) continue; // nothing to patch
+      ensureTxns()[idx] = applyUpdateDraft(list()[idx], op.payload);
+      // transactionMeta is intentionally left as-is (real token preserved).
+      pendingIds.push(op.entityId);
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (idx !== -1) pendingIds.push(op.entityId); // keep the row, mark it
+      continue;
+    }
+    if (idx === -1) continue;
+    ensureTxns().splice(idx, 1);
+    if (meta || op.entityId in serverData.transactionMeta) {
+      const m = ensureMeta();
+      delete m[op.entityId];
+    }
+    hiddenIds.push(op.entityId);
   }
 
-  if (extraTxns.length === 0) return { data: serverData, pendingIds: [] };
+  if (!txns && !meta) return { data: serverData, pendingIds, hiddenIds };
 
   return {
     data: {
       ...serverData,
-      transactions: [...serverData.transactions, ...extraTxns],
-      transactionMeta: { ...serverData.transactionMeta, ...extraMeta },
+      transactions: txns ?? serverData.transactions,
+      transactionMeta: meta ?? serverData.transactionMeta,
     },
     pendingIds,
+    hiddenIds,
   };
 }

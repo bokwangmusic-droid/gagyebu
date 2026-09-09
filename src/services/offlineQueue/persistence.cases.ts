@@ -4,7 +4,7 @@
  * storage stubs, never real AsyncStorage. Covers STEP 16-H2-A1 §4/§5 and the
  * STEP 16-H2-A1.1 FIX 1 read-failure contract.
  */
-import { QUEUE_SCHEMA_VERSION, type PendingWrite } from '@/lib/offlineQueue';
+import { QUEUE_SCHEMA_VERSION, type PendingTransactionCreate } from '@/lib/offlineQueue';
 import {
   createQueueController,
   loadPendingWrites,
@@ -18,7 +18,7 @@ export interface CaseResult {
   detail: string;
 }
 
-const rec = (over: Partial<PendingWrite> = {}): PendingWrite => ({
+const rec = (over: Partial<PendingTransactionCreate> = {}): PendingTransactionCreate => ({
   queueId: 'q-1',
   schemaVersion: QUEUE_SCHEMA_VERSION,
   scope: { userId: 'u-A', householdId: 'h-A' },
@@ -86,7 +86,7 @@ const failStorage: QueueStorage = {
 };
 
 const idsOf = (json: string | null): string[] =>
-  json == null ? [] : (JSON.parse(json) as PendingWrite[]).map((r) => r.entityId);
+  json == null ? [] : (JSON.parse(json) as PendingTransactionCreate[]).map((r) => r.entityId);
 
 export async function runQueuePersistenceCases(): Promise<{
   results: CaseResult[];
