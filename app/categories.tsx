@@ -13,6 +13,7 @@ import Animated, {
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { BottomSheet } from '@/components/ui/BottomSheet';
 import { Field, SegmentedTabs, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
@@ -30,11 +31,13 @@ import {
 } from '@/data/categories';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { uid } from '@/lib/id';
+import { pendingCategoryRowLabel } from '@/lib/pendingCategoryLabel';
 import {
   isCategoryNameTaken,
   type NewCustomCategoryDraft,
 } from '@/lib/remoteCategoryWriteMapping';
 import type { RemoteBudgetMeta, RemoteCategoryMeta } from '@/lib/remoteFinanceMapping';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { softDeleteBudget } from '@/services/remoteBudgetWrite';
 import {
   createCustomCategory,
@@ -43,8 +46,10 @@ import {
   updateCustomCategory,
 } from '@/services/remoteCategoryWrite';
 import { useAuth } from '@/store/auth';
+import type { FinanceReadResult } from '@/store/financeRead';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { BudgetMap } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
@@ -115,7 +120,12 @@ function CategoriesManager({
   const toast = useToast();
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
-  const { status } = useFinanceRead();
+  const { status, categoryManagementRows, pendingCategoryOps } = useFinanceRead();
+  // STEP 16-H2-C2-B2: durable offline fallback for a category CREATE / UPDATE
+  // whose direct write hit a TRANSPORT failure. DELETE is deliberately NOT
+  // wired here — its offline path stays blocked on the Budget queue (§19).
+  const pending = usePendingWrites();
+  const financeRefresh = useRemoteFinanceRefreshControl();
 
   const [tab, setTab] = useState<TxnType>('expense');
   const [sheet, setSheet] = useState<SheetState | null>(null);
@@ -131,13 +141,45 @@ function CategoriesManager({
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const reorderBusyRef = useRef(false);
 
-  const allCats = getAllCats(tab, customCats, catOrder);
-  const customIds = new Set(customCats[tab].map((c) => c.id));
+  // STEP 16-H2-C2-B2 §8: the MANAGEMENT list renders `categoryManagementRows`
+  // (server customCats + pending CREATE synthetic + pending UPDATE overlay −
+  // pending DELETE + failed local orphan). Every OTHER consumer keeps using
+  // `customCats` (authoritative). A pending CREATE id is not in `catOrder`, so
+  // it naturally sorts to the end of the list.
+  const allCats = getAllCats(tab, categoryManagementRows, catOrder);
+  const customIds = new Set(categoryManagementRows[tab].map((c) => c.id));
+
+  // A row carrying an un-sent offline op — read-only everywhere: no edit
+  // sheet, no delete, and excluded from reorder (§12).
+  const isPendingRow = (id: string) => pendingCategoryOps.has(id);
+  // STEP 16-H2-C2-B2 §13: reorder is online-only LWW and a pending category id
+  // must NEVER reach `saveCategoryOrder`. Simplest structural guarantee — the
+  // whole tab's reorder is disabled while ANY of its rows carries a pending /
+  // failed op; `saveCategoryOrder` then simply never runs.
+  const tabHasPendingCategory = categoryManagementRows[tab].some((c) => isPendingRow(c.id));
 
   const canCreate = REMOTE_FINANCE_WRITE.categoryCreate;
   const canEdit = REMOTE_FINANCE_WRITE.categoryEdit;
   const canDelete = REMOTE_FINANCE_WRITE.categoryDelete;
-  const canReorder = REMOTE_FINANCE_WRITE.categoryReorder;
+  const canReorder = REMOTE_FINANCE_WRITE.categoryReorder && !tabHasPendingCategory;
+
+  /**
+   * STEP 16-H2-C2-B2 §4: a durable-enqueue that itself failed — the change is
+   * NOT queued, so the sheet stays open and the user is told why. Raw
+   * coordinator reasons are never surfaced. Mirrors card-add / input.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '카테고리를 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
 
   /** built-in + live custom names of the CURRENT tab, minus an optional self id. */
   const namesForTab = (excludeId?: string) =>
@@ -175,13 +217,39 @@ function CategoriesManager({
       expectedUserId: session.user.id,
       draft,
     });
-    submittingRef.current = false;
-    setSubmitting(false);
 
     if (!res.ok) {
+      // STEP 16-H2-C2-B2 §2/§3/§4: a TRANSPORT failure (offline) -> durable
+      // CREATE queue. The SAME client id (`id` from createIdRef, never
+      // regenerated) and the SAME draft go in, so a later flush replays the
+      // exact request and its 23505 reconcile stays idempotent — no
+      // duplicate-category on a lost response.
+      if (res.transport === true) {
+        const enq = await pending.enqueueCategoryCreate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: id,
+          payload: draft,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          createIdRef.current = null; // this create session is done -> next opens a fresh c-id
+          setSheet(null);
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('카테고리를 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          return;
+        }
+        // Durable enqueue failed — DO NOT claim success, keep the sheet.
+        toast.show(enqueueFailMessage(enq.reason));
+        return;
+      }
+      submittingRef.current = false;
+      setSubmitting(false);
       toast.show(res.reason === 'invalid' ? '카테고리 정보를 확인해 주세요.' : res.message);
       return; // keep the sheet open; createIdRef unchanged so a retry reuses the id
     }
+    submittingRef.current = false;
+    setSubmitting(false);
     createIdRef.current = null;
     setSheet(null);
     await refresh();
@@ -193,6 +261,7 @@ function CategoriesManager({
 
   const openEdit = (cat: Category) => {
     if (!canEdit) return;
+    if (isPendingRow(cat.id)) return; // §12: a pending / failed row is read-only
     const meta = categoryMeta[cat.id];
     if (!meta) {
       toast.show('카테고리 정보를 다시 불러온 뒤 수정해 주세요.');
@@ -215,16 +284,39 @@ function CategoriesManager({
       expectedUpdatedAt: sheet.expectedUpdatedAt, // captured at sheet open, never re-read
       draft,
     });
-    submittingRef.current = false;
-    setSubmitting(false);
 
     if (res.ok) {
+      submittingRef.current = false;
+      setSubmitting(false);
       setSheet(null);
       await refresh();
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('카테고리를 수정했어요');
       return;
     }
+    // STEP 16-H2-C2-B2 §6/§7: a TRANSPORT failure (offline) -> durable UPDATE
+    // queue with the FROZEN mount token verbatim, so the optimistic-
+    // concurrency check still fires (as a conflict) when the flush runs.
+    if (res.transport === true) {
+      const enq = await pending.enqueueCategoryUpdate({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: sheet.category.id,
+        payload: draft,
+        expectedUpdatedAt: sheet.expectedUpdatedAt,
+      });
+      submittingRef.current = false;
+      setSubmitting(false);
+      if (enq.ok) {
+        setSheet(null);
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('카테고리를 수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason)); // keep the sheet open
+      return;
+    }
+    submittingRef.current = false;
+    setSubmitting(false);
     if (res.reason === 'identity' || res.reason === 'error' || res.reason === 'invalid') {
       toast.show(res.message); // keep the sheet open
       return;
@@ -239,6 +331,7 @@ function CategoriesManager({
 
   const confirmDelete = (id: string, name: string) => {
     if (!canDelete || deletingRef.current) return;
+    if (isPendingRow(id)) return; // §12: a pending / failed row is read-only
     // STEP 16-G2-C4-B §17: capture BOTH tokens at initiation (before the
     // Alert), so a background refresh can't swap them under us.
     const categoryToken = categoryMeta[id]?.updatedAt ?? null;
@@ -328,9 +421,14 @@ function CategoriesManager({
 
   /* ---------------- reorder (shared, household_settings) ---------------- */
 
-  const onReorder = (orderedIds: string[]) => {
+  const onReorder = (rawOrderedIds: string[]) => {
     if (!canReorder || reorderBusyRef.current) return;
     if (!ready || !session?.user?.id || !activeHousehold) return;
+    // STEP 16-H2-C2-B2 §13: a pending / failed category id must NEVER reach
+    // `saveCategoryOrder` (it isn't a real server row yet). `canReorder` is
+    // already false whenever the tab has one, so this filter is belt-and-
+    // suspenders — it also means `saveCategoryOrder`'s own logic is untouched.
+    const orderedIds = rawOrderedIds.filter((id) => !isPendingRow(id));
     // §26 validation: non-empty strings, no dupes.
     if (
       orderedIds.length === 0 ||
@@ -381,7 +479,12 @@ function CategoriesManager({
       : undefined;
 
   return (
-    <ModalScreen title="카테고리 관리" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen
+      title="카테고리 관리"
+      onClose={() => router.back()}
+      right={addBtn}
+      refreshControl={financeRefresh}
+    >
       <View style={{ paddingHorizontal: spacing.lg, paddingTop: spacing.xs }}>
         <SegmentedTabs
           value={tab}
@@ -404,8 +507,12 @@ function CategoriesManager({
           marginBottom: spacing.sm,
         }}
       >
-        입력 시 이 순서대로 나타나요 ·{' '}
-        <Text style={{ color: colors.primaryStrong }}>오른쪽 ⋮⋮ 손잡이를 끌어서 이동</Text>
+        {tabHasPendingCategory
+          ? '전송 대기 중인 카테고리가 있어요 · 반영된 뒤 순서를 바꿀 수 있어요'
+          : '입력 시 이 순서대로 나타나요 · '}
+        {!tabHasPendingCategory && (
+          <Text style={{ color: colors.primaryStrong }}>오른쪽 ⋮⋮ 손잡이를 끌어서 이동</Text>
+        )}
       </Text>
 
       <DragList
@@ -413,6 +520,7 @@ function CategoriesManager({
         cats={allCats}
         customIds={customIds}
         deletingId={deletingId}
+        pendingOps={pendingCategoryOps}
         onReorder={canReorder ? onReorder : undefined}
         onEdit={canEdit ? openEdit : undefined}
         onDelete={canDelete ? confirmDelete : undefined}
@@ -636,6 +744,7 @@ function DragList({
   cats,
   customIds,
   deletingId,
+  pendingOps,
   onReorder,
   onEdit,
   onDelete,
@@ -643,6 +752,9 @@ function DragList({
   cats: Category[];
   customIds: Set<string>;
   deletingId: string | null;
+  /** STEP 16-H2-C2-B2 — category id -> its un-sent offline op state, for the
+   *  row label + read-only gate. Rows in this map are excluded from reorder. */
+  pendingOps: FinanceReadResult['pendingCategoryOps'];
   onReorder?: (ids: string[]) => void;
   onEdit?: (cat: Category) => void;
   onDelete?: (id: string, name: string) => void;
@@ -684,26 +796,32 @@ function DragList({
         borderRadius: radii.xxl,
       }}
     >
-      {data.map((c, index) => (
-        <DragRow
-          key={c.id}
-          cat={c}
-          index={index}
-          count={data.length}
-          custom={customIds.has(c.id)}
-          dimmed={deletingId === c.id}
-          activeIndex={activeIndex}
-          dragY={dragY}
-          onEdit={onEdit}
-          onDelete={onDelete}
-          reorderable={!!onReorder}
-          onDragStart={() => setDragging(true)}
-          onCommit={(from, to) => {
-            commit(from, to);
-            setDragging(false);
-          }}
-        />
-      ))}
+      {data.map((c, index) => {
+        const pendingOp = pendingOps.get(c.id);
+        return (
+          <DragRow
+            key={c.id}
+            cat={c}
+            index={index}
+            count={data.length}
+            custom={customIds.has(c.id)}
+            dimmed={deletingId === c.id}
+            pendingLabel={pendingOp ? pendingCategoryRowLabel(pendingOp) : null}
+            activeIndex={activeIndex}
+            dragY={dragY}
+            onEdit={onEdit}
+            onDelete={onDelete}
+            // §12: a pending / failed row is never a drag target (belt to the
+            // tab-level `canReorder` gate) — a pending id must not reach commit.
+            reorderable={!!onReorder && !pendingOp}
+            onDragStart={() => setDragging(true)}
+            onCommit={(from, to) => {
+              commit(from, to);
+              setDragging(false);
+            }}
+          />
+        );
+      })}
     </View>
   );
 }
@@ -714,6 +832,7 @@ function DragRow({
   count,
   custom,
   dimmed,
+  pendingLabel,
   activeIndex,
   dragY,
   onEdit,
@@ -727,6 +846,9 @@ function DragRow({
   count: number;
   custom: boolean;
   dimmed: boolean;
+  /** STEP 16-H2-C2-B2 — non-null when this row carries an un-sent offline op:
+   *  the small muted status line, and the row is read-only. */
+  pendingLabel: string | null;
   activeIndex: { value: number };
   dragY: { value: number };
   onEdit?: (cat: Category) => void;
@@ -793,7 +915,9 @@ function DragRow({
     };
   });
 
-  const editable = custom && !!onEdit;
+  // §12: a row with an un-sent offline op is read-only — no edit tap, no
+  // delete button. §27: the status shows only as a small muted line.
+  const editable = custom && !!onEdit && !pendingLabel;
 
   const left = (
     <>
@@ -816,8 +940,17 @@ function DragRow({
         >
           {cat.name}
         </Text>
-        <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-          {custom ? (editable ? '사용자 추가 · 눌러서 수정' : '사용자 추가') : '기본'}
+        <Text
+          numberOfLines={1}
+          style={{
+            fontFamily: pendingLabel ? fontFamily.medium : fontFamily.regular,
+            fontSize: 10,
+            lineHeight: 12,
+            color: colors.textMuted,
+            ...noPad,
+          }}
+        >
+          {pendingLabel ?? (custom ? (editable ? '사용자 추가 · 눌러서 수정' : '사용자 추가') : '기본')}
         </Text>
       </View>
     </>
@@ -856,7 +989,7 @@ function DragRow({
           borderBottomColor: colors.track,
           backgroundColor: colors.white,
           borderRadius: radii.xxl,
-          opacity: dimmed ? 0.5 : 1,
+          opacity: dimmed ? 0.5 : pendingLabel ? 0.6 : 1,
         }}
       >
         {editable ? (
@@ -867,7 +1000,7 @@ function DragRow({
           <View style={leftStyle}>{left}</View>
         )}
 
-        {custom && onDelete && (
+        {custom && onDelete && !pendingLabel && (
           <Pressable
             onPress={() => onDelete(cat.id, cat.name)}
             disabled={dimmed}
