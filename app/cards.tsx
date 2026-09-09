@@ -16,6 +16,8 @@ import {
 } from '@/lib/card';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
+import { pendingCardRowLabel } from '@/lib/pendingCardLabel';
+import type { FinanceReadResult } from '@/store/financeRead';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -32,13 +34,27 @@ interface CardRow {
   activeInstallments: number;
   /** 남은 할부 원금 합계. */
   remainingInstallment: number;
+  /**
+   * STEP 16-H2-C2-A2 — this row carries an un-sent offline card op (a pending
+   * CREATE / UPDATE overlay, or a terminal-failed op held for a manual
+   * retry). Set only on the card-management screen. When present the row is
+   * read-only (§11) and shows `pending.label` as a small muted secondary
+   * line (§20).
+   */
+  pending?: { label: string; failed: boolean };
 }
 
 function buildRows(
   txns: Transaction[],
   cards: CreditCard[],
+  managementRows: CreditCard[],
+  pendingCardOps: FinanceReadResult['pendingCardOps'],
   now: Date,
 ): { rows: CardRow[]; unassigned: CardRow | null; total: number } {
+  // Billing / 할부 accumulation stay on the AUTHORITATIVE server cards +
+  // transactions (STEP 16-H2-C2-A2 §8): a pending card is never a transaction
+  // target, so it simply contributes 0. Only the row LIST comes from
+  // `managementRows` so an un-sent card is visible here (and nowhere else).
   const billing = cardBillingForMonth(txns, cards, now);
 
   const acc: Record<string, { count: number; remaining: number }> = {};
@@ -52,15 +68,21 @@ function buildRows(
     bucket.remaining += plan.remainingAmount;
   }
 
-  const rows: CardRow[] = cards.map((c) => ({
-    id: c.id,
-    name: c.name,
-    color: c.color,
-    paymentDay: c.paymentDay,
-    monthCharge: billing.byCard[c.id] ?? 0,
-    activeInstallments: acc[c.id]?.count ?? 0,
-    remainingInstallment: acc[c.id]?.remaining ?? 0,
-  }));
+  const rows: CardRow[] = managementRows.map((c) => {
+    const op = pendingCardOps.get(c.id);
+    return {
+      id: c.id,
+      name: c.name,
+      color: c.color,
+      paymentDay: c.paymentDay,
+      monthCharge: billing.byCard[c.id] ?? 0,
+      activeInstallments: acc[c.id]?.count ?? 0,
+      remainingInstallment: acc[c.id]?.remaining ?? 0,
+      ...(op
+        ? { pending: { label: pendingCardRowLabel(op), failed: op.failed } }
+        : {}),
+    };
+  });
 
   const unassignedActive = acc[UNASSIGNED_CARD_ID];
   const unassigned: CardRow | null =
@@ -79,12 +101,20 @@ function buildRows(
 
 export default function CardsList() {
   const router = useRouter();
-  const { status, error, cards, transactions, refresh } = useFinanceRead();
+  const {
+    status,
+    error,
+    cards,
+    cardManagementRows,
+    pendingCardOps,
+    transactions,
+    refresh,
+  } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
   const { rows, unassigned, total } = useMemo(
-    () => buildRows(transactions, cards, new Date()),
-    [transactions, cards],
+    () => buildRows(transactions, cards, cardManagementRows, pendingCardOps, new Date()),
+    [transactions, cards, cardManagementRows, pendingCardOps],
   );
 
   if (status !== 'ready') {
@@ -141,11 +171,11 @@ export default function CardsList() {
           <Text style={{ fontFamily: fontFamily.medium, fontSize: 15, color: 'rgba(255,255,255,0.9)' }}>원</Text>
         </View>
         <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, color: 'rgba(255,255,255,0.85)', marginTop: 8, lineHeight: 15 }}>
-          카드 {cards.length}장 · 카드사 실제 청구일과 다를 수 있어요
+          카드 {rows.length}장 · 카드사 실제 청구일과 다를 수 있어요
         </Text>
       </LinearGradient>
 
-      {cards.length === 0 && !unassigned ? (
+      {rows.length === 0 && !unassigned ? (
         <EmptyState
           icon={REMOTE_FINANCE_WRITE.cardCreate ? undefined : 'card'}
           onPress={REMOTE_FINANCE_WRITE.cardCreate ? openAdd : undefined}
@@ -163,7 +193,14 @@ export default function CardsList() {
             <CardItem
               key={row.id}
               row={row}
-              onPress={REMOTE_FINANCE_WRITE.cardEdit ? () => openEdit(row.id) : undefined}
+              // STEP 16-H2-C2-A2 §11: a pending / failed offline card row is
+              // read-only — no edit route, no delete re-entry (cross-op
+              // compaction is not supported yet).
+              onPress={
+                REMOTE_FINANCE_WRITE.cardEdit && !row.pending
+                  ? () => openEdit(row.id)
+                  : undefined
+              }
             />
           ))}
           {/* "카드 미지정" is not a real card — never an edit target. */}
@@ -208,6 +245,21 @@ function CardItem({ row, onPress }: { row: CardRow; onPress?: () => void }) {
                 ? `매월 ${row.paymentDay}일 결제 예정`
                 : '결제일 미설정'}
           </Text>
+          {/* STEP 16-H2-C2-A2 §20: a small muted secondary line for an
+              un-sent offline card op — never a banner / red alert. */}
+          {row.pending && (
+            <Text
+              style={{
+                fontFamily: fontFamily.medium,
+                fontSize: 11,
+                lineHeight: 14,
+                color: row.pending.failed ? colors.textSub : colors.textMuted,
+                ...noPad,
+              }}
+            >
+              {row.pending.label}
+            </Text>
+          )}
         </View>
         {onPress && !isUnassigned && (
           <AppIcon name="chevron" size={16} color={colors.textMuted} />
@@ -244,6 +296,9 @@ function CardItem({ row, onPress }: { row: CardRow; onPress?: () => void }) {
     borderWidth: 1,
     borderColor: colors.border,
     borderRadius: radii.xxl,
+    // STEP 16-H2-C2-A2 §11/§20: a pending / failed offline card row reads as
+    // muted — subtle, not a red alert.
+    ...(row.pending ? { opacity: 0.6 } : {}),
   } as const;
 
   if (onPress && !isUnassigned) {

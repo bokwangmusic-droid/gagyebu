@@ -20,6 +20,8 @@ import { createCard, softDeleteCard, updateCard } from '@/services/remoteCardWri
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import type { CreditCard } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
@@ -180,6 +182,10 @@ function CardForm({ mode }: { mode: FormMode }) {
   // Household finance READ values (status/refresh) come ONLY from the
   // remote read-only source — never useStore().
   const { status, error, refresh } = useFinanceRead();
+  // STEP 16-H2-C2-A2: durable offline fallback for a card CREATE / UPDATE /
+  // soft DELETE whose direct write hit a TRANSPORT failure (offline). Never
+  // used for a server/terminal verdict.
+  const pending = usePendingWrites();
 
   const editing = mode.kind === 'edit' ? mode.card : null;
   const isEdit = mode.kind === 'edit';
@@ -244,6 +250,24 @@ function CardForm({ mode }: { mode: FormMode }) {
     };
   };
 
+  /**
+   * STEP 16-H2-C2-A2 §4: a durable-enqueue that itself failed — the change is
+   * NOT queued, so the form stays open and the user is told why. Raw
+   * coordinator reasons are never surfaced.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '카드를 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
   const save = async () => {
     if (submittingRef.current || deletingRef.current || !canSave) return;
     if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
@@ -262,7 +286,31 @@ function CardForm({ mode }: { mode: FormMode }) {
         draft,
       });
       if (!res.ok) {
-        // cardIdRef is unchanged — a retry reuses the same id.
+        // STEP 16-H2-C2-A2 §2/§3/§4: a TRANSPORT failure (offline) -> durable
+        // CREATE queue. The SAME client id (cardIdRef, never regenerated) and
+        // the SAME draft go into the PendingWrite, so a later flush replays
+        // the exact request and its 23505 reconcile stays idempotent — no
+        // duplicate-card accident on a lost response.
+        if (res.transport === true) {
+          const enq = await pending.enqueueCardCreate({
+            scope: { userId: session.user.id, householdId: activeHousehold.id },
+            entityId: cardIdRef.current,
+            payload: draft,
+          });
+          submittingRef.current = false;
+          setSubmitting(false);
+          if (enq.ok) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+            toast.show('카드를 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+            router.back();
+            return;
+          }
+          // Durable enqueue failed — DO NOT claim success, keep the form.
+          toast.show(enqueueFailMessage(enq.reason));
+          return;
+        }
+        // A non-transport terminal failure — existing behaviour: message +
+        // stay. cardIdRef is unchanged so a manual retry reuses the same id.
         submittingRef.current = false;
         setSubmitting(false);
         toast.show(res.message);
@@ -275,7 +323,10 @@ function CardForm({ mode }: { mode: FormMode }) {
       return;
     }
 
-    // ---- edit ---- expectedUpdatedAt is the token captured at MOUNT.
+    // ---- edit ---- expectedUpdatedAt is the token captured at MOUNT
+    // (expectedUpdatedAtRef), never re-fetched — that is what makes the
+    // conflict check meaningful, online AND for a queued offline UPDATE
+    // (STEP 16-H2-C2-A2 §5).
     const token = expectedUpdatedAtRef.current;
     if (!token) {
       submittingRef.current = false;
@@ -291,6 +342,27 @@ function CardForm({ mode }: { mode: FormMode }) {
       draft,
     });
     if (!res.ok) {
+      // STEP 16-H2-C2-A2 §6: a TRANSPORT failure (offline) -> durable UPDATE
+      // queue with the FROZEN mount token verbatim, so the optimistic-
+      // concurrency check still fires (as a conflict) when the flush runs.
+      if (res.transport === true) {
+        const enq = await pending.enqueueCardUpdate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: mode.card.id,
+          payload: draft,
+          expectedUpdatedAt: token,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('카드를 수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        toast.show(enqueueFailMessage(enq.reason));
+        return;
+      }
       submittingRef.current = false;
       setSubmitting(false);
       if (res.reason === 'identity' || res.reason === 'error') {
@@ -346,6 +418,28 @@ function CardForm({ mode }: { mode: FormMode }) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('카드를 삭제했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-C2-A2 §7: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue with the FROZEN mount token. `composeCardManagement` hides the row
+    // from the card-management screen right away; the transaction/card
+    // reference truth stays server-authoritative until the flush lands.
+    if (res.transport === true) {
+      const enq = await pending.enqueueCardDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: mode.card.id,
+        expectedUpdatedAt: token,
+      });
+      deletingRef.current = false;
+      setDeleting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('카드를 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        router.back();
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
       return;
     }
 
