@@ -6,6 +6,7 @@ import { Alert, Pressable, Text, TextInput, View } from 'react-native';
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { Card } from '@/components/ui/Card';
 import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -36,6 +37,7 @@ export default function PlannedScreen() {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, error, planned, plannedMeta, notes, customCats, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
   const [tab, setTab] = useState<'planned' | 'notes'>('planned');
 
   const deletingRef = useRef(false);
@@ -129,7 +131,7 @@ export default function PlannedScreen() {
   }
 
   return (
-    <Screen>
+    <Screen refreshControl={financeRefresh}>
       <ScreenHeader
         title="예정 · 메모"
         right={

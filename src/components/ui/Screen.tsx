@@ -1,5 +1,11 @@
-import type { ReactNode } from 'react';
-import { ScrollView, View, type StyleProp, type ViewStyle } from 'react-native';
+import type { ReactElement, ReactNode } from 'react';
+import {
+  ScrollView,
+  View,
+  type RefreshControlProps,
+  type StyleProp,
+  type ViewStyle,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { colors, layout } from '@/theme/tokens';
@@ -9,6 +15,12 @@ interface ScreenProps {
   /** Add bottom padding to clear the floating tab bar + FAB. */
   scroll?: boolean;
   contentStyle?: StyleProp<ViewStyle>;
+  /**
+   * Optional pull-to-refresh for the scroll body (STEP 16-G3-B3 §6). Pass
+   * the element from `useRemoteFinanceRefreshControl()`. Ignored when
+   * `scroll` is false. Purely additive — omitting it changes nothing.
+   */
+  refreshControl?: ReactElement<RefreshControlProps>;
 }
 
 /**
@@ -16,7 +28,7 @@ interface ScreenProps {
  * column like the web version. Handles the safe-area top inset and leaves
  * room at the bottom for the floating nav.
  */
-export function Screen({ children, scroll = true, contentStyle }: ScreenProps) {
+export function Screen({ children, scroll = true, contentStyle, refreshControl }: ScreenProps) {
   const insets = useSafeAreaInsets();
 
   const inner = (
@@ -48,6 +60,7 @@ export function Screen({ children, scroll = true, contentStyle }: ScreenProps) {
         contentStyle,
       ]}
       showsVerticalScrollIndicator={false}
+      refreshControl={refreshControl}
     >
       {inner}
     </ScrollView>

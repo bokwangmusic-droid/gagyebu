@@ -5,6 +5,7 @@ import { Pressable, Text, View } from 'react-native';
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
 import { isKrRedDay } from '@/data/holidays';
@@ -25,6 +26,7 @@ interface DayTotals {
 export default function CalendarScreen() {
   const router = useRouter();
   const { status, error, transactions, customCats, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
 
   const now = new Date();
   const [view, setView] = useState({ year: now.getFullYear(), month: now.getMonth() });
@@ -102,7 +104,7 @@ export default function CalendarScreen() {
   }
 
   return (
-    <ModalScreen title="달력" onClose={() => router.back()} right={todayBtn}>
+    <ModalScreen title="달력" onClose={() => router.back()} right={todayBtn} refreshControl={financeRefresh}>
       <FinanceReadOnlyBanner />
       {/* Month nav */}
       <View

@@ -5,6 +5,7 @@ import { Pressable, Text, View } from 'react-native';
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
@@ -27,6 +28,7 @@ export default function AllTransactions() {
   const router = useRouter();
   const params = useLocalSearchParams<{ filter?: string; scope?: string }>();
   const { status, error, transactions, customCats, cards, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
 
   const [filter, setFilter] = useState<Filter>((params.filter as Filter) || 'all');
   const [scope, setScope] = useState<Scope>((params.scope as Scope) || 'all');
@@ -89,6 +91,7 @@ export default function AllTransactions() {
     <ModalScreen
       title="전체 내역"
       onClose={() => router.back()}
+      refreshControl={financeRefresh}
       right={<Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub }}>{filtered.length}건</Text>}
     >
       <FinanceReadOnlyBanner />

@@ -5,6 +5,7 @@ import { Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import {
@@ -79,6 +80,7 @@ function buildRows(
 export default function CardsList() {
   const router = useRouter();
   const { status, error, cards, transactions, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
 
   const { rows, unassigned, total } = useMemo(
     () => buildRows(transactions, cards, new Date()),
@@ -114,7 +116,7 @@ export default function CardsList() {
   ) : undefined;
 
   return (
-    <ModalScreen title="카드 관리" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen title="카드 관리" onClose={() => router.back()} right={addBtn} refreshControl={financeRefresh}>
       <LinearGradient
         colors={gradients.primary}
         start={{ x: 0, y: 0 }}

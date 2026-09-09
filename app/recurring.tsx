@@ -5,6 +5,7 @@ import { Alert, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { Card } from '@/components/ui/Card';
 import { SegmentedTabs, Toggle } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -28,6 +29,7 @@ export default function RecurringList() {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, error, recurring, recurringMeta, customCats, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
   const [tab, setTab] = useState<TxnType>('expense');
 
   // One row-level write at a time (toggle OR delete). Dims + disables that row.
@@ -161,7 +163,7 @@ export default function RecurringList() {
   ) : undefined;
 
   return (
-    <ModalScreen title="반복 지출·수입" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen title="반복 지출·수입" onClose={() => router.back()} right={addBtn} refreshControl={financeRefresh}>
       <Card style={{ marginTop: spacing.xs }}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <View>

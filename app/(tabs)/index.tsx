@@ -5,6 +5,7 @@ import { Pressable, Text, View } from 'react-native';
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { Card } from '@/components/ui/Card';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
@@ -36,6 +37,7 @@ function insightTone(tone: Insight['tone']): { bg: string; fg: string } {
 export default function HomeScreen() {
   const router = useRouter();
   const { status, error, transactions, planned, customCats, cards, budgets, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
   const { income, expense, byCategory, totalBudget, remaining } = useMemo(
     () => monthlyTotals(transactions, budgets),
     [transactions, budgets],
@@ -100,7 +102,7 @@ export default function HomeScreen() {
   }
 
   return (
-    <Screen>
+    <Screen refreshControl={financeRefresh}>
       <ScreenHeader
         title={formatMonthLabel()}
         containerStyle={{ paddingTop: spacing.sm + 2, paddingBottom: spacing.sm }}

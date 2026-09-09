@@ -55,6 +55,7 @@ import {
 } from '@/lib/remoteFinanceMapping';
 import {
   createRefreshScheduler,
+  shouldForegroundRefresh,
   type RefreshScheduler,
 } from '@/lib/remoteFinanceRefreshScheduler';
 import { fetchHouseholdFinanceSnapshot } from '@/services/remoteFinance';
@@ -182,22 +183,21 @@ export function RemoteFinanceProvider({ children }: { children: ReactNode }) {
     };
   }, [householdId, userId]);
 
-  // STEP 16-G3-B1 §10: background/inactive -> active. One authoritative
-  // refresh of the current scope, through the SAME scheduler (no separate
-  // fetch path). A cold start is already 'active', and the initial mount
-  // fires no 'change' event, so only a genuine return-from-background
-  // transition triggers this.
+  // STEP 16-G3-B1 §10 / STEP 16-G3-B3 §2: background/inactive -> active. One
+  // authoritative refresh of the current scope, through the SAME scheduler
+  // (no separate fetch path). A cold start is already 'active', and the
+  // initial mount fires no 'change' event, so only a genuine
+  // return-from-background transition triggers this. The transition rule is
+  // the pure `shouldForegroundRefresh` (unit-tested in the scheduler cases);
+  // this effect is just the RN wiring. If a realtime reconnect's catch-up
+  // lands in the same window, the B1 scheduler coalesces the two into one
+  // fetch (STEP 16-G3-B3 §10 case 8).
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   useEffect(() => {
     const sub = AppState.addEventListener('change', (next) => {
       const prev = appStateRef.current;
       appStateRef.current = next;
-      if (
-        next === 'active' &&
-        (prev === 'background' || prev === 'inactive') &&
-        userId &&
-        householdId
-      ) {
+      if (shouldForegroundRefresh({ prev, next, userId, householdId })) {
         void schedulerRef.current?.request();
       }
     });

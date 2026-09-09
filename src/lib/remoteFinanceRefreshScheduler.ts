@@ -76,6 +76,42 @@ export interface RefreshScheduler {
 const scopeKeyOf = (s: RefreshScope | null): string | null =>
   s ? `${s.userId}:${s.householdId}` : null;
 
+/* ------------------------------------------------------------------ *
+ * Foreground-refresh predicate — STEP 16-G3-B3 §2.
+ *
+ * Pure. Decides whether a React Native AppState transition should trigger
+ * ONE authoritative refresh of the current scope (which the provider then
+ * routes through `scheduler.request()` — the same coalesced path every
+ * other trigger uses). Extracted so the "only a real background->foreground
+ * return, and only with a live scope" rule is unit-testable without React
+ * or an AppState mock (STEP 16-G3-B3 §10 cases 1-4).
+ *
+ * A cold start is already `active` and fires no transition, so this can
+ * only return true for a genuine return-from-background — never on the
+ * initial mount (no double initial fetch).
+ * ------------------------------------------------------------------ */
+export type AppVisibility =
+  | 'active'
+  | 'background'
+  | 'inactive'
+  | 'unknown'
+  | 'extension'
+  | (string & {});
+
+export function shouldForegroundRefresh(args: {
+  prev: AppVisibility;
+  next: AppVisibility;
+  userId: string | null | undefined;
+  householdId: string | null | undefined;
+}): boolean {
+  return (
+    args.next === 'active' &&
+    (args.prev === 'background' || args.prev === 'inactive') &&
+    !!args.userId &&
+    !!args.householdId
+  );
+}
+
 export function createRefreshScheduler<T>(
   opts: RefreshSchedulerOptions<T>,
 ): RefreshScheduler {

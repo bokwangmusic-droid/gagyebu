@@ -101,6 +101,75 @@ export function createInvalidationDebouncer(opts: {
 }
 
 /* ------------------------------------------------------------------ *
+ * Reconnect tracker — pure, no Supabase, no timers, no fetch.
+ *
+ * STEP 16-G3-B3 §3/§15. Classifies each `subscribe()` status callback so
+ * the subscription can tell a genuine RECONNECT (a later `SUBSCRIBED` after
+ * the socket dropped) from the very first `SUBSCRIBED`, and can log
+ * lifecycle transitions ONCE instead of on every repeated callback in a
+ * reconnect loop.
+ *
+ * It deliberately does NOT drive the catch-up refresh: the subscription
+ * still calls `debouncer.schedule()` on EVERY `SUBSCRIBED` (first one closes
+ * the initial-snapshot<->subscription gap per STEP 16-G3-B2 §15; a
+ * reconnect one recovers `postgres_changes` events missed while the socket
+ * was down). Both collapse into a single trailing invalidation, and the
+ * provider's B1 scheduler owns fetch concurrency — so a flapping connection
+ * can never produce a burst of parallel snapshots.
+ * ------------------------------------------------------------------ */
+
+export type RealtimeLifecyclePhase =
+  /** The very first `SUBSCRIBED` for this channel. */
+  | 'first-subscribed'
+  /** `SUBSCRIBED` again after a CHANNEL_ERROR / TIMED_OUT / CLOSED. */
+  | 'reconnected'
+  /** First CHANNEL_ERROR / TIMED_OUT / CLOSED since the last `SUBSCRIBED`. */
+  | 'disrupted'
+  /** A repeat of the current phase — nothing changed, do not act/log. */
+  | 'noise';
+
+export interface RealtimeReconnectTracker {
+  observe: (status: RealtimeSubscribeStatus) => RealtimeLifecyclePhase;
+}
+
+export function createRealtimeReconnectTracker(): RealtimeReconnectTracker {
+  let hadSubscribed = false;
+  let disruptedSinceSubscribe = false;
+
+  return {
+    observe: (status) => {
+      if (status === 'SUBSCRIBED') {
+        if (!hadSubscribed) {
+          hadSubscribed = true;
+          disruptedSinceSubscribe = false;
+          return 'first-subscribed';
+        }
+        if (disruptedSinceSubscribe) {
+          disruptedSinceSubscribe = false;
+          return 'reconnected';
+        }
+        // Repeated SUBSCRIBED with no disruption between — treat as noise so
+        // it neither logs nor counts as a reconnect.
+        return 'noise';
+      }
+      if (
+        status === 'CHANNEL_ERROR' ||
+        status === 'TIMED_OUT' ||
+        status === 'CLOSED'
+      ) {
+        // A disruption before we ever came up is not a "reconnect" setup —
+        // the first successful SUBSCRIBED is still `first-subscribed`.
+        if (!hadSubscribed) return 'noise';
+        if (disruptedSinceSubscribe) return 'noise'; // already known to be down
+        disruptedSinceSubscribe = true;
+        return 'disrupted';
+      }
+      return 'noise';
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Subscription
  * ------------------------------------------------------------------ */
 
@@ -125,6 +194,7 @@ export function subscribeHouseholdFinance(args: {
 }): HouseholdFinanceSubscription {
   const scopeKey = `${args.userId}:${args.householdId}`;
   let disposed = false;
+  const tracker = createRealtimeReconnectTracker();
 
   const debouncer = createInvalidationDebouncer({
     delayMs: REALTIME_INVALIDATION_DEBOUNCE_MS,
@@ -158,16 +228,27 @@ export function subscribeHouseholdFinance(args: {
   channel.subscribe((status, err) => {
     if (disposed) return;
     args.onStatus?.(status, err);
-    if (status === 'SUBSCRIBED') {
-      // §15: close the initial-snapshot <-> subscription gap. Also fires
-      // after a reconnect (CHANNEL_ERROR / TIMED_OUT -> SUBSCRIBED). Routed
-      // through the debouncer so it merges with any queued events and the
-      // provider's B1 scheduler still owns fetch concurrency.
+    const phase = tracker.observe(status);
+
+    if (status === 'SUBSCRIBED' && phase !== 'noise') {
+      // `first-subscribed` (STEP 16-G3-B2 §15) closes the initial-snapshot
+      // <-> subscription gap; `reconnected` (STEP 16-G3-B3 §3) recovers
+      // events missed while the socket was down. A redundant repeat
+      // SUBSCRIBED with no disruption between is `noise` and skipped, so a
+      // flapping callback can't add fetches. Everything else routes through
+      // the debouncer -> one trailing invalidation -> the provider's B1
+      // scheduler, which owns fetch concurrency, so even a real reconnect
+      // storm collapses to a single authoritative snapshot.
       debouncer.schedule();
     }
-    if (__DEV__ && (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT')) {
+
+    // Log lifecycle transitions ONCE (not per repeated callback in a
+    // reconnect loop) and only in dev — never surfaced to the UI or
+    // FinanceRead status (STEP 16-G3-B3 §8/§15).
+    if (__DEV__ && phase !== 'noise') {
       // eslint-disable-next-line no-console
-      console.warn(`[finance-realtime] ${status}`, err?.message ?? '');
+      const log = phase === 'disrupted' ? console.warn : console.log;
+      log(`[finance-realtime] ${phase}`, err?.message ?? '');
     }
   });
 
@@ -178,6 +259,10 @@ export function subscribeHouseholdFinance(args: {
       disposed = true;
       debouncer.dispose();
       void supabase.removeChannel(channel);
+      if (__DEV__) {
+        // eslint-disable-next-line no-console
+        console.log('[finance-realtime] removed');
+      }
     },
   };
 }

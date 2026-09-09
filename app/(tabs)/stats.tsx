@@ -6,6 +6,7 @@ import Svg, { Circle, G, Text as SvgText } from 'react-native-svg';
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { FinanceReadOnlyBanner } from '@/components/FinanceReadOnlyBanner';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { Card } from '@/components/ui/Card';
 import { SegmentedTabs } from '@/components/ui/controls';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -48,6 +49,7 @@ interface Bar {
 export default function StatsScreen() {
   const router = useRouter();
   const { status, error, transactions, customCats, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
   const [period, setPeriod] = useState<Period>('week');
   const [selectedBar, setSelectedBar] = useState<Bar | null>(null);
 
@@ -168,7 +170,7 @@ export default function StatsScreen() {
   }
 
   return (
-    <Screen>
+    <Screen refreshControl={financeRefresh}>
       <ScreenHeader
         title="통계"
         right={<Text style={{ fontFamily: fontFamily.semibold, fontSize: 14, color: colors.text }}>{info.header}</Text>}

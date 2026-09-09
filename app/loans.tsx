@@ -6,6 +6,7 @@ import { Alert, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { ProgressBar } from '@/components/ui/ProgressBar';
@@ -27,6 +28,7 @@ export default function LoansList() {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, error, loans, loanMeta, loanPaymentMeta, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
   const [expanded, setExpanded] = useState<string | null>(null);
 
   // One row-level write at a time — the id is either a loan id (card dim)
@@ -169,7 +171,7 @@ export default function LoansList() {
   ) : undefined;
 
   return (
-    <ModalScreen title="대출 관리" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen title="대출 관리" onClose={() => router.back()} right={addBtn} refreshControl={financeRefresh}>
       <LinearGradient
         colors={gradients.primary}
         start={{ x: 0, y: 0 }}

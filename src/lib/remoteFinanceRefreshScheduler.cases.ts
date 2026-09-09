@@ -9,6 +9,7 @@
  */
 import {
   createRefreshScheduler,
+  shouldForegroundRefresh,
   type RefreshScope,
   type SnapshotOutcome,
 } from '@/lib/remoteFinanceRefreshScheduler';
@@ -280,6 +281,79 @@ export async function runSchedulerCases(): Promise<{
         h.commits.length === 1 &&
         h.commits[0].scopeKey === 'u-owner:h-B',
       `errCommits=${errCommits.length} commits=${JSON.stringify(h.commits.map((c) => c.scopeKey))}`,
+    );
+  }
+
+  // CASE 10 — STEP 16-G3-B3 §2/§10: the foreground-refresh predicate.
+  // Only a real background/inactive -> active return with a live scope.
+  {
+    const uid = 'u-owner';
+    const hid = 'h-A';
+    const bgToActive = shouldForegroundRefresh({ prev: 'background', next: 'active', userId: uid, householdId: hid });
+    const inactiveToActive = shouldForegroundRefresh({ prev: 'inactive', next: 'active', userId: uid, householdId: hid });
+    const activeToActive = shouldForegroundRefresh({ prev: 'active', next: 'active', userId: uid, householdId: hid });
+    const toBackground = shouldForegroundRefresh({ prev: 'active', next: 'background', userId: uid, householdId: hid });
+    const noUser = shouldForegroundRefresh({ prev: 'background', next: 'active', userId: null, householdId: hid });
+    const noHousehold = shouldForegroundRefresh({ prev: 'background', next: 'active', userId: uid, householdId: null });
+    check(
+      'CASE 10 foreground predicate: only bg/inactive->active with a live scope',
+      bgToActive === true &&
+        inactiveToActive === true &&
+        activeToActive === false &&
+        toBackground === false &&
+        noUser === false &&
+        noHousehold === false,
+      `bg->active=${bgToActive} inactive->active=${inactiveToActive} active->active=${activeToActive} ->bg=${toBackground} noUser=${noUser} noHousehold=${noHousehold}`,
+    );
+  }
+
+  // CASE 11 — STEP 16-G3-B3 §10 case 12: request() after dispose() is a
+  // safe no-op — no fetch, and the returned promise still resolves (so a
+  // late `await refresh()` from an unmounting screen can't hang).
+  {
+    const h = makeHarness();
+    h.scheduler.setScope(A);
+    await flush();
+    h.settleNext(ok('init'));
+    await flush();
+    const before = h.calls;
+    h.scheduler.dispose();
+    const flags = { resolved: false };
+    const p = h.scheduler.request().then(() => {
+      flags.resolved = true;
+    });
+    await flush();
+    await p;
+    check(
+      'CASE 11 request() after dispose -> no fetch, promise resolves',
+      h.calls === before && flags.resolved,
+      `calls ${before}->${h.calls} resolved=${flags.resolved}`,
+    );
+  }
+
+  // CASE 12 — STEP 16-G3-B3 §10 case 8: a realtime reconnect catch-up and
+  // an AppState foreground refresh landing together are just two request()s
+  // — the scheduler coalesces them to one in-flight + one trailing, never
+  // two parallel snapshots.
+  {
+    const h = makeHarness();
+    h.scheduler.setScope(A);
+    await flush();
+    h.settleNext(ok('init'));
+    await flush();
+    const p1 = h.scheduler.request(); // e.g. realtime reconnect SUBSCRIBED
+    const p2 = h.scheduler.request(); // e.g. AppState background->active
+    await flush();
+    h.settleNext(ok('r1'));
+    await flush();
+    h.settleNext(ok('r2'));
+    await Promise.all([p1, p2]);
+    await flush();
+    const last = h.commits[h.commits.length - 1];
+    check(
+      'CASE 12 reconnect + foreground together -> coalesced, no parallel fetch',
+      h.maxInFlight === 1 && h.calls === 3 && dataOf(last?.outcome) === 'r2',
+      `maxInFlight=${h.maxInFlight} calls=${h.calls} last=${dataOf(last?.outcome)}`,
     );
   }
 

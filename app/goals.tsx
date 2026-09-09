@@ -6,6 +6,7 @@ import { Alert, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { ProgressBar } from '@/components/ui/ProgressBar';
@@ -38,6 +39,7 @@ export default function GoalsList() {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, error, goals, goalMeta, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
 
   const pendingRef = useRef(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
@@ -129,7 +131,7 @@ export default function GoalsList() {
   ) : undefined;
 
   return (
-    <ModalScreen title="저축 목표" onClose={() => router.back()} right={addBtn}>
+    <ModalScreen title="저축 목표" onClose={() => router.back()} right={addBtn} refreshControl={financeRefresh}>
       <LinearGradient
         colors={gradients.goalPink}
         start={{ x: 0, y: 0 }}

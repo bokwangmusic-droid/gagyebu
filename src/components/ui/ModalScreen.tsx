@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode, type Ref } from 'react';
+import { useEffect, useState, type ReactElement, type ReactNode, type Ref } from 'react';
 import {
   Keyboard,
   Platform,
@@ -9,6 +9,7 @@ import {
   type LayoutChangeEvent,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  type RefreshControlProps,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -46,6 +47,12 @@ interface ModalScreenProps {
    * `scrollEventThrottle` only when provided. Purely additive.
    */
   onScrollViewScroll?: (e: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  /**
+   * Optional pull-to-refresh for the scroll body (STEP 16-G3-B3 §6). Pass
+   * the element from `useRemoteFinanceRefreshControl()`. No effect unless
+   * `scroll` is true. Purely additive; omitting it changes nothing.
+   */
+  refreshControl?: ReactElement<RefreshControlProps>;
 }
 
 /**
@@ -64,6 +71,7 @@ export function ModalScreen({
   scrollRef,
   onScrollViewLayout,
   onScrollViewScroll,
+  refreshControl,
 }: ModalScreenProps) {
   const insets = useSafeAreaInsets();
   const [kb, setKb] = useState(0);
@@ -121,6 +129,7 @@ export function ModalScreen({
           onLayout={onScrollViewLayout}
           onScroll={onScrollViewScroll}
           scrollEventThrottle={onScrollViewScroll ? 16 : undefined}
+          refreshControl={refreshControl}
           style={{ flex: 1, marginBottom: kb }}
           contentContainerStyle={{ paddingBottom: insets.bottom + 32 + (kb > 0 ? 24 : 0) }}
           showsVerticalScrollIndicator={false}

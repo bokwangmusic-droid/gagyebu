@@ -6,6 +6,7 @@ import { Alert, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
+import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
@@ -28,6 +29,7 @@ export default function BudgetScreen() {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, error, transactions, budgets, budgetMeta, customCats, refresh } = useFinanceRead();
+  const financeRefresh = useRemoteFinanceRefreshControl();
   const { byCategory, expense, totalBudget, remaining } = useMemo(
     () => monthlyTotals(transactions, budgets),
     [transactions, budgets],
@@ -97,7 +99,7 @@ export default function BudgetScreen() {
   }
 
   return (
-    <Screen>
+    <Screen refreshControl={financeRefresh}>
       <ScreenHeader
         title="예산 관리"
         onBack={router.canGoBack() ? () => router.back() : undefined}
