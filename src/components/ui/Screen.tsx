@@ -57,6 +57,15 @@ export function Screen({ children, scroll = true, contentStyle, refreshControl }
       style={{ flex: 1, backgroundColor: colors.bg }}
       contentContainerStyle={[
         { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 132 },
+        // STEP 16-G3-B4 TODO#2: a ScrollView whose content is shorter than
+        // the viewport does not start a pull-to-refresh gesture on Android
+        // (seen on tablets, where the viewport is tall and e.g. the budget
+        // list is short). Only when a RefreshControl is actually wired, grow
+        // the content box to fill the viewport so the pull is always
+        // available. No visual change — content stays top-aligned (no
+        // justifyContent) and flexGrow can't shrink content that already
+        // overflows; screens with no RefreshControl are left untouched.
+        refreshControl ? { flexGrow: 1 } : null,
         contentStyle,
       ]}
       showsVerticalScrollIndicator={false}
