@@ -35,6 +35,13 @@
  * Small, deliberate duplication with remoteFinanceWrite.ts (error
  * describer, conflict-reason union, the 0-row reconcile shape) is accepted
  * per STEP 16-G2-C2 §10 — safety over a premature shared-helper refactor.
+ *
+ * STEP 16-H2-C2-0: every result now carries an additive optional
+ * `transport?: boolean`. It is `true` only for a NETWORK/TRANSPORT failure
+ * (primary write OR reconcile-read) — never for a 23505, an RLS/PGRST
+ * verdict, or a successful-but-empty reselect. Only a `transport` failure is
+ * safe for the Offline Write Queue to enqueue; every other end state is
+ * unchanged from STEP 16-G2-C2.
  */
 import type { PostgrestError } from '@supabase/supabase-js';
 
@@ -45,21 +52,30 @@ import {
   type CardInsertRow,
   type NewCardDraft,
 } from '@/lib/remoteCardWriteMapping';
+import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 
+/**
+ * `transport: true` (STEP 16-H2-C2-0) marks a NETWORK/TRANSPORT failure — the
+ * request never reached a server verdict — as opposed to a server/RLS/23505
+ * verdict or a reconcile-read that came back empty. ONLY a `transport`
+ * failure is safe for the Offline Write Queue to enqueue. Additive and
+ * optional; existing callers that branch on `res.ok` / `res.reason` are
+ * unaffected.
+ */
 export type CreateCardResult =
   | { ok: true; id: string }
-  | { ok: false; message: string };
+  | { ok: false; message: string; transport?: boolean };
 
 /** Every non-ok end state for a card edit / soft delete. */
 export type CardWriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error';
 
 export type UpdateCardResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: CardWriteConflictReason; message: string };
+  | { ok: false; reason: CardWriteConflictReason; message: string; transport?: boolean };
 
 export type SoftDeleteCardResult =
   | { ok: true }
-  | { ok: false; reason: CardWriteConflictReason; message: string };
+  | { ok: false; reason: CardWriteConflictReason; message: string; transport?: boolean };
 
 const GENERIC_ERROR = '카드를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
@@ -158,8 +174,14 @@ export async function createCard(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    // Can't read it back (RLS says it isn't ours, or a transient read error)
-    // -> do NOT treat as success.
+    // STEP 16-H2-C2-0: a TRANSPORT failure during the 23505 reconcile read is
+    // retryable — the row may well be ours; the offline queue should
+    // re-attempt, not give up. A non-transport read error, or a successful
+    // read that returned no row (RLS says it isn't ours), stays terminal.
+    const readClass = classifyWriteReadError(readErr, describeWriteError);
+    if (readClass?.transport) {
+      return { ok: false, message: readClass.message, transport: true };
+    }
     if (readErr || !existing) {
       return { ok: false, message: GENERIC_ERROR };
     }
@@ -170,7 +192,10 @@ export async function createCard(args: {
     return { ok: false, message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, message: describeWriteError(error) };
+  // A non-23505 error: transport (offline) or an unexpected server error.
+  if (error) {
+    return { ok: false, message: describeWriteError(error), transport: isTransportError(error) };
+  }
   return { ok: false, message: GENERIC_ERROR };
 }
 
@@ -197,7 +222,14 @@ export async function updateCard(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile against the current row (no updated_at / deleted_at filter).
@@ -208,11 +240,19 @@ export async function updateCard(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  // A failed reselect (network / RLS / transient) is NOT "the row is gone" —
-  // classify it as 'error' so the caller retries instead of treating a
-  // still-existing card as deleted. Only a successful reselect that returns
-  // no row is 'gone'.
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-C2-0: a failed reselect is NOT "the row is gone". A TRANSPORT
+  // read failure is retryable (transport:true); a non-transport read error is
+  // a plain server error. Only a SUCCESSFUL reselect that returns no row is
+  // genuinely 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -249,7 +289,14 @@ export async function softDeleteCard(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile (no updated_at / deleted_at filter).
@@ -260,10 +307,18 @@ export async function softDeleteCard(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  // A failed reselect (network / RLS / transient) is NOT "the row is gone" —
-  // classify it as 'error'. Only a successful reselect returning no row is
-  // 'gone'.
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-C2-0: a failed reselect is NOT "the row is gone". Transport
+  // read failure -> retryable (transport:true); non-transport -> plain server
+  // error; only a successful empty reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: DELETE_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.

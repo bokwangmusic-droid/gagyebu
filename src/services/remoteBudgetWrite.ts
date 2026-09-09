@@ -51,6 +51,7 @@ import {
   isValidBudgetDraft,
   type NewBudgetDraft,
 } from '@/lib/remoteBudgetWriteMapping';
+import { isTransportError } from '@/lib/transportError';
 
 export type BudgetWriteReason =
   | 'identity'
@@ -61,13 +62,30 @@ export type BudgetWriteReason =
   | 'gone'
   | 'error';
 
+/**
+ * `transport: true` (STEP 16-H2-C2-0) marks a NETWORK/TRANSPORT failure of
+ * ANY of the requests `saveBudget` / `softDeleteBudget` make (primary
+ * UPDATE/INSERT, the guarded revive UPDATE, or any of the reconcile reads) —
+ * the request never reached a server verdict. It is NEVER set for a 23505,
+ * an RLS/PGRST verdict, the `exists` idempotency outcome, or a
+ * successful-but-empty reselect. ONLY a `transport` failure is safe for the
+ * Offline Write Queue to enqueue. Additive/optional — the natural-key
+ * identity, nullable-`expectedUpdatedAt` branching, tombstone revive,
+ * amount-match reconcile, `updated_at` guard, and partial-multi-row UI
+ * semantics are all UNCHANGED from STEP 16-G2-C3-B.
+ */
 export type SaveBudgetResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: BudgetWriteReason; message: string };
+  | { ok: false; reason: BudgetWriteReason; message: string; transport?: boolean };
 
 export type SoftDeleteBudgetResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<BudgetWriteReason, 'invalid' | 'exists' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<BudgetWriteReason, 'invalid' | 'exists' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 const GENERIC_ERROR = '예산을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
@@ -84,6 +102,28 @@ function describeWriteError(error: PostgrestError): string {
     return '네트워크 연결을 확인한 뒤 다시 시도해주세요.';
   }
   return GENERIC_ERROR;
+}
+
+/**
+ * STEP 16-H2-C2-0: shape ANY failed PostgREST request `saveBudget` /
+ * `softDeleteBudget` make (primary UPDATE/INSERT, the guarded revive, or any
+ * reconcile read) into a `reason:'error'` failure, tagging transport-vs-
+ * verdict so the offline queue can tell a retryable network drop from a
+ * server verdict. Never changes any other branch (`deleted` / `conflict` /
+ * `exists` / `gone` / idempotent-success stay as they were).
+ */
+function writeErrResult(err: PostgrestError): {
+  ok: false;
+  reason: 'error';
+  message: string;
+  transport?: true;
+} {
+  return {
+    ok: false,
+    reason: 'error',
+    message: describeWriteError(err),
+    ...(isTransportError(err) ? { transport: true } : {}),
+  };
 }
 
 /** The live session must be exactly the user the trusted screen was built for. */
@@ -147,7 +187,7 @@ export async function saveBudget(args: {
       .select('category_id, updated_at')
       .maybeSingle();
 
-    if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+    if (error) return writeErrResult(error);
     if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
     return reconcileUpdate(key, args.amount);
@@ -167,15 +207,16 @@ export async function saveBudget(args: {
   if (error?.code === '23505') {
     return reconcileInsertConflict(key, args.amount, args.expectedUserId);
   }
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) return writeErrResult(error);
   return { ok: false, reason: 'error', message: GENERIC_ERROR };
 }
 
 /** 0-row after a guarded amount UPDATE — classify (STEP 16-G2-C3-B §13/§19). */
 async function reconcileUpdate(key: BudgetRowKey, desiredAmount: number): Promise<SaveBudgetResult> {
   const { data: existing, error: readErr } = await reselect(key);
-  // A failed reselect (network / RLS / transient) is NOT "the row is gone".
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-C2-0: a failed reselect is NOT "the row is gone" — tag
+  // transport-vs-verdict; only a SUCCESSFUL empty reselect is 'gone'.
+  if (readErr) return writeErrResult(readErr);
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const row = existing as Record<string, unknown>;
@@ -194,7 +235,7 @@ async function reconcileInsertConflict(
   expectedUserId: string,
 ): Promise<SaveBudgetResult> {
   const { data: existing, error: readErr } = await reselect(key);
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  if (readErr) return writeErrResult(readErr); // STEP 16-H2-C2-0: transport-tagged
   if (!existing) return { ok: false, reason: 'gone', message: GENERIC_ERROR };
 
   const row = existing as Record<string, unknown>;
@@ -229,12 +270,12 @@ async function reviveTombstone(
     .select('category_id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) return writeErrResult(error); // STEP 16-H2-C2-0: transport-tagged
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — someone raced us. Reconcile.
   const { data: existing, error: readErr } = await reselect(key);
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  if (readErr) return writeErrResult(readErr); // STEP 16-H2-C2-0: transport-tagged
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const row = existing as Record<string, unknown>;
@@ -274,12 +315,12 @@ export async function softDeleteBudget(args: {
     .select('category_id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) return writeErrResult(error); // STEP 16-H2-C2-0: transport-tagged
   if (data?.category_id) return { ok: true };
 
   // 0 rows — reconcile.
   const { data: existing, error: readErr } = await reselect(key);
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  if (readErr) return writeErrResult(readErr); // STEP 16-H2-C2-0: transport-tagged
   if (!existing) return { ok: false, reason: 'gone', message: DELETE_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.

@@ -47,6 +47,7 @@ import {
   type CustomCategoryInsertRow,
   type NewCustomCategoryDraft,
 } from '@/lib/remoteCategoryWriteMapping';
+import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 
 export type CategoryWriteReason =
   | 'identity'
@@ -56,17 +57,31 @@ export type CategoryWriteReason =
   | 'gone'
   | 'error';
 
+/**
+ * `transport: true` (STEP 16-H2-C2-0) marks a NETWORK/TRANSPORT failure of a
+ * custom-category CRUD write — the request never reached a server verdict —
+ * as opposed to a 23505, an RLS/PGRST verdict, or a successful-but-empty
+ * reconcile read. ONLY a `transport` failure is safe for the Offline Write
+ * Queue to enqueue. Additive/optional; existing `res.ok`/`res.reason`
+ * callers are unaffected. `saveCategoryOrder` is DELIBERATELY excluded — it
+ * has no optimistic-concurrency contract and must not look queue-able.
+ */
 export type CreateCategoryResult =
   | { ok: true; id: string }
-  | { ok: false; reason: CategoryWriteReason; message: string };
+  | { ok: false; reason: CategoryWriteReason; message: string; transport?: boolean };
 
 export type UpdateCategoryResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: CategoryWriteReason; message: string };
+  | { ok: false; reason: CategoryWriteReason; message: string; transport?: boolean };
 
 export type SoftDeleteCategoryResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<CategoryWriteReason, 'invalid' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<CategoryWriteReason, 'invalid' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 export type SaveCategoryOrderResult =
   | { ok: true }
@@ -162,7 +177,18 @@ export async function createCustomCategory(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+    // STEP 16-H2-C2-0: a TRANSPORT failure during the 23505 reconcile read is
+    // retryable; a non-transport read error stays terminal; a successful
+    // empty read (RLS says it isn't ours) stays terminal.
+    const readClass = classifyWriteReadError(readErr, describeWriteError);
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: GENERIC_ERROR };
     if (isSameCreateRow(existing as Record<string, unknown>, row, args.expectedUserId)) {
       return { ok: true, id: args.id };
@@ -170,7 +196,14 @@ export async function createCustomCategory(args: {
     return { ok: false, reason: 'conflict', message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: GENERIC_ERROR };
 }
 
@@ -200,7 +233,14 @@ export async function updateCustomCategory(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile.
@@ -211,7 +251,18 @@ export async function updateCustomCategory(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-C2-0: transport read failure -> retryable (transport:true);
+  // non-transport read error -> plain server error; only a successful empty
+  // reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -244,7 +295,14 @@ export async function softDeleteCustomCategory(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile.
@@ -255,7 +313,17 @@ export async function softDeleteCustomCategory(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-C2-0: transport read failure -> retryable (transport:true);
+  // non-transport -> plain server error; only a successful empty reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.
