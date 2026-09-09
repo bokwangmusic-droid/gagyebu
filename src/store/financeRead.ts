@@ -176,6 +176,28 @@ export interface FinanceReadResult {
     { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
   >;
 
+  /**
+   * STEP 16-H2-C2-B1 — the custom-category list for the CATEGORY-MANAGEMENT
+   * screen ONLY: authoritative server `customCats` with a pending UPDATE
+   * overlaid, a synthetic entry for a pending/failed CREATE, a synthetic entry
+   * for a failed UPDATE whose server row is gone, minus a not-failed pending
+   * DELETE. DELIBERATELY separate from `customCats` (which stays
+   * authoritative-server-only so every category picker, stats name
+   * resolution, backup and household-import never see an un-sent category —
+   * §12/§13). Same `{ expense, income }` shape; equals `customCats` when there
+   * are no category ops.
+   */
+  categoryManagementRows: CustomCatMap;
+  /**
+   * custom category id -> its pending offline-op state, for the row label /
+   * read-only gate on the category-management screen. Mirrors `pendingCardOps`.
+   * `reason` only set when `failed` is true.
+   */
+  pendingCategoryOps: ReadonlyMap<
+    string,
+    { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+  >;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -206,6 +228,8 @@ const EMPTY_SLICES = {
   failedLocalTransactions: [] as FinanceReadResult['failedLocalTransactions'],
   cardManagementRows: [] as CreditCard[],
   pendingCardOps: new Map() as FinanceReadResult['pendingCardOps'],
+  categoryManagementRows: DEFAULT_CUSTOM_CATS,
+  pendingCategoryOps: new Map() as FinanceReadResult['pendingCategoryOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -220,6 +244,9 @@ export function useFinanceRead(): FinanceReadResult {
     pendingCardOps: providerCardOps,
     cardFailedReasons,
     failedCardIds: providerFailedCardIds,
+    pendingCategoryOps: providerCategoryOps,
+    categoryFailedReasons,
+    failedCategoryIds: providerFailedCategoryIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -240,14 +267,16 @@ export function useFinanceRead(): FinanceReadResult {
       // mutates `data`; it returns the same reference when nothing applies.
       // `providerFailedIds` (entity-id set) only changes DELETE behaviour —
       // a failed DELETE keeps its server row visible so it can be labelled.
-      const anyOps = providerOps.length > 0 || providerCardOps.length > 0;
+      const anyOps =
+        providerOps.length > 0 || providerCardOps.length > 0 || providerCategoryOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
               data,
-              [...providerOps, ...providerCardOps],
+              [...providerOps, ...providerCardOps, ...providerCategoryOps],
               providerFailedIds,
               providerFailedCardIds,
+              providerFailedCategoryIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -269,6 +298,26 @@ export function useFinanceRead(): FinanceReadResult {
             op,
             failed: isFailed,
             ...(isFailed ? { reason: cardFailedReasons.get(id) } : {}),
+          });
+        }
+      }
+      // STEP 16-H2-C2-B1: custom-category display-only surface. `composeFinance`
+      // NEVER folded a category row into `composed.customCats`; it feeds
+      // `categoryManagement` only.
+      const categoryManagementRows = composedResult
+        ? composedResult.categoryManagement.rows
+        : data.customCats;
+      const pendingCategoryOps = new Map<
+        string,
+        { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+      >();
+      if (composedResult) {
+        for (const [id, op] of composedResult.categoryManagement.opById) {
+          const isFailed = composedResult.categoryManagement.failedIds.has(id);
+          pendingCategoryOps.set(id, {
+            op,
+            failed: isFailed,
+            ...(isFailed ? { reason: categoryFailedReasons.get(id) } : {}),
           });
         }
       }
@@ -315,6 +364,8 @@ export function useFinanceRead(): FinanceReadResult {
         failedLocalTransactions,
         cardManagementRows,
         pendingCardOps,
+        categoryManagementRows,
+        pendingCategoryOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -373,5 +424,8 @@ export function useFinanceRead(): FinanceReadResult {
     providerCardOps,
     cardFailedReasons,
     providerFailedCardIds,
+    providerCategoryOps,
+    categoryFailedReasons,
+    providerFailedCategoryIds,
   ]);
 }

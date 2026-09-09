@@ -27,7 +27,16 @@ import {
   type SoftDeleteCardResult,
   type UpdateCardResult,
 } from '@/services/remoteCardWrite';
+import {
+  createCustomCategory,
+  softDeleteCustomCategory,
+  updateCustomCategory,
+  type CreateCategoryResult,
+  type SoftDeleteCategoryResult,
+  type UpdateCategoryResult,
+} from '@/services/remoteCategoryWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
+import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { PendingWrite } from '@/lib/offlineQueue';
 
@@ -97,6 +106,26 @@ export interface RunOpDeps {
     expectedUserId: string;
     expectedUpdatedAt: string;
   }) => Promise<SoftDeleteCardResult>;
+  /** STEP 16-H2-C2-B1 — injected in tests; default to the real category services. */
+  createCategory?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    draft: NewCustomCategoryDraft;
+  }) => Promise<CreateCategoryResult>;
+  updateCategory?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: NewCustomCategoryDraft;
+  }) => Promise<UpdateCategoryResult>;
+  softDeleteCategory?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteCategoryResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -106,11 +135,61 @@ export async function runPendingWrite(
   op: PendingWrite,
   deps: RunOpDeps,
 ): Promise<RunOpOutcome> {
-  if (op.entity !== 'transaction' && op.entity !== 'card') {
+  if (op.entity !== 'transaction' && op.entity !== 'card' && op.entity !== 'category') {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
 
   try {
+    // ---- CATEGORY (STEP 16-H2-C2-B1 §21–§23) ----
+    if (op.entity === 'category') {
+      if (op.op === 'create') {
+        const create = deps.createCategory ?? createCustomCategory;
+        const res = await create({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // CategoryWriteReason adds 'invalid' (structural) — not a conflict the
+        // queue/UI can phrase, so it is flattened to a reason-less terminal.
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      if (op.op === 'update') {
+        const update = deps.updateCategory ?? updateCustomCategory;
+        const res = await update({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      // category delete
+      const del = deps.softDeleteCategory ?? softDeleteCustomCategory;
+      const res = await del({
+        id: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
     // ---- CARD (STEP 16-H2-C2-A1 §16–§18) ----
     if (op.entity === 'card') {
       if (op.op === 'create') {

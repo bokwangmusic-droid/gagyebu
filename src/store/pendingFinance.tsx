@@ -25,8 +25,10 @@ import {
 } from 'react';
 import { AppState, type AppStateStatus } from 'react-native';
 
+import type { Category } from '@/data/categories';
 import type { PendingWrite } from '@/lib/offlineQueue';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
+import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
   createPendingWriteCoordinator,
@@ -102,6 +104,31 @@ interface PendingFinanceValue {
     entityId: string;
     expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-C2-B1 — current-scope CUSTOM-CATEGORY ops (create/update/delete,
+   *  incl. terminal-failed) for the category-management overlay. Bare
+   *  category-id keys. `enqueueCategoryDelete` has an engine path but NO UI
+   *  wiring yet (blocked on the Budget queue, §30). */
+  pendingCategoryOps: PendingWrite[];
+  categoryOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  categoryFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingCategoryIds: ReadonlySet<string>;
+  failedCategoryIds: ReadonlySet<string>;
+  enqueueCategoryCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCustomCategoryDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueCategoryUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewCustomCategoryDraft;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueCategoryDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
   /** Ask for a flush now (e.g. pull-to-refresh). `includeFailed` retries held ops. */
   requestFlush: (opts?: { includeFailed?: boolean }) => void;
 }
@@ -155,6 +182,19 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const serverCardsRef = useRef<ReadonlyMap<string, CreditCard>>(serverCards);
   serverCardsRef.current = serverCards;
 
+  const serverCategories = useMemo<ReadonlyMap<string, Category>>(
+    () =>
+      new Map(
+        [
+          ...(rf.data?.customCats.expense ?? []),
+          ...(rf.data?.customCats.income ?? []),
+        ].map((c) => [c.id, c]),
+      ),
+    [rf.data?.customCats],
+  );
+  const serverCategoriesRef = useRef<ReadonlyMap<string, Category>>(serverCategories);
+  serverCategoriesRef.current = serverCategories;
+
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
   const coordRef = useRef<ReturnType<typeof createPendingWriteCoordinator> | null>(null);
@@ -165,6 +205,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getKnownCardIds: () => knownCardIdsRef.current,
       getServerTransactions: () => serverTxnsRef.current,
       getServerCards: () => serverCardsRef.current,
+      getServerCategories: () => serverCategoriesRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -223,6 +264,12 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       cardFailedReasons: state.card.failedReasons.size > 0 ? state.card.failedReasons : EMPTY_REASON_MAP,
       pendingCardIds: state.card.pendingIds.size > 0 ? state.card.pendingIds : EMPTY_SET,
       failedCardIds: state.card.failedIds.size > 0 ? state.card.failedIds : EMPTY_SET,
+      pendingCategoryOps: state.category.scopeOps.length > 0 ? state.category.scopeOps : EMPTY_OPS,
+      categoryOpByEntity: state.category.opByEntity.size > 0 ? state.category.opByEntity : EMPTY_KIND_MAP,
+      categoryFailedReasons:
+        state.category.failedReasons.size > 0 ? state.category.failedReasons : EMPTY_REASON_MAP,
+      pendingCategoryIds: state.category.pendingIds.size > 0 ? state.category.pendingIds : EMPTY_SET,
+      failedCategoryIds: state.category.failedIds.size > 0 ? state.category.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
@@ -231,6 +278,9 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueCardCreate: coord.enqueueCardCreate,
       enqueueCardUpdate: coord.enqueueCardUpdate,
       enqueueCardDelete: coord.enqueueCardDelete,
+      enqueueCategoryCreate: coord.enqueueCategoryCreate,
+      enqueueCategoryUpdate: coord.enqueueCategoryUpdate,
+      enqueueCategoryDelete: coord.enqueueCategoryDelete,
       requestFlush: coord.requestFlush,
     }),
     // state is a fresh object each render; that's exactly when something changed

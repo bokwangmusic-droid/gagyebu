@@ -8,14 +8,21 @@
  * synchronous `requestRefresh`, and a mutable "server snapshot" (a
  * `Map<id, Transaction>` of ACTIVE rows). No React, no Supabase.
  */
+import type { Category } from '@/data/categories';
 import { QUEUE_SCHEMA_VERSION, type PendingTransactionCreate } from '@/lib/offlineQueue';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
+import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type {
   CreateCardResult,
   SoftDeleteCardResult,
   UpdateCardResult,
 } from '@/services/remoteCardWrite';
+import type {
+  CreateCategoryResult,
+  SoftDeleteCategoryResult,
+  UpdateCategoryResult,
+} from '@/services/remoteCategoryWrite';
 import type {
   CreateTransactionResult,
   SoftDeleteResult,
@@ -98,6 +105,11 @@ interface Harness {
   cardCreateLog: HCardCreateArgs[];
   cardUpdateLog: HCardUpdateArgs[];
   cardDeleteLog: HCardDeleteArgs[];
+  /** trusted server snapshot's ACTIVE custom categories, keyed by id (STEP 16-H2-C2-B1). */
+  catServer: Map<string, Category>;
+  catCreateLog: HCatCreateArgs[];
+  catUpdateLog: HCatUpdateArgs[];
+  catDeleteLog: HCatDeleteArgs[];
   maxConcurrentCreates: number;
   timers: { id: number; fn: () => void; ms: number; cancelled: boolean }[];
   setScope: (s: CoordinatorScope | null) => void;
@@ -108,12 +120,17 @@ interface Harness {
   setCardCreate: (f: (args: HCardCreateArgs) => Promise<CreateCardResult>) => void;
   setCardUpdate: (f: (args: HCardUpdateArgs) => Promise<UpdateCardResult>) => void;
   setCardDelete: (f: (args: HCardDeleteArgs) => Promise<SoftDeleteCardResult>) => void;
+  setCatCreate: (f: (args: HCatCreateArgs) => Promise<CreateCategoryResult>) => void;
+  setCatUpdate: (f: (args: HCatUpdateArgs) => Promise<UpdateCategoryResult>) => void;
+  setCatDelete: (f: (args: HCatDeleteArgs) => Promise<SoftDeleteCategoryResult>) => void;
   /** put/replace a server row (id present + fields set). */
   serverPut: (id: string, d: NewTransactionDraft) => void;
   /** remove a server row (id absent == deleted/gone in the read model). */
   serverDelete: (id: string) => void;
   cardServerPut: (id: string, d: NewCardDraft) => void;
   cardServerDelete: (id: string) => void;
+  catServerPut: (id: string, d: NewCustomCategoryDraft) => void;
+  catServerDelete: (id: string) => void;
   runTimers: () => void;
   refreshes: () => number;
 }
@@ -131,6 +148,27 @@ const draftToCard = (id: string, d: NewCardDraft): CreditCard => ({
 type HCardCreateArgs = { id: string; householdId: string; expectedUserId: string; draft: NewCardDraft };
 type HCardUpdateArgs = HCardCreateArgs & { expectedUpdatedAt: string };
 type HCardDeleteArgs = { id: string; householdId: string; expectedUserId: string; expectedUpdatedAt: string };
+
+const catDraft = (over: Partial<NewCustomCategoryDraft> = {}): NewCustomCategoryDraft => ({
+  type: 'expense',
+  name: 'Groceries',
+  icon: 'utensils',
+  bg: '#EDE9FE',
+  color: '#7C63D4',
+  ...over,
+});
+const draftToCat = (id: string, d: NewCustomCategoryDraft): Category => ({
+  id,
+  name: d.name,
+  bg: d.bg,
+  color: d.color,
+  icon: d.icon,
+  custom: true,
+});
+
+type HCatCreateArgs = { id: string; householdId: string; expectedUserId: string; draft: NewCustomCategoryDraft };
+type HCatUpdateArgs = HCatCreateArgs & { expectedUpdatedAt: string };
+type HCatDeleteArgs = { id: string; householdId: string; expectedUserId: string; expectedUpdatedAt: string };
 
 type HCreateArgs = {
   id: string;
@@ -173,6 +211,10 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   const cardCreateLog: HCardCreateArgs[] = [];
   const cardUpdateLog: HCardUpdateArgs[] = [];
   const cardDeleteLog: HCardDeleteArgs[] = [];
+  const catServer = new Map<string, Category>();
+  const catCreateLog: HCatCreateArgs[] = [];
+  const catUpdateLog: HCatUpdateArgs[] = [];
+  const catDeleteLog: HCatDeleteArgs[] = [];
   let inFlight = 0;
 
   const h = {} as Harness;
@@ -229,6 +271,26 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     return { ok: true };
   };
 
+  // default custom-category services: "server accepted + snapshot reflects it"
+  let catCreateImpl = async (args: HCatCreateArgs): Promise<CreateCategoryResult> => {
+    catCreateLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    catServer.set(args.id, draftToCat(args.id, args.draft));
+    return { ok: true, id: args.id };
+  };
+  let catUpdateImpl = async (args: HCatUpdateArgs): Promise<UpdateCategoryResult> => {
+    catUpdateLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    catServer.set(args.id, draftToCat(args.id, args.draft));
+    return { ok: true, updatedAt: '2026-09-11T00:00:00.000Z' };
+  };
+  let catDeleteImpl = async (args: HCatDeleteArgs): Promise<SoftDeleteCategoryResult> => {
+    catDeleteLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    catServer.delete(args.id);
+    return { ok: true };
+  };
+
   const coord = createPendingWriteCoordinator({
     storage: storage as unknown as QueueStorage,
     getScope: () => scope,
@@ -236,6 +298,7 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     getKnownCardIds: () => cards,
     getServerTransactions: () => server,
     getServerCards: () => cardServer,
+    getServerCategories: () => catServer,
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();
@@ -247,6 +310,9 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     createCard: (args) => cardCreateImpl(args as HCardCreateArgs),
     updateCard: (args) => cardUpdateImpl(args as HCardUpdateArgs),
     softDeleteCard: (args) => cardDeleteImpl(args as HCardDeleteArgs),
+    createCategory: (args) => catCreateImpl(args as HCatCreateArgs),
+    updateCategory: (args) => catUpdateImpl(args as HCatUpdateArgs),
+    softDeleteCategory: (args) => catDeleteImpl(args as HCatDeleteArgs),
     schedule: (fn, ms) => {
       const id = ++timerSeq;
       timers.push({ id, fn, ms, cancelled: false });
@@ -270,6 +336,10 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   h.cardCreateLog = cardCreateLog;
   h.cardUpdateLog = cardUpdateLog;
   h.cardDeleteLog = cardDeleteLog;
+  h.catServer = catServer;
+  h.catCreateLog = catCreateLog;
+  h.catUpdateLog = catUpdateLog;
+  h.catDeleteLog = catDeleteLog;
   h.maxConcurrentCreates = 0;
   h.timers = timers;
   h.setScope = (s) => {
@@ -297,6 +367,15 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   h.setCardDelete = (f) => {
     cardDeleteImpl = f;
   };
+  h.setCatCreate = (f) => {
+    catCreateImpl = f;
+  };
+  h.setCatUpdate = (f) => {
+    catUpdateImpl = f;
+  };
+  h.setCatDelete = (f) => {
+    catDeleteImpl = f;
+  };
   h.serverPut = (id, d) => {
     server.set(id, draftToTxn(id, d));
   };
@@ -308,6 +387,12 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   };
   h.cardServerDelete = (id) => {
     cardServer.delete(id);
+  };
+  h.catServerPut = (id, d) => {
+    catServer.set(id, draftToCat(id, d));
+  };
+  h.catServerDelete = (id) => {
+    catServer.delete(id);
   };
   h.runTimers = () => {
     const due = timers.filter((t) => !t.cancelled);
@@ -1793,6 +1878,311 @@ export async function runCoordinatorCases(): Promise<{
         st.card.pendingIds.has('card-c14') && st.card.pendingIds.size === 1 &&
         st.pendingCount === 2,
       `txnPending=${[...st.pendingIds]} cardPending=${[...st.card.pendingIds]} count=${st.pendingCount}`,
+    );
+  }
+
+  /* ============ STEP 16-H2-C2-B1 — custom-category coordinator ============ */
+
+  const KC_TRANSPORT: CreateCategoryResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const KU_TRANSPORT: UpdateCategoryResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const KD_TRANSPORT: SoftDeleteCategoryResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const KU_CONFLICT: UpdateCategoryResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' };
+  const KD_CONFLICT: SoftDeleteCategoryResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' };
+
+  // K1 (§33.30/31) — CREATE runOp forwards exact id/draft/scope; success -> acked
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    await h.coord.enqueueCategoryCreate({ scope: A, entityId: 'cat-k1', payload: catDraft({ name: 'K1' }) });
+    await settle(8);
+    check(
+      'K1 category CREATE forwards exact id/draft/scope; server has it; acked',
+      h.catCreateLog.length === 1 && h.catCreateLog[0].id === 'cat-k1' &&
+        h.catCreateLog[0].householdId === 'h-A' && h.catCreateLog[0].expectedUserId === 'u-A' &&
+        h.catCreateLog[0].draft.name === 'K1' &&
+        h.catServer.get('cat-k1')?.name === 'K1' && h.coord.getState().pendingCount === 0,
+      JSON.stringify(h.catCreateLog[0]),
+    );
+  }
+  // K2 (§33.32) — CREATE transport -> pending category op, not on server
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCatCreate(() => Promise.resolve(KC_TRANSPORT));
+    const enq = await h.coord.enqueueCategoryCreate({ scope: A, entityId: 'cat-k2', payload: catDraft() });
+    await settle();
+    check(
+      'K2 category CREATE transport -> pending category op, absent from server',
+      enq.ok === true && h.coord.getState().category.pendingIds.has('cat-k2') &&
+        h.coord.getState().category.opByEntity.get('cat-k2') === 'create' &&
+        !h.catServer.has('cat-k2'),
+      '',
+    );
+  }
+  // K3 (§33.34/35) — UPDATE forwards FROZEN token; applied; acked
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k3', catDraft({ name: 'old' }));
+    await h.coord.enqueueCategoryUpdate({
+      scope: A, entityId: 'cat-k3', payload: catDraft({ name: 'new' }), expectedUpdatedAt: 'FROZEN-1',
+    });
+    await settle(8);
+    check(
+      'K3 category UPDATE forwards frozen token; applied; acked',
+      h.catUpdateLog.length === 1 && h.catUpdateLog[0].expectedUpdatedAt === 'FROZEN-1' &&
+        h.catServer.get('cat-k3')?.name === 'new' && h.coord.getState().pendingCount === 0,
+      JSON.stringify(h.catUpdateLog[0]),
+    );
+  }
+  // K4 (§33.36) — UPDATE transport -> every replay reuses the SAME frozen token
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k4', catDraft());
+    h.setCatUpdate((args) => { h.catUpdateLog.push(args); return Promise.resolve(KU_TRANSPORT); });
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'cat-k4', payload: catDraft({ name: 'x' }), expectedUpdatedAt: 'V1' });
+    await settle();
+    h.runTimers();
+    await settle(6);
+    check(
+      'K4 category UPDATE transport -> every replay reuses the SAME frozen token',
+      h.catUpdateLog.length >= 2 && h.catUpdateLog.every((u) => u.expectedUpdatedAt === 'V1'),
+      JSON.stringify(h.catUpdateLog.map((u) => u.expectedUpdatedAt)),
+    );
+  }
+  // K5 (§33.37) — UPDATE conflict reason preserved, retained, no auto-retry (no blind LWW)
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k5', catDraft({ name: 'B-won' }));
+    let calls = 0;
+    h.setCatUpdate(() => { calls += 1; return Promise.resolve(KU_CONFLICT); });
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'cat-k5', payload: catDraft({ name: 'A' }), expectedUpdatedAt: 'V1' });
+    await settle(6);
+    const after = calls;
+    h.coord.requestFlush();
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'K5 category UPDATE conflict -> failed + reason=conflict, B row untouched, no auto-retry',
+      st.category.failedIds.has('cat-k5') && st.category.failedReasons.get('cat-k5') === 'conflict' &&
+        h.catServer.get('cat-k5')?.name === 'B-won' && after === 1 && calls === 1 &&
+        st.category.opByEntity.get('cat-k5') === 'update',
+      `reason=${st.category.failedReasons.get('cat-k5')} calls=${calls}`,
+    );
+  }
+  // K6 (§33.38/39) — DELETE forwards frozen token; row gone; acked
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k6', catDraft());
+    await h.coord.enqueueCategoryDelete({ scope: A, entityId: 'cat-k6', expectedUpdatedAt: 'DEL-FROZEN' });
+    await settle(8);
+    check(
+      'K6 category DELETE forwards frozen token; row gone; acked',
+      h.catDeleteLog.length === 1 && h.catDeleteLog[0].expectedUpdatedAt === 'DEL-FROZEN' &&
+        !h.catServer.has('cat-k6') && h.coord.getState().pendingCount === 0,
+      JSON.stringify(h.catDeleteLog[0]),
+    );
+  }
+  // K7 (§33.40) — DELETE transport -> pending delete op
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k7', catDraft());
+    h.setCatDelete(() => Promise.resolve(KD_TRANSPORT));
+    const enq = await h.coord.enqueueCategoryDelete({ scope: A, entityId: 'cat-k7', expectedUpdatedAt: 'V1' });
+    await settle();
+    check(
+      'K7 category DELETE transport -> pending delete op',
+      enq.ok === true && h.coord.getState().category.opByEntity.get('cat-k7') === 'delete' &&
+        h.coord.getState().category.pendingIds.has('cat-k7'),
+      '',
+    );
+  }
+  // K8 (§33.41) — DELETE conflict reason preserved; still on server
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k8', catDraft());
+    h.setCatDelete(() => Promise.resolve(KD_CONFLICT));
+    await h.coord.enqueueCategoryDelete({ scope: A, entityId: 'cat-k8', expectedUpdatedAt: 'V1' });
+    await settle(6);
+    const st = h.coord.getState();
+    check(
+      'K8 category DELETE conflict -> failed + reason=conflict, category still on server',
+      st.category.failedIds.has('cat-k8') && st.category.failedReasons.get('cat-k8') === 'conflict' &&
+        h.catServer.has('cat-k8') && st.pendingCount === 1,
+      `reason=${st.category.failedReasons.get('cat-k8')}`,
+    );
+  }
+  // K9 (§33.42/43) — CREATE ack requires FIELD match, not just id
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    let applied = false;
+    h.setCatCreate(async (args) => {
+      h.catCreateLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      h.catServer.set(args.id, draftToCat(args.id, catDraft({ name: applied ? args.draft.name : 'WRONG' })));
+      return { ok: true, id: args.id };
+    });
+    await h.coord.enqueueCategoryCreate({ scope: A, entityId: 'cat-k9', payload: catDraft({ name: 'RIGHT' }) });
+    await settle(8);
+    const stalePending = h.coord.getState().pendingCount === 1;
+    applied = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'K9 category CREATE ack requires FIELD match -> stale mismatch replays, then acks',
+      stalePending && h.catServer.get('cat-k9')?.name === 'RIGHT' && h.coord.getState().pendingCount === 0,
+      `stalePending=${stalePending} name=${h.catServer.get('cat-k9')?.name}`,
+    );
+  }
+  // K10 (§33.44/45) — UPDATE ack: stale snapshot -> no ack; match -> ack
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k10', catDraft({ name: 'v0' }));
+    let applied = false;
+    h.setCatUpdate(async (args) => {
+      h.catUpdateLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      if (applied) h.catServer.set(args.id, draftToCat(args.id, args.draft));
+      return { ok: true, updatedAt: 'V2' };
+    });
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'cat-k10', payload: catDraft({ name: 'v9' }), expectedUpdatedAt: 'V1' });
+    await settle(8);
+    const stale = h.coord.getState().pendingCount === 1;
+    applied = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'K10 category UPDATE ack: stale snapshot -> replays; acked once fields match',
+      stale && h.catServer.get('cat-k10')?.name === 'v9' && h.coord.getState().pendingCount === 0,
+      `stale=${stale} name=${h.catServer.get('cat-k10')?.name}`,
+    );
+  }
+  // K11 (§33.46/47) — DELETE ack: not acked while row present; acked once absent
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k11', catDraft());
+    let reallyDelete = false;
+    h.setCatDelete(async (args) => {
+      h.catDeleteLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      if (reallyDelete) h.catServerDelete(args.id);
+      return { ok: true };
+    });
+    await h.coord.enqueueCategoryDelete({ scope: A, entityId: 'cat-k11', expectedUpdatedAt: 'V1' });
+    await settle(8);
+    const stillPending = h.coord.getState().pendingCount === 1;
+    reallyDelete = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'K11 category DELETE ack: not acked while row present; acked once absent',
+      stillPending && !h.catServer.has('cat-k11') && h.coord.getState().pendingCount === 0,
+      `stillPending=${stillPending}`,
+    );
+  }
+  // K12 (§33.48) — settled but remote untrusted -> NOT acked, queue retained
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k12', catDraft({ name: 'old' }));
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'cat-k12', payload: catDraft({ name: 'new' }), expectedUpdatedAt: 'V1' });
+    h.setRemoteReady(false);
+    await settle(8);
+    check(
+      'K12 category op settled but remote untrusted -> NOT acked, queue retained',
+      h.catUpdateLog.length >= 1 && h.coord.getState().pendingCount === 1,
+      `updates=${h.catUpdateLog.length} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+  // K13 (§33.50–52) — scope isolation: A's pending category op invisible + not flushed under B; resumes under A
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k13', catDraft());
+    h.setCatUpdate(() => Promise.resolve(KU_TRANSPORT));
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'cat-k13', payload: catDraft({ name: 'x' }), expectedUpdatedAt: 'V1' });
+    await settle();
+    h.setScope(B);
+    const underB = h.coord.getState();
+    const beforeB = h.catUpdateLog.length;
+    h.setCatUpdate((args) => { h.catUpdateLog.push(args); h.catServerPut(args.id, args.draft); return Promise.resolve({ ok: true, updatedAt: 'V2' }); });
+    h.coord.requestFlush();
+    await settle(8);
+    const ranUnderB = h.catUpdateLog.slice(beforeB).some((u) => u.id === 'cat-k13');
+    h.setScope(A);
+    const underA = h.coord.getState();
+    check(
+      'K13 category op scope-isolated: nothing under B, not flushed under B, resumes under A',
+      underB.category.pendingIds.size === 0 && underB.pendingCount === 0 && ranUnderB === false &&
+        underA.category.pendingIds.has('cat-k13') && underA.category.opByEntity.get('cat-k13') === 'update',
+      `B.pending=${underB.pendingCount} ranUnderB=${ranUnderB}`,
+    );
+  }
+  // K14 (§33.53/54) — restart hydrate restores pending CREATE + terminal-failed UPDATE(reason)
+  {
+    const seed = JSON.stringify([
+      { queueId: 'q-kr1', schemaVersion: QUEUE_SCHEMA_VERSION, scope: A, entity: 'category', op: 'update',
+        entityId: 'cat-kr1', payload: catDraft({ name: 'restored' }), expectedUpdatedAt: 'V1',
+        enqueuedAt: '2026-09-10T09:00:00.000Z', attemptCount: 0, lastError: 'conflict', lastErrorReason: 'conflict' },
+      { queueId: 'q-kr2', schemaVersion: QUEUE_SCHEMA_VERSION, scope: A, entity: 'category', op: 'create',
+        entityId: 'cat-kr2', payload: catDraft(), enqueuedAt: '2026-09-10T09:00:00.000Z', attemptCount: 0 },
+    ]);
+    const h = makeHarness({ seed, remoteReady: false });
+    await h.coord.hydrate();
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'K14 restart -> pending category CREATE + terminal-failed category UPDATE(reason) restored',
+      st.category.failedIds.has('cat-kr1') && st.category.failedReasons.get('cat-kr1') === 'conflict' &&
+        st.category.opByEntity.get('cat-kr1') === 'update' &&
+        st.category.pendingIds.has('cat-kr2') && st.category.opByEntity.get('cat-kr2') === 'create' &&
+        st.pendingCount === 2,
+      `kr1reason=${st.category.failedReasons.get('cat-kr1')} pending=${st.pendingCount}`,
+    );
+  }
+  // K15 (§33.55/56) — transport backoff scheduled; terminal not auto-retried
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.catServerPut('cat-k15', catDraft());
+    h.setCatUpdate(() => Promise.resolve(KU_TRANSPORT));
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'cat-k15', payload: catDraft({ name: 'x' }), expectedUpdatedAt: 'V1' });
+    await settle();
+    const t = h.timers.find((x) => !x.cancelled && x.ms === 5000);
+    check('K15 category transport -> backoff scheduled at 5000ms', !!t, `timers=${JSON.stringify(h.timers.map((x) => x.ms))}`);
+  }
+  // K16 (§33.57–60) — same id for transaction + card + category cannot corrupt state; pendingCount = 3
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('trio-id', draft({ amount: 100 }));
+    h.cardServerPut('trio-id', cardDraft({ name: 'card' }));
+    h.catServerPut('trio-id', catDraft({ name: 'cat' }));
+    h.setUpdate(() => Promise.resolve(U_CONFLICT));       // txn UPDATE -> terminal conflict
+    h.setCardUpdate(() => Promise.resolve(CU_TRANSPORT)); // card UPDATE -> pending
+    h.setCatUpdate(() => Promise.resolve(KU_TRANSPORT));  // cat UPDATE -> pending
+    await h.coord.enqueueTransactionUpdate({ scope: A, entityId: 'trio-id', payload: draft({ amount: 9 }), expectedUpdatedAt: 'V1', originalRawCardId: null });
+    await settle(6);
+    await h.coord.enqueueCardUpdate({ scope: A, entityId: 'trio-id', payload: cardDraft({ name: 'edited' }), expectedUpdatedAt: 'V1' });
+    await settle(2);
+    await h.coord.enqueueCategoryUpdate({ scope: A, entityId: 'trio-id', payload: catDraft({ name: 'edited' }), expectedUpdatedAt: 'V1' });
+    await settle(4);
+    const st = h.coord.getState();
+    check(
+      'K16 same id across transaction/card/category: no cross-contamination; pendingCount counts all three',
+      st.failedIds.has('trio-id') && st.failedReasons.get('trio-id') === 'conflict' &&
+        st.card.pendingIds.has('trio-id') && st.card.failedIds.has('trio-id') === false &&
+        st.category.pendingIds.has('trio-id') && st.category.failedIds.has('trio-id') === false &&
+        st.pendingCount === 3,
+      `txnFailed=${st.failedIds.has('trio-id')} cardFailed=${st.card.failedIds.has('trio-id')} catFailed=${st.category.failedIds.has('trio-id')} pending=${st.pendingCount}`,
     );
   }
 

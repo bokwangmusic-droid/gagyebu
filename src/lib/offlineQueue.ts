@@ -1,6 +1,6 @@
 /**
- * Offline Write Queue — pure core. STEP 16-H2-A1, widened in H2-B1 and again
- * in STEP 16-H2-C2-A1.
+ * Offline Write Queue — pure core. STEP 16-H2-A1, widened in H2-B1, again in
+ * STEP 16-H2-C2-A1 (card), and again in STEP 16-H2-C2-B1 (custom category).
  *
  * NO Supabase, NO AsyncStorage, NO React. Just the record shapes, the
  * validator, the FIFO / idempotent enqueue, the scope filter, and the read
@@ -9,19 +9,25 @@
  * .../runOp.ts; sequencing in .../flusher.ts.
  *
  * Scope: transaction CREATE/UPDATE/soft-DELETE (H2-A/B) + card
- * CREATE/UPDATE/soft-DELETE (H2-C2-A1, engine only — no enqueue-from-UI
- * wiring). `entity` is now `'transaction' | 'card'`; `op` is a 3-way union
- * per entity. `schemaVersion` STAYS 1 — the transaction record shapes are
- * byte-identical, so an H2-B device's stored transaction-only queue loads
- * with no migration; a card record simply has `entity:'card'`.
+ * CREATE/UPDATE/soft-DELETE (H2-C2-A1) + custom-category CREATE/UPDATE/
+ * soft-DELETE (H2-C2-B1, engine only — CREATE/UPDATE get UI wiring in B2,
+ * DELETE stays UI-blocked on the Budget queue). `entity` is now
+ * `'transaction' | 'card' | 'category'`; `op` is a 3-way union per entity.
+ * `schemaVersion` STAYS 1 — a stored transaction/card queue loads with no
+ * migration; a category record simply has `entity:'category'`.
  *
- * IMPORTANT (H2-C2-A1 §8/§9/§15): a pending/failed CARD is NEVER folded into
- * `RemoteFinanceData.cards`. `composeFinance` returns card display rows in a
- * SEPARATE `cardManagement` collection so the transaction card picker,
- * backup and household-import snapshots only ever see authoritative server
- * cards — no cross-entity chaining is structurally possible.
+ * IMPORTANT (H2-C2-A1 §8/§9/§15, H2-C2-B1 §12/§13): a pending/failed CARD or
+ * CATEGORY is NEVER folded into `RemoteFinanceData.cards` / `.customCats` /
+ * `.categoryMeta` / `.catOrder`. `composeFinance` returns card and category
+ * display rows in SEPARATE `cardManagement` / `categoryManagement`
+ * collections so the transaction/planned/recurring/budget pickers, stats
+ * name resolution, backup and household-import snapshots only ever see
+ * authoritative server data — no cross-entity chaining is structurally
+ * possible.
  */
+import type { Category, CustomCatMap } from '@/data/categories';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
+import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
@@ -52,7 +58,7 @@ export interface PendingWriteScope {
  * optimistic-concurrency token lives in `expectedUpdatedAt` (UPDATE/DELETE),
  * NOT in `payload`.
  */
-export type PendingEntity = 'transaction' | 'card';
+export type PendingEntity = 'transaction' | 'card' | 'category';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -143,13 +149,53 @@ export interface PendingCardDelete extends PendingWriteBase {
   expectedUpdatedAt: string;
 }
 
+/* ---------------- custom-category records (STEP 16-H2-C2-B1) ---------------- */
+
+/** `payload` is exactly what `createCustomCategory({ draft })` is re-handed —
+ *  the UI-editable `NewCustomCategoryDraft` (`type` / `name` / `icon` / `bg` /
+ *  `color`). `entityId` is the SAME client `c-…` id the direct
+ *  `createCustomCategory` used, so a lost-response replay hits the service's
+ *  23505 idempotency path (§5). No `expectedUpdatedAt` — a CREATE has no token. */
+export interface PendingCategoryCreate extends PendingWriteBase {
+  entity: 'category';
+  op: 'create';
+  payload: NewCustomCategoryDraft;
+}
+
+/** `payload` is what `updateCustomCategory({ draft })` is re-handed. Only
+ *  `name` / `bg` / `color` / `icon` are ever written on the server (`type` is
+ *  product-immutable — `buildCustomCategoryUpdate` drops it), but the draft
+ *  keeps its `type` for the management-only display row. `expectedUpdatedAt`
+ *  is FROZEN from the `categoryMeta.updatedAt` the edit sheet opened against
+ *  and is NEVER refreshed (§6) — a stale token turns a concurrent edit into a
+ *  `conflict`, never a blind overwrite. */
+export interface PendingCategoryUpdate extends PendingWriteBase {
+  entity: 'category';
+  op: 'update';
+  payload: NewCustomCategoryDraft;
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeleteCustomCategory` guarded on the FROZEN
+ *  `expectedUpdatedAt` (§7). NO `payload`. Never a hard DELETE. The
+ *  accompanying budget cleanup is the CALLER's concern and is NOT modelled
+ *  here (§30) — this record only removes the category row. */
+export interface PendingCategoryDelete extends PendingWriteBase {
+  entity: 'category';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
   | PendingTransactionDelete
   | PendingCardCreate
   | PendingCardUpdate
-  | PendingCardDelete;
+  | PendingCardDelete
+  | PendingCategoryCreate
+  | PendingCategoryUpdate
+  | PendingCategoryDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -227,13 +273,48 @@ function isValidCardDraft(p: unknown): p is NewCardDraft {
   return true;
 }
 
+/**
+ * Structural validity for a stored `NewCustomCategoryDraft` (STEP 16-H2-C2-B1
+ * §9). Only the UI-editable shape — `type` / `name` / `icon` / `bg` / `color`,
+ * all non-empty strings, `type` one of income|expense. Palette-exactness is
+ * NOT re-checked here (the read model's `bg`/`color`/`icon` are opaque
+ * strings) — the write service's own `isValidCustomCategoryDraft` re-runs on
+ * every replay. Any server / identity / timestamp / read-model field present
+ * -> reject.
+ */
+function isValidCategoryDraft(p: unknown): p is NewCustomCategoryDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (d.type !== 'income' && d.type !== 'expense') return false;
+  if (!isNonEmptyString(d.name)) return false;
+  if (!isNonEmptyString(d.icon)) return false;
+  if (!isNonEmptyString(d.bg)) return false;
+  if (!isNonEmptyString(d.color)) return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d ||
+    'deleted_at' in d ||
+    'custom' in d
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
   const r = x as Record<string, unknown>;
   if (r.schemaVersion !== QUEUE_SCHEMA_VERSION) return null;
   if (!isNonEmptyString(r.queueId)) return null;
-  if (r.entity !== 'transaction' && r.entity !== 'card') return null;
+  if (r.entity !== 'transaction' && r.entity !== 'card' && r.entity !== 'category') return null;
   if (r.op !== 'create' && r.op !== 'update' && r.op !== 'delete') return null;
   if (!isNonEmptyString(r.entityId)) return null;
   const scope = r.scope as Record<string, unknown> | undefined;
@@ -273,6 +354,29 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
     if ('payload' in r) return null; // a DELETE carries no user payload (§6)
     return { ...base, entity: 'card', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'category') {
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token (§9)
+      if (!isValidCategoryDraft(r.payload)) return null;
+      return { ...base, entity: 'category', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (!isValidCategoryDraft(r.payload)) return null;
+      return {
+        ...base,
+        entity: 'category',
+        op: 'update',
+        payload: r.payload,
+        expectedUpdatedAt: r.expectedUpdatedAt,
+      };
+    }
+    // category delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload (§9)
+    return { ...base, entity: 'category', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
   }
 
   // ---- transaction ----
@@ -457,6 +561,70 @@ export function makePendingCardDelete(args: {
   };
 }
 
+export function makePendingCategoryCreate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewCustomCategoryDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingCategoryCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'category',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingCategoryUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewCustomCategoryDraft;
+  /** FROZEN — the `categoryMeta.updatedAt` the edit sheet opened against. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingCategoryUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'category',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingCategoryDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingCategoryDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'category',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -500,6 +668,13 @@ function cardDraftEqual(a: NewCardDraft, b: NewCardDraft): boolean {
   );
 }
 
+/** Equality of the SERVER-editable custom-category fields (name / bg / color /
+ *  icon). `type` is create-only (`buildCustomCategoryUpdate` drops it), so it
+ *  is NOT compared here (STEP 16-H2-C2-B1 §10); the CREATE matcher adds it. */
+function categoryEditableEqual(a: NewCustomCategoryDraft, b: NewCustomCategoryDraft): boolean {
+  return a.name === b.name && a.bg === b.bg && a.color === b.color && a.icon === b.icon;
+}
+
 /**
  * Is `b` the EXACT SAME request as `a` — safe to treat a re-enqueue as an
  * idempotent no-op? Same dedup identity (scope+entity+op+entityId) is assumed.
@@ -518,6 +693,20 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
     if (a.op === 'create' && b.op === 'create') return cardDraftEqual(a.payload, b.payload);
     if (a.op === 'update' && b.op === 'update') {
       return a.expectedUpdatedAt === b.expectedUpdatedAt && cardDraftEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
+  }
+
+  if (a.entity === 'category' && b.entity === 'category') {
+    // CREATE: identity + same draft INCLUDING type (create-only field). A
+    // DIFFERING CREATE for the same id is `existing-pending`, never a silent
+    // overwrite (§11), mirroring the service's isSameCreateRow.
+    if (a.op === 'create' && b.op === 'create') {
+      return a.payload.type === b.payload.type && categoryEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'update' && b.op === 'update') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt && categoryEditableEqual(a.payload, b.payload);
     }
     if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
     return false;
@@ -752,6 +941,137 @@ export function serverCardConfirmsUpdate(serverRow: CreditCard, draft: NewCardDr
   return true;
 }
 
+/* ---------------- custom-category display model (STEP 16-H2-C2-B1) ---------------- */
+
+/** A pending CREATE / failed-orphan UPDATE payload -> a synthetic domain
+ *  `Category`. The row is read-only (never re-edited), so it carries no
+ *  timestamp — `Category` has none. */
+function categoryDraftToDomain(op: PendingCategoryCreate | PendingCategoryUpdate): Category {
+  const d = op.payload;
+  return { id: op.entityId, name: d.name, bg: d.bg, color: d.color, icon: d.icon, custom: true };
+}
+
+/** Overlay an UPDATE draft onto an existing domain category. `id` / `custom`
+ *  (identity) preserved; server-immutable `type` is not a `Category` field so
+ *  it can't change here. */
+function applyCategoryUpdate(row: Category, d: NewCustomCategoryDraft): Category {
+  return { ...row, name: d.name, bg: d.bg, color: d.color, icon: d.icon };
+}
+
+/**
+ * Does an authoritative server custom category already reflect a queued
+ * UPDATE's desired draft? STEP 16-H2-C2-B1 §24 — the pre-ack confirmation.
+ * Mirrors the write service's own `categoryFieldsMatch` at the READ-MODEL
+ * level: name / bg / color / icon compared strictly. `type` is not compared
+ * (product-immutable, never written by an UPDATE). Also used for the CREATE
+ * ack (§25): id present AND fields match. Pure — no `JSON.stringify`.
+ */
+export function serverCategoryConfirmsUpdate(
+  serverRow: Category,
+  draft: NewCustomCategoryDraft,
+): boolean {
+  return (
+    serverRow.name === draft.name &&
+    serverRow.bg === draft.bg &&
+    serverRow.color === draft.color &&
+    serverRow.icon === draft.icon
+  );
+}
+
+export interface CategoryManagementView {
+  /**
+   * The custom categories to render on the CATEGORY-management screen ONLY:
+   * authoritative server customCats, with a pending UPDATE overlaid, plus a
+   * synthetic entry for a pending/failed CREATE, plus a synthetic entry for a
+   * FAILED UPDATE whose server row is gone, minus a not-failed pending DELETE.
+   * DELIBERATELY separate from `data.customCats` (§12/§13) so the
+   * transaction/planned/recurring/budget category pickers, stats name
+   * resolution, backup and household-import only ever see authoritative server
+   * categories — no cross-entity chaining is possible. Same `{ expense, income }`
+   * shape as `data.customCats`. Equals `data.customCats` when there are no
+   * category ops.
+   */
+  rows: CustomCatMap;
+  /** category id -> the pending op that produced or marks it. */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** category ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server category ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+}
+
+function composeCategoryManagement(
+  serverCats: CustomCatMap,
+  ops: readonly PendingWrite[],
+  failedCategoryIds?: ReadonlySet<string>,
+): CategoryManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const catOps = ops.filter(
+    (o): o is PendingCategoryCreate | PendingCategoryUpdate | PendingCategoryDelete =>
+      o.entity === 'category',
+  );
+  if (catOps.length === 0) {
+    return { rows: serverCats, opById, failedIds, hiddenIds };
+  }
+
+  const failed = (id: string) => !!failedCategoryIds?.has(id);
+  // Fresh arrays — serverCats and its arrays are never mutated.
+  const rows: CustomCatMap = { expense: serverCats.expense.slice(), income: serverCats.income.slice() };
+  const findIn = (id: string) => {
+    let i = rows.expense.findIndex((c) => c.id === id);
+    if (i !== -1) return { list: rows.expense, idx: i } as const;
+    i = rows.income.findIndex((c) => c.id === id);
+    if (i !== -1) return { list: rows.income, idx: i } as const;
+    return null;
+  };
+
+  for (const op of catOps) {
+    const hit = findIn(op.entityId);
+
+    if (op.op === 'create') {
+      if (hit) continue; // the flush already landed — no marker
+      rows[op.payload.type].push(categoryDraftToDomain(op));
+      opById.set(op.entityId, 'create');
+      if (failed(op.entityId)) failedIds.add(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (hit) {
+        hit.list[hit.idx] = applyCategoryUpdate(hit.list[hit.idx], op.payload);
+        opById.set(op.entityId, 'update');
+        if (failed(op.entityId)) failedIds.add(op.entityId);
+        continue;
+      }
+      // server row gone: only a TERMINAL-failed UPDATE gets a display-only
+      // synthetic row (a not-failed one just waits — like transactions/cards).
+      if (failed(op.entityId)) {
+        rows[op.payload.type].push(categoryDraftToDomain(op));
+        opById.set(op.entityId, 'update');
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (hit) {
+        opById.set(op.entityId, 'delete'); // keep the server row visible, mark it failed
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+    if (hit) {
+      hit.list.splice(hit.idx, 1);
+      hiddenIds.push(op.entityId);
+    }
+  }
+
+  return { rows, opById, failedIds, hiddenIds };
+}
+
 export interface CardManagementView {
   /**
    * The cards to render on the card-management screen ONLY: authoritative
@@ -864,6 +1184,13 @@ export interface ComposedFinance {
    * there are no card ops.
    */
   cardManagement: CardManagementView;
+  /**
+   * STEP 16-H2-C2-B1 — DISPLAY-ONLY custom-category rows + markers for the
+   * category-management screen. NEVER merged into `data.customCats` /
+   * `data.categoryMeta` / `data.catOrder`. Equals `data.customCats` when
+   * there are no category ops.
+   */
+  categoryManagement: CategoryManagementView;
 }
 
 /**
@@ -898,12 +1225,25 @@ export function composeFinance(
   ops: readonly PendingWrite[],
   failedTransactionIds?: ReadonlySet<string>,
   failedCardIds?: ReadonlySet<string>,
+  failedCategoryIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
+  const categoryManagement = composeCategoryManagement(
+    serverData.customCats,
+    ops,
+    failedCategoryIds,
+  );
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
-    return { data: serverData, pendingIds: [], hiddenIds: [], orphanedFailedUpdates: [], cardManagement };
+    return {
+      data: serverData,
+      pendingIds: [],
+      hiddenIds: [],
+      orphanedFailedUpdates: [],
+      cardManagement,
+      categoryManagement,
+    };
   }
 
   let txns: Transaction[] | null = null; // lazily copied on first change
@@ -970,7 +1310,14 @@ export function composeFinance(
   }
 
   if (!txns && !meta) {
-    return { data: serverData, pendingIds, hiddenIds, orphanedFailedUpdates, cardManagement };
+    return {
+      data: serverData,
+      pendingIds,
+      hiddenIds,
+      orphanedFailedUpdates,
+      cardManagement,
+      categoryManagement,
+    };
   }
 
   return {
@@ -983,5 +1330,6 @@ export function composeFinance(
     hiddenIds,
     orphanedFailedUpdates,
     cardManagement,
+    categoryManagement,
   };
 }
