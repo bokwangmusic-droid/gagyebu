@@ -41,11 +41,20 @@ import {
   type TransactionInsertRow,
   type TransactionUpdateRow,
 } from '@/lib/remoteFinanceWriteMapping';
+import { isTransportError } from '@/lib/transportError';
 import type { TransactionSplit } from '@/store/types';
 
 export type CreateTransactionResult =
   | { ok: true; id: string }
-  | { ok: false; message: string };
+  /**
+   * `transport: true` (STEP 16-H2-A1 §1) marks a NETWORK/TRANSPORT failure —
+   * the INSERT never reached a server verdict — as opposed to an unexpected
+   * server error, an identity guard, or a 23505 that failed to reconcile.
+   * ONLY a `transport` failure is safe for the Offline Write Queue to
+   * enqueue. The field is additive and optional; existing callers that only
+   * branch on `res.ok` are unaffected.
+   */
+  | { ok: false; message: string; transport?: boolean };
 
 /** STEP 16-G2-B — every non-ok end state for an edit / soft delete. */
 export type WriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error';
@@ -189,7 +198,12 @@ export async function createTransaction(args: {
     return { ok: false, message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, message: describeWriteError(error) };
+  // A non-23505 error: could be transport (offline) or an unexpected server
+  // error. `transport` lets the Offline Write Queue (STEP 16-H2) tell them
+  // apart; the message/behaviour for every current caller is unchanged.
+  if (error) {
+    return { ok: false, message: describeWriteError(error), transport: isTransportError(error) };
+  }
   return { ok: false, message: GENERIC_ERROR };
 }
 
