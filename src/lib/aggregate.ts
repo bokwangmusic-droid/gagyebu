@@ -73,6 +73,66 @@ export function sortedExpenseCategories(txns: Transaction[]): [string, number][]
 }
 
 /**
+ * Millisecond value of a `Transaction.date`. Invalid / missing dates sort as
+ * the epoch so the comparator in `recentTransactions` stays total.
+ */
+function dateMs(date: string): number {
+  const t = Date.parse(date);
+  return Number.isFinite(t) ? t : 0;
+}
+
+/**
+ * Creation time recovered from a client-minted id: `<prefix>-<ms>-<rand>`
+ * (src/lib/id.ts and src/store/store.tsx's private `uid`). An id that doesn't
+ * carry a numeric middle segment yields 0 — the `id` string comparison in
+ * `recentTransactions` is still there as the final, always-deterministic
+ * tie-break.
+ */
+function createdMsFromId(id: string): number {
+  const seg = id.split('-')[1];
+  const n = seg ? Number(seg) : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * The `limit` most-recently-entered transactions, for the home "최근 내역"
+ * list — a DETERMINISTIC selection, not "the first N of whatever order the
+ * array happens to be in".
+ *
+ * Why this exists: the remote snapshot SELECT (src/services/remoteFinance.ts)
+ * carries no `ORDER BY`, and src/lib/remoteFinanceMapping.ts preserves that
+ * order, so a freshly-inserted transaction can land anywhere in the array —
+ * which is why a just-created row could be missing from the home list while
+ * still showing on 전체 내역 (that screen re-sorts by `date`). The local
+ * store happens to prepend new rows, so a bare `.slice(0, N)` looked correct
+ * there; this helper makes both paths agree on the same Transaction model.
+ *
+ * Order:
+ *   1. `date` descending — the same key app/all-transactions.tsx sorts by.
+ *   2. tie-break: creation time descending, from the id's `<ms>` segment.
+ *   3. final tie-break: `id` descending — fully deterministic even for two
+ *      rows created in the same millisecond.
+ *
+ * Pure; sorts a COPY, never mutates the input. `updated_at` / an edit is
+ * deliberately NOT a key: editing an old transaction (without changing its
+ * `date`) does not move it up the list.
+ */
+export function recentTransactions(
+  txns: readonly Transaction[],
+  limit = 5,
+): Transaction[] {
+  return [...txns]
+    .sort((a, b) => {
+      const byDate = dateMs(b.date) - dateMs(a.date);
+      if (byDate !== 0) return byDate;
+      const byCreated = createdMsFromId(b.id) - createdMsFromId(a.id);
+      if (byCreated !== 0) return byCreated;
+      return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+    })
+    .slice(0, Math.max(0, limit));
+}
+
+/**
  * Current-calendar-month figures — the same computation `useMonthlyTotals`
  * (src/store/store.tsx) does, extracted as a plain function so a screen
  * reading from a data source OTHER than `useStore()` (STEP 16-G1B's

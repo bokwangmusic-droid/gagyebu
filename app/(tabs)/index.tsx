@@ -11,7 +11,7 @@ import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
 import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
-import { monthlyTotals } from '@/lib/aggregate';
+import { monthlyTotals, recentTransactions } from '@/lib/aggregate';
 import { cardBillingForMonth } from '@/lib/card';
 import { fmt, formatMonthLabel, formatRelativeDateTime, toDateKey } from '@/lib/format';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
@@ -66,7 +66,10 @@ export default function HomeScreen() {
   }, [cards, cardBill]);
 
   const percent = totalBudget > 0 ? Math.min(100, Math.round((expense / totalBudget) * 100)) : 0;
-  const recent = transactions.slice(0, 5);
+  // Deterministic "most recently entered 5" — NOT the first 5 of the array.
+  // The remote snapshot arrives with no ORDER BY, so a bare slice(0, 5) could
+  // drop a just-created transaction that 전체 내역 (which re-sorts) still shows.
+  const recent = useMemo(() => recentTransactions(transactions, 5), [transactions]);
 
   const topCats = useMemo(
     () =>
