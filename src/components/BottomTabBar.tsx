@@ -111,28 +111,43 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
           left: 0,
           right: 0,
           bottom: 0,
-          alignSelf: 'center',
-          width: '100%',
-          maxWidth: layout.maxContentWidth,
-          flexDirection: 'row',
+          // Full-screen-width card: background / top border / shadow span
+          // edge-to-edge. The interactive row below is the part that stays
+          // capped + centred.
           alignItems: 'center',
           backgroundColor: colors.card,
           borderTopWidth: 1,
           borderTopColor: colors.border,
-          paddingTop: 8,
-          paddingHorizontal: BAR_PAD_X,
-          paddingBottom: padBottom,
         },
         shadows.md,
       ]}
     >
-      {renderItem(TABS[0])}
-      {renderItem(TABS[1])}
-      <View style={{ width: 68 }} />
-      {renderItem(TABS[2])}
-      {renderItem(TABS[3])}
+      {/* The tab row keeps the app's "phone column" — the SAME
+          maxContentWidth + centring src/components/ui/Screen.tsx uses — so on
+          a tablet the five items don't stretch across the whole screen.
+          The old bar put `maxWidth` + `left: 0` on ONE absolutely
+          positioned node; Yoga sizes that from `maxWidth` and anchors it to
+          `left`, producing a left-aligned ~430px half-bar on any screen
+          wider than maxContentWidth (phones were never wider, so it only
+          showed on tablets). */}
+      <View
+        style={{
+          width: '100%',
+          maxWidth: layout.maxContentWidth,
+          flexDirection: 'row',
+          alignItems: 'center',
+          paddingTop: 8,
+          paddingHorizontal: BAR_PAD_X,
+          paddingBottom: padBottom,
+        }}
+      >
+        {renderItem(TABS[0])}
+        {renderItem(TABS[1])}
+        <View style={{ width: 68 }} />
+        {renderItem(TABS[2])}
+        {renderItem(TABS[3])}
 
-      {/* Docked add button — STEP 16-G1B hid it entirely in read-only mode
+        {/* Docked add button — STEP 16-G1B hid it entirely in read-only mode
           (this is the app's single most prominent "add transaction"
           affordance, on every tab at all times). STEP 16-G2-A brings it
           back, but ONLY for new-transaction-create: it opens /input, which
@@ -145,10 +160,12 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
           `paddingHorizontal` (BAR_PAD_X) pushed the button that many px
           left of the true centre. Instead it now lives in a full-width
           overlay: `left/right` cancel BAR_PAD_X exactly so the overlay
-          spans the bar edge-to-edge, and `alignItems: 'center'` puts the
-          FAB's centre at precisely 50% of the bar width — independent of
-          the tab items' flex/label widths. `box-none` keeps the overlay
-          from stealing taps meant for the tabs underneath. */}
+          spans the tab row edge-to-edge, and `alignItems: 'center'` puts
+          the FAB's centre at precisely 50% of the row width — independent
+          of the tab items' flex/label widths, and (since the row is itself
+          centred) at the true horizontal centre of the screen on a tablet.
+          `box-none` keeps the overlay from stealing taps meant for the tabs
+          underneath. */}
       {REMOTE_FINANCE_WRITE.transactionCreate && (
         <View
           pointerEvents="box-none"
@@ -195,6 +212,7 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
           </Pressable>
         </View>
       )}
+      </View>
     </View>
   );
 }
