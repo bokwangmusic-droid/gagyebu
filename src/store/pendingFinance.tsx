@@ -12,7 +12,7 @@
  *
  * It NEVER owns or copies the authoritative snapshot — that stays in
  * `RemoteFinanceProvider`. This provider only holds durable UNSENT
- * operations. Transaction CREATE only in this step.
+ * operations. Transaction CREATE (H2-A2) + UPDATE + soft DELETE (H2-B2).
  */
 import {
   createContext,
@@ -32,22 +32,31 @@ import {
   type CoordinatorScope,
   type EnqueueOutcome,
   type Hydration,
+  type PendingOpKind,
 } from '@/services/offlineQueue/coordinator';
+import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { useRemoteFinance } from '@/store/remoteFinance';
+import type { Transaction } from '@/store/types';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_OPS: PendingWrite[] = [];
+const EMPTY_KIND_MAP: ReadonlyMap<string, PendingOpKind> = new Map();
+const EMPTY_REASON_MAP: ReadonlyMap<string, WriteConflictReason | undefined> = new Map();
 
 interface PendingFinanceValue {
   hydration: Hydration;
   hydrationReady: boolean;
-  /** Current-scope transaction-create ops (incl. terminal-failed) for the overlay. */
-  pendingTransactionCreateOps: PendingWrite[];
-  /** entity ids of not-yet-sent pending creates for the current scope. */
+  /** Current-scope transaction ops (create/update/delete, incl. terminal-failed) for the overlay. */
+  pendingTransactionOps: PendingWrite[];
+  /** entity id -> op kind of its current-scope pending/failed op. */
+  opByEntity: ReadonlyMap<string, PendingOpKind>;
+  /** entity id -> original service reason for a terminal failure. */
+  failedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  /** entity ids of not-yet-sent pending ops (not failed). */
   pendingTransactionIds: ReadonlySet<string>;
-  /** entity ids of terminal-failed, held creates for the current scope. */
+  /** entity ids of terminal-failed, held ops. */
   failedTransactionIds: ReadonlySet<string>;
   pendingCount: number;
   lastError: string | null;
@@ -56,6 +65,18 @@ interface PendingFinanceValue {
     scope: CoordinatorScope;
     entityId: string;
     payload: NewTransactionDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueTransactionUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewTransactionDraft;
+    expectedUpdatedAt: string;
+    originalRawCardId: string | null;
+  }) => Promise<EnqueueOutcome>;
+  enqueueTransactionDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
   /** Ask for a flush now (e.g. pull-to-refresh). `includeFailed` retries held ops. */
   requestFlush: (opts?: { includeFailed?: boolean }) => void;
@@ -96,12 +117,12 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const knownCardIdsRef = useRef<ReadonlySet<string>>(knownCardIds);
   knownCardIdsRef.current = knownCardIds;
 
-  const serverTxnIds = useMemo<ReadonlySet<string>>(
-    () => new Set((rf.data?.transactions ?? []).map((t) => t.id)),
+  const serverTxns = useMemo<ReadonlyMap<string, Transaction>>(
+    () => new Map((rf.data?.transactions ?? []).map((t) => [t.id, t])),
     [rf.data?.transactions],
   );
-  const serverTxnIdsRef = useRef<ReadonlySet<string>>(serverTxnIds);
-  serverTxnIdsRef.current = serverTxnIds;
+  const serverTxnsRef = useRef<ReadonlyMap<string, Transaction>>(serverTxns);
+  serverTxnsRef.current = serverTxns;
 
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
@@ -111,7 +132,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getScope: () => scopeRef.current,
       getRemoteReady: () => remoteReadyRef.current,
       getKnownCardIds: () => knownCardIdsRef.current,
-      getServerTransactionIds: () => serverTxnIdsRef.current,
+      getServerTransactions: () => serverTxnsRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -160,12 +181,16 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
     () => ({
       hydration: state.hydration,
       hydrationReady: state.hydration === 'ready',
-      pendingTransactionCreateOps: state.scopeOps.length > 0 ? state.scopeOps : EMPTY_OPS,
+      pendingTransactionOps: state.scopeOps.length > 0 ? state.scopeOps : EMPTY_OPS,
+      opByEntity: state.opByEntity.size > 0 ? state.opByEntity : EMPTY_KIND_MAP,
+      failedReasons: state.failedReasons.size > 0 ? state.failedReasons : EMPTY_REASON_MAP,
       pendingTransactionIds: state.pendingIds.size > 0 ? state.pendingIds : EMPTY_SET,
       failedTransactionIds: state.failedIds.size > 0 ? state.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
+      enqueueTransactionUpdate: coord.enqueueTransactionUpdate,
+      enqueueTransactionDelete: coord.enqueueTransactionDelete,
       requestFlush: coord.requestFlush,
     }),
     // state is a fresh object each render; that's exactly when something changed

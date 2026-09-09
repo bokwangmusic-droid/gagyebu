@@ -1,19 +1,26 @@
 /**
  * Static verification for the Offline Write Queue coordinator
- * (src/services/offlineQueue/coordinator.ts) — STEP 16-H2-A2.
+ * (src/services/offlineQueue/coordinator.ts) — STEP 16-H2-A2, extended for
+ * STEP 16-H2-B2 (UPDATE + soft DELETE enqueue APIs, op-aware ack).
  *
- * Fully faked: in-memory storage, scriptable `createTransaction`, a manual
- * timer, a synchronous `requestRefresh`, and a mutable "server snapshot"
- * (set of transaction ids). No React, no Supabase.
+ * Fully faked: in-memory storage, scriptable `createTransaction` /
+ * `updateTransaction` / `softDeleteTransaction`, a manual timer, a
+ * synchronous `requestRefresh`, and a mutable "server snapshot" (a
+ * `Map<id, Transaction>` of ACTIVE rows). No React, no Supabase.
  */
 import { QUEUE_SCHEMA_VERSION, type PendingTransactionCreate } from '@/lib/offlineQueue';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
-import type { CreateTransactionResult } from '@/services/remoteFinanceWrite';
+import type {
+  CreateTransactionResult,
+  SoftDeleteResult,
+  UpdateTransactionResult,
+} from '@/services/remoteFinanceWrite';
 import {
   createPendingWriteCoordinator,
   type CoordinatorScope,
 } from '@/services/offlineQueue/coordinator';
 import type { QueueStorage } from '@/services/offlineQueue/persistence';
+import type { Transaction } from '@/store/types';
 
 export interface CaseResult {
   name: string;
@@ -35,6 +42,20 @@ const draft = (over: Partial<NewTransactionDraft> = {}): NewTransactionDraft => 
   memo: '',
   date: '2026-09-10T09:00:00.000Z',
   ...over,
+});
+
+/** A server row that reflects `d` — mirrors `createDraftToDomain`. */
+const draftToTxn = (id: string, d: NewTransactionDraft): Transaction => ({
+  id,
+  type: d.type,
+  category: d.category,
+  amount: d.amount,
+  memo: d.memo,
+  date: d.date,
+  ...(d.paymentMethod !== undefined ? { paymentMethod: d.paymentMethod } : {}),
+  ...(d.cardId !== undefined ? { cardId: d.cardId } : {}),
+  ...(d.installment !== undefined ? { installment: d.installment } : {}),
+  ...(d.splits !== undefined && d.splits.length > 0 ? { splits: d.splits } : {}),
 });
 
 function memStorage(seed?: string) {
@@ -59,15 +80,24 @@ function memStorage(seed?: string) {
 
 interface Harness {
   coord: ReturnType<typeof createPendingWriteCoordinator>;
-  server: Set<string>;
+  /** trusted server snapshot's ACTIVE transactions, keyed by id. */
+  server: Map<string, Transaction>;
   cards: Set<string>;
   storage: ReturnType<typeof memStorage>;
   createLog: { id: string; householdId: string; expectedUserId: string; knownCardIds: ReadonlySet<string> }[];
+  updateLog: HUpdateArgs[];
+  deleteLog: HDeleteArgs[];
   maxConcurrentCreates: number;
   timers: { id: number; fn: () => void; ms: number; cancelled: boolean }[];
   setScope: (s: CoordinatorScope | null) => void;
   setRemoteReady: (b: boolean) => void;
   setCreate: (f: (args: HCreateArgs) => Promise<CreateTransactionResult>) => void;
+  setUpdate: (f: (args: HUpdateArgs) => Promise<UpdateTransactionResult>) => void;
+  setDelete: (f: (args: HDeleteArgs) => Promise<SoftDeleteResult>) => void;
+  /** put/replace a server row (id present + fields set). */
+  serverPut: (id: string, d: NewTransactionDraft) => void;
+  /** remove a server row (id absent == deleted/gone in the read model). */
+  serverDelete: (id: string) => void;
   runTimers: () => void;
   refreshes: () => number;
 }
@@ -80,8 +110,25 @@ type HCreateArgs = {
   knownCardIds: ReadonlySet<string>;
 };
 
+type HUpdateArgs = {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  expectedUpdatedAt: string;
+  draft: NewTransactionDraft;
+  knownCardIds: ReadonlySet<string>;
+  originalRawCardId?: string | null;
+};
+
+type HDeleteArgs = {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  expectedUpdatedAt: string;
+};
+
 function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: CoordinatorScope | null }): Harness {
-  const server = new Set<string>();
+  const server = new Map<string, Transaction>();
   const cards = new Set<string>();
   const storage = memStorage(opts?.seed);
   let scope: CoordinatorScope | null = opts?.scope === undefined ? A : opts.scope;
@@ -90,6 +137,8 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   const timers: Harness['timers'] = [];
   let timerSeq = 0;
   const createLog: Harness['createLog'] = [];
+  const updateLog: HUpdateArgs[] = [];
+  const deleteLog: HDeleteArgs[] = [];
   let inFlight = 0;
 
   const h = {} as Harness;
@@ -106,8 +155,24 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     });
     await new Promise<void>((r) => setTimeout(r, 0));
     inFlight -= 1;
-    server.add(args.id);
+    server.set(args.id, draftToTxn(args.id, args.draft));
     return { ok: true, id: args.id };
+  };
+
+  // default updateTransaction: "server applied it + snapshot reflects the draft"
+  let updateImpl = async (args: HUpdateArgs): Promise<UpdateTransactionResult> => {
+    updateLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    server.set(args.id, draftToTxn(args.id, args.draft));
+    return { ok: true, updatedAt: '2026-09-11T00:00:00.000Z' };
+  };
+
+  // default softDeleteTransaction: "server applied it + row gone from snapshot"
+  let deleteImpl = async (args: HDeleteArgs): Promise<SoftDeleteResult> => {
+    deleteLog.push(args);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    server.delete(args.id);
+    return { ok: true };
   };
 
   const coord = createPendingWriteCoordinator({
@@ -115,13 +180,15 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     getScope: () => scope,
     getRemoteReady: () => remoteReady,
     getKnownCardIds: () => cards,
-    getServerTransactionIds: () => server,
+    getServerTransactions: () => server,
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();
     },
     onChange: () => {},
     createTransaction: (args) => createImpl(args as HCreateArgs),
+    updateTransaction: (args) => updateImpl(args as HUpdateArgs),
+    softDeleteTransaction: (args) => deleteImpl(args as HDeleteArgs),
     schedule: (fn, ms) => {
       const id = ++timerSeq;
       timers.push({ id, fn, ms, cancelled: false });
@@ -139,6 +206,8 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   h.cards = cards;
   h.storage = storage;
   h.createLog = createLog;
+  h.updateLog = updateLog;
+  h.deleteLog = deleteLog;
   h.maxConcurrentCreates = 0;
   h.timers = timers;
   h.setScope = (s) => {
@@ -150,6 +219,18 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   };
   h.setCreate = (f) => {
     createImpl = f;
+  };
+  h.setUpdate = (f) => {
+    updateImpl = f;
+  };
+  h.setDelete = (f) => {
+    deleteImpl = f;
+  };
+  h.serverPut = (id, d) => {
+    server.set(id, draftToTxn(id, d));
+  };
+  h.serverDelete = (id) => {
+    server.delete(id);
   };
   h.runTimers = () => {
     const due = timers.filter((t) => !t.cancelled);
@@ -199,7 +280,7 @@ export async function runCoordinatorCases(): Promise<{
     check(
       'CASE 1 enqueue + online flush -> server has it, queue empty',
       enq.ok === true && h.server.has('txn-1') && h.coord.getState().pendingCount === 0,
-      `enq=${JSON.stringify(enq)} server=${[...h.server]} pending=${h.coord.getState().pendingCount}`,
+      `enq=${JSON.stringify(enq)} server=${[...h.server.keys()]} pending=${h.coord.getState().pendingCount}`,
     );
   }
 
@@ -380,7 +461,7 @@ export async function runCoordinatorCases(): Promise<{
     let calls = 0;
     h.setCreate((args) => {
       calls += 1;
-      if (calls >= 2) h.server.add(args.id); // 2nd replay lands
+      if (calls >= 2) h.serverPut(args.id, args.draft); // 2nd replay lands
       return Promise.resolve({ ok: true, id: args.id });
     });
     await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-14', payload: draft() });
@@ -444,7 +525,7 @@ export async function runCoordinatorCases(): Promise<{
     await settle();
     // network back
     h.setCreate((args) => {
-      h.server.add(args.id);
+      h.serverPut(args.id, args.draft);
       return Promise.resolve({ ok: true, id: args.id });
     });
     h.runTimers();
@@ -490,7 +571,7 @@ export async function runCoordinatorCases(): Promise<{
     await settle();
     const failedBefore = h.coord.getState().failedIds.has('txn-18b');
     h.setCreate((args) => {
-      h.server.add(args.id);
+      h.serverPut(args.id, args.draft);
       return Promise.resolve({ ok: true, id: args.id });
     });
     h.coord.requestFlush({ includeFailed: true });
@@ -546,7 +627,7 @@ export async function runCoordinatorCases(): Promise<{
     h.setScope(B); // login B
     // B is online (default create), but A's op must not run under B
     h.setCreate((args) => {
-      h.server.add(args.id);
+      h.serverPut(args.id, args.draft);
       return Promise.resolve({ ok: true, id: args.id });
     });
     h.coord.requestFlush();
@@ -555,7 +636,7 @@ export async function runCoordinatorCases(): Promise<{
     check(
       'CASE 21 A op never flushed while B is the active scope',
       ranForA === false && !h.server.has('txn-21'),
-      `ranForA=${ranForA} server=${[...h.server]}`,
+      `ranForA=${ranForA} server=${[...h.server.keys()]}`,
     );
   }
 
@@ -571,7 +652,7 @@ export async function runCoordinatorCases(): Promise<{
     await settle();
     h.setScope(A); // back to A
     h.setCreate((args) => {
-      h.server.add(args.id);
+      h.serverPut(args.id, args.draft);
       return Promise.resolve({ ok: true, id: args.id });
     });
     h.coord.requestFlush();
@@ -594,7 +675,7 @@ export async function runCoordinatorCases(): Promise<{
     h.maxConcurrentCreates = 0;
     h.setCreate(async (args) => {
       await new Promise<void>((r) => setTimeout(r, 0));
-      h.server.add(args.id);
+      h.serverPut(args.id, args.draft);
       return { ok: true, id: args.id };
     });
     h.coord.requestFlush();
@@ -638,7 +719,7 @@ export async function runCoordinatorCases(): Promise<{
     const noRun = h.createLog.length === 0;
     h.setRemoteReady(true);
     h.setCreate((args) => {
-      h.server.add(args.id);
+      h.serverPut(args.id, args.draft);
       return Promise.resolve({ ok: true, id: args.id });
     });
     h.coord.requestFlush();
@@ -647,6 +728,649 @@ export async function runCoordinatorCases(): Promise<{
       'CASE 25 flush gated on remote-ready; resumes once ready',
       noRun && h.server.has('txn-25') && h.coord.getState().pendingCount === 0,
       `noRunWhileNotReady=${noRun} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  /* ================================================================= *
+   * STEP 16-H2-B2 — transaction UPDATE + soft DELETE enqueue / ack
+   * ================================================================= */
+
+  const U_TRANSPORT: UpdateTransactionResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const U_CONFLICT: UpdateTransactionResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됐어요' };
+  const U_DELETED: UpdateTransactionResult = { ok: false, reason: 'deleted', message: '이미 삭제된 거래예요' };
+  const U_GONE: UpdateTransactionResult = { ok: false, reason: 'gone', message: '거래를 찾을 수 없어요' };
+  const D_TRANSPORT: SoftDeleteResult = { ok: false, reason: 'error', message: 'net', transport: true };
+  const D_CONFLICT: SoftDeleteResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됐어요' };
+
+  const updSeedObj = (over: Record<string, unknown> = {}) => ({
+    queueId: 'q-useed',
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: A,
+    entity: 'transaction',
+    op: 'update',
+    entityId: 'txn-useed',
+    payload: draft(),
+    expectedUpdatedAt: 'V1-TOKEN',
+    originalRawCardId: null,
+    enqueuedAt: '2026-09-10T09:00:00.000Z',
+    attemptCount: 0,
+    ...over,
+  });
+
+  // CASE 26 — enqueue UPDATE before hydrate -> not-hydrated
+  {
+    const h = makeHarness();
+    const enq = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-26', payload: draft(), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    check(
+      'CASE 26 enqueue UPDATE before hydrate -> not-hydrated',
+      enq.ok === false && enq.reason === 'not-hydrated',
+      JSON.stringify(enq),
+    );
+  }
+
+  // CASE 27 — UPDATE transport -> enqueued, visible as a pending UPDATE
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-27', draft({ amount: 100 }));
+    h.setUpdate(() => Promise.resolve(U_TRANSPORT));
+    const enq = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-27', payload: draft({ amount: 777 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'CASE 27 UPDATE transport -> pending, opByEntity=update, not acked',
+      enq.ok === true &&
+        st.pendingIds.has('txn-27') &&
+        st.opByEntity.get('txn-27') === 'update' &&
+        st.pendingCount === 1,
+      `enq=${JSON.stringify(enq)} op=${st.opByEntity.get('txn-27')} pending=${[...st.pendingIds]}`,
+    );
+  }
+
+  // CASE 28 — UPDATE online -> flushes, server row matches draft, reconcile acks
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-28', draft({ amount: 100, memo: 'old' }));
+    const enq = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-28', payload: draft({ amount: 250, memo: 'new' }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(8);
+    check(
+      'CASE 28 UPDATE online -> applied, field-matched, queue empty',
+      enq.ok === true &&
+        h.updateLog.length === 1 &&
+        h.server.get('txn-28')?.amount === 250 &&
+        h.server.get('txn-28')?.memo === 'new' &&
+        h.coord.getState().pendingCount === 0,
+      `updates=${h.updateLog.length} row=${JSON.stringify(h.server.get('txn-28'))} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // CASE 29 — the FROZEN token + originalRawCardId reach updateTransaction verbatim
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-29', draft());
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-29', payload: draft({ amount: 42 }),
+      expectedUpdatedAt: 'FROZEN-AT-MOUNT', originalRawCardId: 'card-was-deleted',
+    });
+    await settle(8);
+    check(
+      'CASE 29 UPDATE forwards frozen expectedUpdatedAt + originalRawCardId verbatim',
+      h.updateLog.length === 1 &&
+        h.updateLog[0].expectedUpdatedAt === 'FROZEN-AT-MOUNT' &&
+        h.updateLog[0].originalRawCardId === 'card-was-deleted',
+      JSON.stringify(h.updateLog[0]),
+    );
+  }
+
+  // CASE 30 — coordinator NEVER re-reads a newer token at flush time
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    // server row already moved on to a newer token/state, but the queued op
+    // must still carry the token frozen at enqueue.
+    h.serverPut('txn-30', draft({ amount: 999 }));
+    h.setUpdate((args) => {
+      h.updateLog.push(args);
+      return Promise.resolve(U_TRANSPORT); // stay offline: 2 attempts
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-30', payload: draft({ amount: 1 }), expectedUpdatedAt: 'V1-ONLY', originalRawCardId: null,
+    });
+    await settle();
+    h.runTimers(); // backoff retry
+    await settle(6);
+    check(
+      'CASE 30 every replay uses the SAME frozen token (no refresh)',
+      h.updateLog.length >= 2 && h.updateLog.every((u) => u.expectedUpdatedAt === 'V1-ONLY'),
+      `tokens=${JSON.stringify(h.updateLog.map((u) => u.expectedUpdatedAt))}`,
+    );
+  }
+
+  // CASE 31 — UPDATE ack needs FIELD match, not just id presence
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-31', draft({ amount: 100 }));
+    // service says ok but the snapshot is still stale (row unchanged). The
+    // `await` yields a macrotask so the "unconfirmed -> replay" cycle can't
+    // starve the test's own `settle`.
+    let applied = false;
+    h.setUpdate(async (args) => {
+      h.updateLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      if (applied) h.serverPut(args.id, args.draft);
+      return { ok: true, updatedAt: 'V2' };
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-31', payload: draft({ amount: 500 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(8);
+    const stalePending = h.coord.getState().pendingCount === 1; // not acked yet
+    applied = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'CASE 31 stale snapshot -> NOT acked (replays); acked once fields match',
+      stalePending &&
+        h.server.get('txn-31')?.amount === 500 &&
+        h.coord.getState().pendingCount === 0,
+      `stalePending=${stalePending} row=${JSON.stringify(h.server.get('txn-31'))} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // CASE 32 — UPDATE terminal conflict -> retained + failed + reason, no auto-retry
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-32', draft({ amount: 100 }));
+    let calls = 0;
+    h.setUpdate(() => {
+      calls += 1;
+      return Promise.resolve(U_CONFLICT);
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-32', payload: draft({ amount: 9 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle();
+    const afterEnqueue = calls;
+    h.coord.requestFlush(); // non-includeFailed must NOT re-run it
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'CASE 32 UPDATE conflict -> failedIds + failedReasons=conflict, not auto-retried',
+      st.failedIds.has('txn-32') &&
+        st.failedReasons.get('txn-32') === 'conflict' &&
+        st.pendingCount === 1 &&
+        afterEnqueue === 1 &&
+        calls === afterEnqueue,
+      `failed=${[...st.failedIds]} reason=${st.failedReasons.get('txn-32')} calls ${afterEnqueue}->${calls}`,
+    );
+  }
+
+  // CASE 33 — UPDATE conflict NEVER overwrites the other device's value (no blind LWW)
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-33', draft({ amount: 9999, memo: 'device-B' })); // B already won
+    h.setUpdate((args) => {
+      h.updateLog.push(args);
+      return Promise.resolve(U_CONFLICT);
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-33', payload: draft({ amount: 1, memo: 'device-A' }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(8);
+    check(
+      "CASE 33 conflict -> B's row untouched, queue retained durably, one attempt only",
+      h.server.get('txn-33')?.amount === 9999 &&
+        h.server.get('txn-33')?.memo === 'device-B' &&
+        h.updateLog.length === 1 &&
+        h.coord.getState().pendingCount === 1 &&
+        (h.storage.dump() ?? '').includes('txn-33'),
+      `row=${JSON.stringify(h.server.get('txn-33'))} attempts=${h.updateLog.length}`,
+    );
+  }
+
+  // CASE 34 — terminal reason is PERSISTED (lastErrorReason) for restart
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-34', draft());
+    h.setUpdate(() => Promise.resolve(U_CONFLICT));
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-34', payload: draft({ amount: 2 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(6);
+    check(
+      'CASE 34 terminal UPDATE persists lastErrorReason:"conflict" (schema still 1)',
+      (h.storage.dump() ?? '').includes('"lastErrorReason":"conflict"') &&
+        (h.storage.dump() ?? '').includes('"schemaVersion":1'),
+      `storage=${h.storage.dump()}`,
+    );
+  }
+
+  // CASE 35 — restart RESTORE: a seeded terminal-failed UPDATE comes back failed with its reason
+  {
+    const seed = JSON.stringify([
+      updSeedObj({ queueId: 'q-35', entityId: 'txn-35', lastError: 'conflict', lastErrorReason: 'conflict' }),
+    ]);
+    const h = makeHarness({ seed, remoteReady: false }); // offline so it can't flush away
+    await h.coord.hydrate();
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'CASE 35 restart -> seeded failed UPDATE restored with failedReasons=conflict',
+      st.failedIds.has('txn-35') &&
+        st.failedReasons.get('txn-35') === 'conflict' &&
+        st.opByEntity.get('txn-35') === 'update' &&
+        st.pendingCount === 1,
+      `failed=${[...st.failedIds]} reason=${st.failedReasons.get('txn-35')} op=${st.opByEntity.get('txn-35')}`,
+    );
+  }
+
+  // CASE 36 — enqueue DELETE before hydrate -> not-hydrated
+  {
+    const h = makeHarness();
+    const enq = await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-36', expectedUpdatedAt: 'V1' });
+    check(
+      'CASE 36 enqueue DELETE before hydrate -> not-hydrated',
+      enq.ok === false && enq.reason === 'not-hydrated',
+      JSON.stringify(enq),
+    );
+  }
+
+  // CASE 37 — DELETE transport -> enqueued, visible as a pending DELETE
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-37', draft());
+    h.setDelete(() => Promise.resolve(D_TRANSPORT));
+    const enq = await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-37', expectedUpdatedAt: 'V1' });
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'CASE 37 DELETE transport -> pending, opByEntity=delete',
+      enq.ok === true &&
+        st.pendingIds.has('txn-37') &&
+        st.opByEntity.get('txn-37') === 'delete' &&
+        st.pendingCount === 1,
+      `enq=${JSON.stringify(enq)} op=${st.opByEntity.get('txn-37')}`,
+    );
+  }
+
+  // CASE 38 — DELETE online -> flushes, row leaves the snapshot, reconcile acks
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-38', draft());
+    const enq = await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-38', expectedUpdatedAt: 'V1' });
+    await settle(8);
+    check(
+      'CASE 38 DELETE online -> row gone, queue empty',
+      enq.ok === true &&
+        h.deleteLog.length === 1 &&
+        !h.server.has('txn-38') &&
+        h.coord.getState().pendingCount === 0,
+      `deletes=${h.deleteLog.length} present=${h.server.has('txn-38')} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // CASE 39 — DELETE forwards the FROZEN token verbatim
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-39', draft());
+    await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-39', expectedUpdatedAt: 'DEL-FROZEN' });
+    await settle(8);
+    check(
+      'CASE 39 DELETE forwards frozen expectedUpdatedAt verbatim',
+      h.deleteLog.length === 1 && h.deleteLog[0].expectedUpdatedAt === 'DEL-FROZEN',
+      JSON.stringify(h.deleteLog[0]),
+    );
+  }
+
+  // CASE 40 — DELETE ack requires the id to be ABSENT; still-present -> replays
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-40', draft());
+    let reallyDelete = false;
+    h.setDelete(async (args) => {
+      h.deleteLog.push(args);
+      await new Promise<void>((r) => setTimeout(r, 0));
+      if (reallyDelete) h.serverDelete(args.id);
+      return { ok: true };
+    });
+    await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-40', expectedUpdatedAt: 'V1' });
+    await settle(8);
+    const stillPending = h.coord.getState().pendingCount === 1;
+    reallyDelete = true;
+    h.coord.requestFlush();
+    await settle(10);
+    check(
+      'CASE 40 DELETE not acked while row still present; acked once absent',
+      stillPending && !h.server.has('txn-40') && h.coord.getState().pendingCount === 0,
+      `stillPending=${stillPending} present=${h.server.has('txn-40')} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // CASE 41 — DELETE terminal conflict -> retained + failed + reason
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-41', draft({ amount: 100 }));
+    h.setDelete(() => Promise.resolve(D_CONFLICT));
+    await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-41', expectedUpdatedAt: 'V1' });
+    await settle(6);
+    const st = h.coord.getState();
+    check(
+      'CASE 41 DELETE conflict -> failedReasons=conflict, row still on server, retained',
+      st.failedIds.has('txn-41') &&
+        st.failedReasons.get('txn-41') === 'conflict' &&
+        h.server.has('txn-41') &&
+        st.pendingCount === 1,
+      `reason=${st.failedReasons.get('txn-41')} present=${h.server.has('txn-41')}`,
+    );
+  }
+
+  // CASE 42 — DELETE is idempotent: service reports ok for an already-gone row -> acked
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    // row already absent from the snapshot
+    h.setDelete((args) => {
+      h.deleteLog.push(args);
+      return Promise.resolve({ ok: true }); // idempotent success, touches nothing
+    });
+    const enq = await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-42', expectedUpdatedAt: 'V1' });
+    await settle(8);
+    check(
+      'CASE 42 DELETE already-gone -> ok -> acked, queue empty, no failure',
+      enq.ok === true &&
+        h.coord.getState().pendingCount === 0 &&
+        h.coord.getState().failedIds.size === 0,
+      `pending=${h.coord.getState().pendingCount} failed=${[...h.coord.getState().failedIds]}`,
+    );
+  }
+
+  // CASE 43 — a DIFFERING same-op pending change for the same id is REFUSED
+  // (no silent overwrite). Two different UPDATEs for one transaction.
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-43', draft({ amount: 1 }));
+    h.setUpdate(() => Promise.resolve(U_TRANSPORT));
+    const up1 = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-43', payload: draft({ amount: 5 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle();
+    const up2 = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-43', payload: draft({ amount: 6 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    const stored = (h.storage.dump() ?? '');
+    check(
+      'CASE 43 differing 2nd UPDATE(same id) -> existing-pending, 1st kept verbatim',
+      up1.ok === true &&
+        up2.ok === false && up2.reason === 'existing-pending' &&
+        h.coord.getState().pendingCount === 1 &&
+        stored.includes('"amount":5') && !stored.includes('"amount":6'),
+      `up1=${JSON.stringify(up1)} up2=${JSON.stringify(up2)} pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // CASE 44 — NO COMPACTION across ops: a pending CREATE and a later pending
+  // UPDATE for the same id are kept as TWO separate FIFO records (never
+  // merged), so a flush replays create-then-update in order (§24).
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCreate(() => Promise.resolve(TRANSPORT));
+    h.setUpdate(() => Promise.resolve(U_TRANSPORT));
+    const cr = await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-44', payload: draft() });
+    await settle();
+    const up = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-44', payload: draft({ amount: 5 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle();
+    const ops = h.coord.getState().scopeOps.map((o) => o.op).join(',');
+    check(
+      'CASE 44 pending CREATE + UPDATE(same id) -> 2 FIFO records, not compacted',
+      cr.ok === true && up.ok === true &&
+        h.coord.getState().pendingCount === 2 &&
+        ops === 'create,update',
+      `cr=${JSON.stringify(cr)} up=${JSON.stringify(up)} ops=[${ops}] pending=${h.coord.getState().pendingCount}`,
+    );
+  }
+
+  // CASE 44b — same, UPDATE then DELETE for one id -> both kept, FIFO order
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-44b', draft());
+    h.setUpdate(() => Promise.resolve(U_TRANSPORT));
+    h.setDelete(() => Promise.resolve(D_TRANSPORT));
+    const up = await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-44b', payload: draft({ amount: 5 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle();
+    const del = await h.coord.enqueueTransactionDelete({ scope: A, entityId: 'txn-44b', expectedUpdatedAt: 'V1' });
+    await settle();
+    const ops = h.coord.getState().scopeOps.map((o) => o.op).join(',');
+    check(
+      'CASE 44b pending UPDATE + DELETE(same id) -> 2 FIFO records, not compacted',
+      up.ok === true && del.ok === true &&
+        h.coord.getState().pendingCount === 2 && ops === 'update,delete',
+      `up=${JSON.stringify(up)} del=${JSON.stringify(del)} ops=[${ops}]`,
+    );
+  }
+
+  // CASE 45 — scope isolation: A's pending UPDATE is invisible + never flushed under B
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-45', draft());
+    h.setUpdate(() => Promise.resolve(U_TRANSPORT));
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-45', payload: draft({ amount: 5 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle();
+    h.setScope(B);
+    const underB = h.coord.getState();
+    const beforeB = h.updateLog.length;
+    h.setUpdate((args) => {
+      h.updateLog.push(args);
+      h.serverPut(args.id, args.draft);
+      return Promise.resolve({ ok: true, updatedAt: 'V2' });
+    });
+    h.coord.requestFlush();
+    await settle(8);
+    const ranUnderB = h.updateLog.slice(beforeB).some((u) => u.id === 'txn-45');
+    h.setScope(A);
+    const underA = h.coord.getState();
+    check(
+      'CASE 45 UPDATE scope-isolated: hidden + not flushed under B, visible again under A',
+      underB.pendingCount === 0 &&
+        ranUnderB === false &&
+        underA.pendingIds.has('txn-45') &&
+        underA.opByEntity.get('txn-45') === 'update',
+      `B=${underB.pendingCount} ranUnderB=${ranUnderB} A=${[...underA.pendingIds]}`,
+    );
+  }
+
+  // CASE 46 — getState().failedReasons is SCOPED, and rebuilt from durable records on return
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-46', draft({ amount: 100 }));
+    h.setUpdate(() => Promise.resolve(U_CONFLICT));
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-46', payload: draft({ amount: 3 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(6);
+    const underA1 = h.coord.getState().failedReasons.get('txn-46');
+    h.setScope(B);
+    const underB = h.coord.getState().failedReasons.has('txn-46');
+    h.setScope(A);
+    const underA2 = h.coord.getState().failedReasons.get('txn-46');
+    check(
+      'CASE 46 failedReasons scoped: A sees conflict, B does not, A sees it again (from disk)',
+      underA1 === 'conflict' && underB === false && underA2 === 'conflict',
+      `A1=${underA1} B=${underB} A2=${underA2}`,
+    );
+  }
+
+  // CASE 47 — requestFlush({includeFailed}) clears reasons AND drops the durable marker
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-47', draft({ amount: 100 }));
+    let mode: 'conflict' | 'ok' = 'conflict';
+    h.setUpdate((args) => {
+      h.updateLog.push(args);
+      if (mode === 'ok') {
+        h.serverPut(args.id, args.draft);
+        return Promise.resolve({ ok: true, updatedAt: 'V2' });
+      }
+      return Promise.resolve(U_CONFLICT);
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-47', payload: draft({ amount: 7 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(6);
+    const hadReason =
+      h.coord.getState().failedReasons.get('txn-47') === 'conflict' &&
+      (h.storage.dump() ?? '').includes('"lastErrorReason"');
+    mode = 'ok';
+    h.coord.requestFlush({ includeFailed: true });
+    await settle(10);
+    check(
+      'CASE 47 includeFailed -> reason cleared, durable lastErrorReason dropped, op retried & acked',
+      hadReason &&
+        h.coord.getState().failedReasons.size === 0 &&
+        !(h.storage.dump() ?? '').includes('"lastErrorReason"') &&
+        h.coord.getState().pendingCount === 0 &&
+        h.server.get('txn-47')?.amount === 7,
+      `hadReason=${hadReason} reasons=${h.coord.getState().failedReasons.size} pending=${h.coord.getState().pendingCount} storage=${h.storage.dump()}`,
+    );
+  }
+
+  /* ---- STEP 16-H2-B2.1 — failed UPDATE whose server row is GONE ---- */
+
+  // CASE 48 — terminal 'deleted' UPDATE (row removed by another device):
+  // retained, failedReasons='deleted', op stays 'update', NOT auto-retried,
+  // frozen token never bumped. The durable record is the data the read
+  // layer needs to resurface a synthetic failed row.
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-48', draft({ amount: 100 })); // exists at edit time…
+    let calls = 0;
+    h.setUpdate((args) => {
+      calls += 1;
+      h.updateLog.push(args);
+      h.serverDelete(args.id); // …device B deletes it; server now says 'deleted'
+      return Promise.resolve(U_DELETED);
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-48', payload: draft({ amount: 12000 }), expectedUpdatedAt: 'V1-FROZEN', originalRawCardId: null,
+    });
+    await settle(6);
+    const afterEnqueue = calls;
+    h.coord.requestFlush(); // plain trigger must NOT re-run a terminal item
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'CASE 48 terminal "deleted" UPDATE -> retained, reason=deleted, op=update, no auto-retry, token frozen',
+      st.failedIds.has('txn-48') &&
+        st.failedReasons.get('txn-48') === 'deleted' &&
+        st.opByEntity.get('txn-48') === 'update' &&
+        st.pendingCount === 1 &&
+        afterEnqueue === 1 && calls === 1 &&
+        h.updateLog.every((u) => u.expectedUpdatedAt === 'V1-FROZEN') &&
+        !h.server.has('txn-48'),
+      `reason=${st.failedReasons.get('txn-48')} op=${st.opByEntity.get('txn-48')} calls=${calls} present=${h.server.has('txn-48')}`,
+    );
+  }
+
+  // CASE 49 — restart RESTORE: a seeded terminal 'deleted'/'gone' UPDATE
+  // whose server row is absent still comes back as a failed UPDATE (so the
+  // read layer can rebuild its synthetic row).
+  {
+    const seed = JSON.stringify([
+      updSeedObj({ queueId: 'q-49a', entityId: 'txn-49a', payload: draft({ amount: 12000, memo: '점심' }), lastError: 'deleted', lastErrorReason: 'deleted' }),
+      updSeedObj({ queueId: 'q-49b', entityId: 'txn-49b', payload: draft({ amount: 900 }), lastError: 'gone', lastErrorReason: 'gone' }),
+    ]);
+    const h = makeHarness({ seed, remoteReady: false }); // server has neither row
+    await h.coord.hydrate();
+    await settle();
+    const st = h.coord.getState();
+    check(
+      'CASE 49 restart -> seeded terminal deleted/gone UPDATE restored with op+reason (row-gone visibility data)',
+      st.failedIds.has('txn-49a') && st.failedReasons.get('txn-49a') === 'deleted' &&
+        st.opByEntity.get('txn-49a') === 'update' &&
+        st.failedIds.has('txn-49b') && st.failedReasons.get('txn-49b') === 'gone' &&
+        st.opByEntity.get('txn-49b') === 'update' &&
+        st.pendingCount === 2,
+      `a=${st.failedReasons.get('txn-49a')} b=${st.failedReasons.get('txn-49b')} pending=${st.pendingCount}`,
+    );
+  }
+
+  // CASE 50 — scope isolation: A's failed row-gone UPDATE is invisible under B
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.serverPut('txn-50', draft({ amount: 1 }));
+    h.setUpdate((args) => {
+      h.updateLog.push(args);
+      h.serverDelete(args.id);
+      return Promise.resolve(U_DELETED);
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-50', payload: draft({ amount: 9 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(6);
+    h.setScope(B);
+    const underB = h.coord.getState();
+    h.setScope(A);
+    const underA = h.coord.getState();
+    check(
+      'CASE 50 failed row-gone UPDATE: nothing under B, restored under A',
+      underB.pendingCount === 0 &&
+        underB.opByEntity.has('txn-50') === false &&
+        underB.failedReasons.has('txn-50') === false &&
+        underA.failedIds.has('txn-50') &&
+        underA.failedReasons.get('txn-50') === 'deleted' &&
+        underA.opByEntity.get('txn-50') === 'update',
+      `B.pending=${underB.pendingCount} A.reason=${underA.failedReasons.get('txn-50')}`,
+    );
+  }
+
+  // CASE 51 — terminal 'gone' UPDATE: same retention + reason plumbing
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setUpdate((args) => {
+      h.updateLog.push(args);
+      return Promise.resolve(U_GONE);
+    });
+    await h.coord.enqueueTransactionUpdate({
+      scope: A, entityId: 'txn-51', payload: draft({ amount: 3 }), expectedUpdatedAt: 'V1', originalRawCardId: null,
+    });
+    await settle(6);
+    const st = h.coord.getState();
+    check(
+      'CASE 51 terminal "gone" UPDATE -> failedReasons=gone, op=update, retained',
+      st.failedIds.has('txn-51') && st.failedReasons.get('txn-51') === 'gone' &&
+        st.opByEntity.get('txn-51') === 'update' && st.pendingCount === 1,
+      `reason=${st.failedReasons.get('txn-51')}`,
     );
   }
 

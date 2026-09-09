@@ -15,6 +15,7 @@
  */
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
+import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import type { Transaction } from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
@@ -54,6 +55,14 @@ interface PendingWriteBase {
   attemptCount: number;
   lastAttemptAt?: string;
   lastError?: string;
+  /**
+   * STEP 16-H2-B2 §14: the ORIGINAL service reason for the last TERMINAL
+   * failure (`conflict` / `deleted` / `gone` / `identity` / `error`), stored
+   * so a restart can rebuild the failed-op UX without parsing `lastError`.
+   * Additive optional — schema stays 1; a CREATE record from H2-A2 simply
+   * has no such key.
+   */
+  lastErrorReason?: WriteConflictReason;
 }
 
 /** `payload` is exactly what `createTransaction()` is re-handed. */
@@ -151,6 +160,7 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (typeof r.attemptCount !== 'number' || !Number.isInteger(r.attemptCount) || r.attemptCount < 0) return null;
   if (r.lastAttemptAt !== undefined && typeof r.lastAttemptAt !== 'string') return null;
   if (r.lastError !== undefined && typeof r.lastError !== 'string') return null;
+  if (r.lastErrorReason !== undefined && typeof r.lastErrorReason !== 'string') return null;
 
   const base = {
     queueId: r.queueId,
@@ -162,6 +172,9 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     attemptCount: r.attemptCount,
     ...(r.lastAttemptAt !== undefined ? { lastAttemptAt: r.lastAttemptAt as string } : {}),
     ...(r.lastError !== undefined ? { lastError: r.lastError as string } : {}),
+    ...(r.lastErrorReason !== undefined
+      ? { lastErrorReason: r.lastErrorReason as WriteConflictReason }
+      : {}),
   };
 
   if (r.op === 'create') {
@@ -393,8 +406,15 @@ export function opsForScope(
  * Read overlay — transaction CREATE / UPDATE / DELETE
  * ------------------------------------------------------------------ */
 
-/** A CREATE payload -> a synthetic domain `Transaction` row. */
-function createDraftToDomain(op: PendingTransactionCreate): Transaction {
+/**
+ * A CREATE payload -> a synthetic domain `Transaction` row. Also reused
+ * (STEP 16-H2-B2.1) to rebuild a read-only row for a TERMINAL-failed UPDATE
+ * whose authoritative server row is gone: `NewTransactionDraft` carries
+ * every user-editable field, and server-locked provenance
+ * (`fromRecurring` / `tags` / `memberId` / …) is all optional on
+ * `Transaction`, so this stays type-safe with nothing invented.
+ */
+function createDraftToDomain(op: PendingTransactionCreate | PendingTransactionUpdate): Transaction {
   const d = op.payload;
   return {
     id: op.entityId,
@@ -443,17 +463,80 @@ function createSyntheticMeta(op: PendingTransactionCreate): RemoteTransactionMet
   };
 }
 
+/**
+ * Does an authoritative server row already reflect a queued UPDATE's desired
+ * draft? STEP 16-H2-B2 §16 — the confirmation before a durable ack. Mirrors
+ * the field set of the write service's own `financialFieldsMatch`
+ * (src/services/remoteFinanceWrite.ts) at the READ-MODEL level:
+ *   - type / category / amount / memo / date(instant) / installment.months /
+ *     splits (order-significant) compared strictly;
+ *   - paymentMethod compared strictly;
+ *   - `cardId` LENIENT: an exact mismatch is only disqualifying when the
+ *     draft's card is a CURRENTLY-LIVE card (it should have stuck). When the
+ *     draft's card isn't live (soft-deleted / preserved-as-dangling / nulled)
+ *     the read model can legitimately show `undefined`, so that difference is
+ *     accepted — matching the service's "absent card_id => preserve" rule.
+ *
+ * A false negative here only costs one extra idempotent replay (the service's
+ * 0-row reconcile confirms it), never data loss. Pure.
+ */
+export function serverRowConfirmsUpdate(
+  serverRow: Transaction,
+  draft: NewTransactionDraft,
+  knownCardIds: ReadonlySet<string>,
+): boolean {
+  if (serverRow.type !== draft.type) return false;
+  if (serverRow.category !== draft.category) return false;
+  if (Number(serverRow.amount) !== Number(draft.amount)) return false;
+  if ((serverRow.memo ?? '') !== (draft.memo ?? '')) return false;
+  if (new Date(serverRow.date).getTime() !== new Date(draft.date).getTime()) return false;
+  if ((serverRow.installment?.months ?? null) !== (draft.installment?.months ?? null)) return false;
+  if ((serverRow.paymentMethod ?? null) !== (draft.paymentMethod ?? null)) return false;
+
+  const sa = serverRow.splits ?? [];
+  const sb = draft.splits ?? [];
+  if (sa.length !== sb.length) return false;
+  if (
+    !sa.every(
+      (s, i) =>
+        s.category === sb[i].category &&
+        Number(s.amount) === Number(sb[i].amount) &&
+        (s.memo ?? null) === (sb[i].memo ?? null),
+    )
+  ) {
+    return false;
+  }
+
+  const draftCard = draft.cardId ?? null;
+  const serverCard = serverRow.cardId ?? null;
+  if (draftCard !== serverCard && draftCard != null && knownCardIds.has(draftCard)) {
+    return false;
+  }
+  return true;
+}
+
 export interface ComposedFinance {
   /** `serverData` with pending overlays applied. A NEW object when anything
    *  changed; the SAME reference when nothing applied. `serverData` and its
    *  arrays/maps are never mutated. */
   data: RemoteFinanceData;
-  /** transaction ids added by a pending CREATE or patched by a pending
-   *  UPDATE, plus failed-DELETE ids whose server row is being shown again —
-   *  i.e. every row that carries a "전송 대기" / "전송 실패" marker. */
+  /** transaction ids present in `data.transactions` ONLY because of a pending
+   *  CREATE / UPDATE overlay, plus failed-DELETE ids whose server row is
+   *  being shown again — i.e. every row IN `data.transactions` that carries a
+   *  "전송 대기" / "전송 실패" marker. Never includes `orphanedFailedUpdates`. */
   pendingIds: string[];
   /** transaction ids currently HIDDEN by a not-failed pending DELETE. */
   hiddenIds: string[];
+  /**
+   * STEP 16-H2-B2.2 — DISPLAY-ONLY rows for a TERMINAL-failed UPDATE whose
+   * authoritative server row is GONE (another device deleted it). These are
+   * synthetic `Transaction`s rebuilt from the frozen draft so Home / 전체
+   * 거래내역 can show the user their un-sent edit read-only. They are
+   * DELIBERATELY kept OUT of `data.transactions` so they never reach any
+   * finance calculation (stats / budget / 합계 / recentTransactions). `[]`
+   * when there are none.
+   */
+  orphanedFailedUpdates: Transaction[];
 }
 
 /**
@@ -466,13 +549,18 @@ export interface ComposedFinance {
  *    that row with `applyUpdateDraft`. The server `transactionMeta[id]` is
  *    PRESERVED — its `updatedAt` is the real optimistic-concurrency token and
  *    must not be replaced with a fake `enqueuedAt` (STEP 16-H2-B1 §9). Not on
- *    the server -> skip.
+ *    the server: skip UNLESS this UPDATE is in `failedTransactionIds` (a
+ *    TERMINAL failure — the row was deleted/gone on the server) — then emit a
+ *    read-only synthetic row into `orphanedFailedUpdates` (NOT into
+ *    `data.transactions`) so the user's durable edit is visible on Home / 전체
+ *    거래내역 without ever entering a finance calculation (STEP 16-H2-B2.2).
  *  - DELETE: not failed -> remove the row from the composed list and its
  *    `transactionMeta` entry (`hiddenIds`). Failed -> DO NOT hide; the server
  *    row stays visible so a screen can label it "삭제 전송 실패" (`pendingIds`).
  *  - `failedTransactionIds` (entity-id set; ≤1 pending op per id by dedup)
- *    only changes DELETE behaviour — a failed CREATE/UPDATE still overlays so
- *    the user's row/edit never vanishes.
+ *    changes DELETE behaviour (failed -> keep visible) and routes an
+ *    otherwise-lost failed UPDATE into `orphanedFailedUpdates`. A failed
+ *    CREATE still overlays via the normal CREATE path (unchanged).
  *  - Ops are applied in enqueue order. Non-transaction ops are ignored.
  */
 export function composeFinance(
@@ -481,12 +569,15 @@ export function composeFinance(
   failedTransactionIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const txnOps = ops.filter((o) => o.entity === 'transaction');
-  if (txnOps.length === 0) return { data: serverData, pendingIds: [], hiddenIds: [] };
+  if (txnOps.length === 0) {
+    return { data: serverData, pendingIds: [], hiddenIds: [], orphanedFailedUpdates: [] };
+  }
 
   let txns: Transaction[] | null = null; // lazily copied on first change
   let meta: Record<string, RemoteTransactionMeta> | null = null;
   const pendingIds: string[] = [];
   const hiddenIds: string[] = [];
+  const orphanedFailedUpdates: Transaction[] = [];
   const failed = (id: string) => !!failedTransactionIds?.has(id);
 
   const list = () => txns ?? serverData.transactions;
@@ -511,7 +602,20 @@ export function composeFinance(
     }
 
     if (op.op === 'update') {
-      if (idx === -1) continue; // nothing to patch
+      if (idx === -1) {
+        // STEP 16-H2-B2.1/B2.2: a TERMINAL-failed UPDATE whose authoritative
+        // row is GONE (another device deleted it). The user's durable edit
+        // must stay VISIBLE, but it is NOT a real transaction any more, so it
+        // is emitted DISPLAY-ONLY into `orphanedFailedUpdates` — never pushed
+        // into `data.transactions` / `pendingIds` / `transactionMeta`, so no
+        // finance calculation (stats / budget / 합계 / recentTransactions)
+        // can ever see its amount. A NOT-failed pending UPDATE whose row is
+        // only transiently missing is left alone (no synthetic row at all).
+        if (failed(op.entityId)) {
+          orphanedFailedUpdates.push(createDraftToDomain(op));
+        }
+        continue;
+      }
       ensureTxns()[idx] = applyUpdateDraft(list()[idx], op.payload);
       // transactionMeta is intentionally left as-is (real token preserved).
       pendingIds.push(op.entityId);
@@ -532,7 +636,9 @@ export function composeFinance(
     hiddenIds.push(op.entityId);
   }
 
-  if (!txns && !meta) return { data: serverData, pendingIds, hiddenIds };
+  if (!txns && !meta) {
+    return { data: serverData, pendingIds, hiddenIds, orphanedFailedUpdates };
+  }
 
   return {
     data: {
@@ -542,5 +648,6 @@ export function composeFinance(
     },
     pendingIds,
     hiddenIds,
+    orphanedFailedUpdates,
   };
 }

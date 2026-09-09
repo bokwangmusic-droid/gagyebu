@@ -38,6 +38,7 @@ import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { usePendingWrites } from '@/store/pendingFinance';
 import { useRemoteFinance } from '@/store/remoteFinance';
+import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import type { BudgetMap, CreditCard, Goal, Loan, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 export type FinanceReadStatus = 'loading' | 'error' | 'ready';
@@ -120,19 +121,40 @@ export interface FinanceReadResult {
   catOrder: CatOrderMap;
 
   /**
-   * STEP 16-H2-A2: transaction ids that are on screen ONLY because of a
-   * durable offline CREATE that hasn't sent yet ("전송 대기"). A superset
-   * `transactions`/`transactionMeta` already include the synthetic rows.
-   * Empty unless the offline queue is hydrated and has current-scope pending
-   * creates the server snapshot doesn't have.
+   * STEP 16-H2-A2: not-yet-sent pending ops that are visible on screen
+   * (a CREATE's synthetic row, an UPDATE's overlaid row). Kept for backward
+   * compatibility — prefer `pendingTransactionOps` for the row label.
    */
   pendingTransactionIds: ReadonlySet<string>;
   /**
-   * STEP 16-H2-A2: pending-create transaction ids whose send hit a TERMINAL
-   * failure and are being held for a manual retry ("전송 실패"). Also present
-   * in `transactions` — a terminal failure never removes the user's row.
+   * STEP 16-H2-A2: visible transaction ids whose send hit a TERMINAL failure
+   * and are being held for a manual retry. A terminal failure never removes
+   * the user's row (a failed DELETE keeps its server row visible).
    */
   failedTransactionIds: ReadonlySet<string>;
+  /**
+   * STEP 16-H2-B2: per-visible-transaction offline-op state, for the row
+   * label / read-only gate. A not-failed pending DELETE hides its row, so it
+   * has NO entry here. `reason` is only set when `failed` is true.
+   */
+  pendingTransactionOps: ReadonlyMap<
+    string,
+    { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+  >;
+  /**
+   * STEP 16-H2-B2.2: DISPLAY-ONLY rows for a TERMINAL-failed offline UPDATE
+   * whose authoritative server row is GONE (deleted on another device). They
+   * are NOT in `transactions` — no stats / budget / 합계 / recent calculation
+   * ever sees them — but Home / 전체 거래내역 render them read-only so the
+   * user's un-sent edit is not silently lost. `reason` drives the failure
+   * label. `[]` unless the offline queue is hydrated and has such a record
+   * for the current scope.
+   */
+  failedLocalTransactions: ReadonlyArray<{
+    transaction: Transaction;
+    op: 'update';
+    reason?: WriteConflictReason;
+  }>;
 
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
@@ -160,6 +182,8 @@ const EMPTY_SLICES = {
   catOrder: DEFAULT_CAT_ORDER,
   pendingTransactionIds: new Set<string>() as ReadonlySet<string>,
   failedTransactionIds: new Set<string>() as ReadonlySet<string>,
+  pendingTransactionOps: new Map() as FinanceReadResult['pendingTransactionOps'],
+  failedLocalTransactions: [] as FinanceReadResult['failedLocalTransactions'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -167,7 +191,9 @@ export function useFinanceRead(): FinanceReadResult {
   const { activeHousehold } = useHousehold();
   const { data, error, loadedForUserId, loadedForHouseholdId, refreshRemoteFinance } = useRemoteFinance();
   const {
-    pendingTransactionCreateOps,
+    pendingTransactionOps: providerOps,
+    opByEntity,
+    failedReasons,
     failedTransactionIds: providerFailedIds,
     hydrationReady,
   } = usePendingWrites();
@@ -189,16 +215,38 @@ export function useFinanceRead(): FinanceReadResult {
       // mutates `data`; it returns the same reference when nothing applies.
       // `providerFailedIds` (entity-id set) only changes DELETE behaviour —
       // a failed DELETE keeps its server row visible so it can be labelled.
-      const { data: composed, pendingIds } =
-        hydrationReady && pendingTransactionCreateOps.length > 0
-          ? composeFinance(data, pendingTransactionCreateOps, providerFailedIds)
-          : { data, pendingIds: [] as string[] };
-      const overlaid = new Set(pendingIds);
+      const { data: composed, pendingIds, orphanedFailedUpdates } =
+        hydrationReady && providerOps.length > 0
+          ? composeFinance(data, providerOps, providerFailedIds)
+          : { data, pendingIds: [] as string[], orphanedFailedUpdates: [] as Transaction[] };
+      // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
+      // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
+      // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
+      // not-failed DELETE is hidden, so it never lands here.
+      const opStates = new Map<
+        string,
+        { op: 'create' | 'update' | 'delete'; failed: boolean; reason?: WriteConflictReason }
+      >();
       const failed = new Set<string>();
       const pending = new Set<string>();
-      for (const id of overlaid) {
-        (providerFailedIds.has(id) ? failed : pending).add(id);
+      for (const id of pendingIds) {
+        const isFailed = providerFailedIds.has(id);
+        (isFailed ? failed : pending).add(id);
+        opStates.set(id, {
+          op: opByEntity.get(id) ?? 'create',
+          failed: isFailed,
+          ...(isFailed ? { reason: failedReasons.get(id) } : {}),
+        });
       }
+      // STEP 16-H2-B2.2: display-only rows for failed UPDATEs whose server
+      // row is gone. `composeFinance` deliberately kept these OUT of
+      // `composed.transactions`, so nothing below (or any stats/budget
+      // consumer) counts them; only Home / 전체 거래내역 render them.
+      const failedLocalTransactions = orphanedFailedUpdates.map((t) => ({
+        transaction: t,
+        op: 'update' as const,
+        reason: failedReasons.get(t.id),
+      }));
       return {
         status: 'ready',
         ready: true,
@@ -210,6 +258,8 @@ export function useFinanceRead(): FinanceReadResult {
         transactionMeta: composed.transactionMeta,
         pendingTransactionIds: pending,
         failedTransactionIds: failed,
+        pendingTransactionOps: opStates,
+        failedLocalTransactions,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -261,7 +311,9 @@ export function useFinanceRead(): FinanceReadResult {
     error,
     refreshRemoteFinance,
     hydrationReady,
-    pendingTransactionCreateOps,
+    providerOps,
+    opByEntity,
+    failedReasons,
     providerFailedIds,
   ]);
 }

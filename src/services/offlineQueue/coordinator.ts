@@ -26,10 +26,14 @@ import {
   computeBackoffDelay,
   enqueuePendingWrite,
   makePendingTransactionCreate,
+  makePendingTransactionDelete,
+  makePendingTransactionUpdate,
   opsForScope,
+  serverRowConfirmsUpdate,
   type PendingWrite,
 } from '@/lib/offlineQueue';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import {
   createQueueController,
   type QueueStorage,
@@ -39,6 +43,7 @@ import {
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
+import type { Transaction } from '@/store/types';
 
 export type Hydration = 'idle' | 'loading' | 'ready' | 'failed';
 
@@ -47,14 +52,20 @@ export interface CoordinatorScope {
   householdId: string;
 }
 
+export type PendingOpKind = 'create' | 'update' | 'delete';
+
 export interface CoordinatorState {
   hydration: Hydration;
-  /** Current-scope transaction-create ops (FIFO). Includes terminal-failed. */
+  /** Current-scope transaction ops (FIFO). Includes terminal-failed. */
   scopeOps: PendingWrite[];
   /** `scopeOps` entity ids that are still waiting to send (not failed). */
   pendingIds: ReadonlySet<string>;
   /** `scopeOps` entity ids that hit a terminal failure and are held. */
   failedIds: ReadonlySet<string>;
+  /** entity id -> the op kind of its current-scope pending/failed op. */
+  opByEntity: ReadonlyMap<string, PendingOpKind>;
+  /** entity id -> the ORIGINAL service reason for a terminal failure. */
+  failedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
   pendingCount: number;
   lastError: string | null;
   flushing: boolean;
@@ -62,7 +73,7 @@ export interface CoordinatorState {
 
 export type EnqueueOutcome =
   | { ok: true }
-  | { ok: false; reason: 'not-hydrated' | 'persist' | 'cap' };
+  | { ok: false; reason: 'not-hydrated' | 'persist' | 'cap' | 'existing-pending' };
 
 type Timer = ReturnType<typeof setTimeout>;
 
@@ -74,8 +85,13 @@ export interface CoordinatorDeps {
   getRemoteReady: () => boolean;
   /** Live getter — the household's current live card ids (for the dangling-card guard). */
   getKnownCardIds: () => ReadonlySet<string>;
-  /** Live getter — transaction ids present in the current trusted server snapshot. */
-  getServerTransactionIds: () => ReadonlySet<string>;
+  /**
+   * Live getter — the current trusted server snapshot's ACTIVE transactions,
+   * keyed by id. Used for the ack confirmation: CREATE needs "id present",
+   * DELETE needs "id absent", UPDATE needs "row present AND its fields match
+   * the queued draft" (STEP 16-H2-B2 §16/§17).
+   */
+  getServerTransactions: () => ReadonlyMap<string, Transaction>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -99,6 +115,23 @@ export interface PendingWriteCoordinator {
     scope: CoordinatorScope;
     entityId: string;
     payload: NewTransactionDraft;
+  }): Promise<EnqueueOutcome>;
+  /**
+   * STEP 16-H2-B2 — `expectedUpdatedAt` / `originalRawCardId` are FROZEN by
+   * the caller from the snapshot the user opened the edit against. The
+   * coordinator stores them verbatim; it NEVER re-reads a newer token.
+   */
+  enqueueTransactionUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewTransactionDraft;
+    expectedUpdatedAt: string;
+    originalRawCardId: string | null;
+  }): Promise<EnqueueOutcome>;
+  enqueueTransactionDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
   /** Ask for a flush. `includeFailed` first clears the terminal-failed set so
    *  those ops get one more attempt (manual "다시 시도"). */
@@ -124,10 +157,12 @@ export function createPendingWriteCoordinator(
   let scope: CoordinatorScope | null = deps.getScope();
   let lastError: string | null = null;
 
-  /** queueId -> entityId: server accepted it, awaiting refresh confirmation. */
-  const awaitingAck = new Map<string, string>();
+  /** queueId -> { entityId, op }: server accepted it, awaiting refresh confirmation. */
+  const awaitingAck = new Map<string, { entityId: string; op: PendingOpKind }>();
   /** entityId set: terminal failure, retained + excluded from auto-retry. */
   const failedIds = new Set<string>();
+  /** entityId -> original service reason for the terminal failure. */
+  const failedReasons = new Map<string, WriteConflictReason | undefined>();
 
   let backoffTimer: Timer | null = null;
   let backoffAttempt = 0;
@@ -164,7 +199,8 @@ export function createPendingWriteCoordinator(
       let changed = false;
 
       for (const s of result.settled) {
-        awaitingAck.set(s.queueId, s.entityId);
+        const rec = controller.read().find((r) => r.queueId === s.queueId);
+        awaitingAck.set(s.queueId, { entityId: s.entityId, op: rec?.op ?? 'create' });
         changed = true;
       }
       for (const t of result.terminal) {
@@ -172,13 +208,19 @@ export function createPendingWriteCoordinator(
           failedIds.add(t.entityId);
           changed = true;
         }
+        failedReasons.set(t.entityId, t.reason);
         lastError = t.message ?? '전송하지 못한 거래가 있어요';
-        // Persist the terminal marker so a restart still shows "전송 실패"
-        // rather than silently auto-retrying. Best-effort.
+        // Persist the terminal marker (message + reason) so a restart shows
+        // the right "전송 실패" copy and never silently auto-retries.
+        const msg = lastError;
         void controller.mutate((cur) => ({
           next: cur.map((r) =>
-            r.entityId === t.entityId && !r.lastError
-              ? { ...r, lastError: lastError ?? 'terminal' }
+            r.entityId === t.entityId
+              ? {
+                  ...r,
+                  lastError: r.lastError ?? msg ?? 'terminal',
+                  ...(t.reason ? { lastErrorReason: t.reason } : {}),
+                }
               : r,
           ),
           result: 0,
@@ -263,11 +305,29 @@ export function createPendingWriteCoordinator(
           return;
         }
 
-        const serverIds = deps.getServerTransactionIds();
-        const confirmed: string[] = []; // queueIds the server now has
+        const serverRows = deps.getServerTransactions();
+        const knownCards = deps.getKnownCardIds();
+        const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
-        for (const [queueId, entityId] of awaitingAck) {
-          if (serverIds.has(entityId)) confirmed.push(queueId);
+        for (const [queueId, { entityId, op }] of awaitingAck) {
+          let ok: boolean;
+          if (op === 'create') {
+            ok = serverRows.has(entityId);
+          } else if (op === 'delete') {
+            // §17: the snapshot's `transactions` already excludes deleted_at;
+            // so "not present" == deleted/gone, both the desired outcome.
+            ok = !serverRows.has(entityId);
+          } else {
+            // §16: id present is NOT enough — the row's fields must reflect
+            // the queued desired draft (guards against a still-stale snapshot).
+            const row = serverRows.get(entityId);
+            const rec = controller.read().find((r) => r.queueId === queueId);
+            ok =
+              !!row &&
+              rec?.op === 'update' &&
+              serverRowConfirmsUpdate(row, rec.payload, knownCards);
+          }
+          if (ok) confirmed.push(queueId);
           else unconfirmed += 1;
         }
 
@@ -290,7 +350,7 @@ export function createPendingWriteCoordinator(
             // reconcile retries the REMOVAL — never re-runs the write.
             for (const q of confirmed) {
               const rec = controller.read().find((r) => r.queueId === q);
-              if (rec) awaitingAck.set(q, rec.entityId);
+              if (rec) awaitingAck.set(q, { entityId: rec.entityId, op: rec.op });
             }
             scheduleBackoff();
           }
@@ -306,8 +366,12 @@ export function createPendingWriteCoordinator(
 
   function rebuildFailedFromRecords() {
     failedIds.clear();
+    failedReasons.clear();
     for (const r of controller.read()) {
-      if (r.lastError) failedIds.add(r.entityId);
+      if (r.lastError) {
+        failedIds.add(r.entityId);
+        failedReasons.set(r.entityId, r.lastErrorReason);
+      }
     }
   }
 
@@ -339,6 +403,7 @@ export function createPendingWriteCoordinator(
     backoffAttempt = 0;
     awaitingAck.clear();
     failedIds.clear();
+    failedReasons.clear();
     lastError = null;
     // Re-derive failed markers for the NEW scope from durable records.
     if (hydration === 'ready') rebuildFailedFromRecords();
@@ -346,20 +411,11 @@ export function createPendingWriteCoordinator(
     requestFlush();
   }
 
-  async function enqueueTransactionCreate(args: {
-    scope: CoordinatorScope;
-    entityId: string;
-    payload: NewTransactionDraft;
-  }): Promise<EnqueueOutcome> {
+  async function enqueue(record: PendingWrite): Promise<EnqueueOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
       return { ok: false, reason: 'not-hydrated' };
     }
-    const record = makePendingTransactionCreate({
-      scope: args.scope,
-      entityId: args.entityId,
-      payload: args.payload,
-    });
     const outcome = await controller.mutate((cur) => {
       const r = enqueuePendingWrite(cur, record);
       return { next: r.ok ? r.queue : null, result: r };
@@ -367,23 +423,76 @@ export function createPendingWriteCoordinator(
 
     if (outcome.blockedNotHydrated) return { ok: false, reason: 'not-hydrated' };
     if (outcome.result && outcome.result.ok === false) {
-      return { ok: false, reason: 'cap' }; // MAX_PENDING_WRITES reached
+      // 'cap' (MAX_PENDING_WRITES) or 'existing-pending' (a differing op for
+      // the same transaction is already queued — never silently overwritten).
+      return { ok: false, reason: outcome.result.reason };
     }
     if (!outcome.persist.ok) return { ok: false, reason: 'persist' };
 
     emit();
-    requestFlush(); // try immediately; onPass will schedule backoff if offline
+    requestFlush(); // try immediately; onPass schedules backoff if offline
     return { ok: true };
+  }
+
+  function enqueueTransactionCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewTransactionDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingTransactionCreate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+      }),
+    );
+  }
+
+  function enqueueTransactionUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewTransactionDraft;
+    expectedUpdatedAt: string;
+    originalRawCardId: string | null;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingTransactionUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+        originalRawCardId: args.originalRawCardId,
+      }),
+    );
+  }
+
+  function enqueueTransactionDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingTransactionDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
   }
 
   function requestFlush(opts?: { includeFailed?: boolean }): void {
     if (disposed) return;
     if (opts?.includeFailed) {
       failedIds.clear();
+      failedReasons.clear();
       lastError = null;
       // Also drop the durable terminal markers so a restart doesn't re-fail.
       void controller.mutate((cur) => ({
-        next: cur.map((r) => (r.lastError ? { ...r, lastError: undefined } : r)),
+        next: cur.map((r) =>
+          r.lastError || r.lastErrorReason
+            ? { ...r, lastError: undefined, lastErrorReason: undefined }
+            : r,
+        ),
         result: 0,
       }), deps.storage);
       emit();
@@ -408,11 +517,19 @@ export function createPendingWriteCoordinator(
     const opIds = new Set(scopeOps.map((o) => o.entityId));
     const scopedFailed = new Set([...failedIds].filter((id) => opIds.has(id)));
     const pendingIds = new Set([...opIds].filter((id) => !scopedFailed.has(id)));
+    const opByEntity = new Map<string, PendingOpKind>(
+      scopeOps.map((o) => [o.entityId, o.op]),
+    );
+    const failedReasonsScoped = new Map<string, WriteConflictReason | undefined>(
+      [...scopedFailed].map((id) => [id, failedReasons.get(id)]),
+    );
     return {
       hydration,
       scopeOps,
       pendingIds,
       failedIds: scopedFailed,
+      opByEntity,
+      failedReasons: failedReasonsScoped,
       pendingCount: scopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -423,6 +540,8 @@ export function createPendingWriteCoordinator(
     hydrate,
     setScope,
     enqueueTransactionCreate,
+    enqueueTransactionUpdate,
+    enqueueTransactionDelete,
     requestFlush,
     dispose,
     getState,

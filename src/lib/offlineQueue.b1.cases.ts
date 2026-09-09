@@ -14,6 +14,7 @@ import {
   makePendingTransactionCreate,
   makePendingTransactionDelete,
   makePendingTransactionUpdate,
+  serverRowConfirmsUpdate,
   validatePendingWrite,
   type PendingWrite,
 } from '@/lib/offlineQueue';
@@ -475,6 +476,135 @@ export async function runOfflineQueueB1Cases(): Promise<{
     );
   }
 
+  /* --- STEP 16-H2-B2.1/B2.2 — failed UPDATE whose server row is gone --- */
+
+  // 23c — failed UPDATE + server row STILL EXISTS -> normal overlay in
+  // data.transactions + pending; NEVER an orphan (a real row is present, so
+  // showing the un-sent draft as a pending-finance row is the kept policy).
+  {
+    const server = baseFinance();
+    const op = makePendingTransactionUpdate({
+      scope: A, entityId: 'txn-1', payload: draft({ amount: 12000, memo: '점심' }),
+      expectedUpdatedAt: FROZEN, originalRawCardId: null, queueId: 'q1',
+    });
+    const { data, pendingIds, orphanedFailedUpdates } = composeFinance(server, [op], new Set(['txn-1']));
+    const r = data.transactions.find((t) => t.id === 'txn-1')!;
+    check(
+      'CASE 23c failed UPDATE + row present -> draft overlaid on the real row, pending, NOT orphan',
+      r.amount === 12000 && r.memo === '점심' &&
+        pendingIds.includes('txn-1') &&
+        data.transactionMeta['txn-1'] === server.transactionMeta['txn-1'] && // real token kept
+        data.transactions.length === 1 &&
+        orphanedFailedUpdates.length === 0,
+      `row=${JSON.stringify(r)} orphans=${orphanedFailedUpdates.length}`,
+    );
+  }
+
+  // 23d — failed UPDATE + server row MISSING -> DISPLAY-ONLY orphan row.
+  // NOT in data.transactions / pendingIds / transactionMeta (so no finance
+  // calc sees it); IS in orphanedFailedUpdates with the frozen draft fields.
+  {
+    const server = financeWith([], {}); // row deleted on the server
+    const op = makePendingTransactionUpdate({
+      scope: A, entityId: 'txn-gone', payload: draft({ amount: 12000, memo: '점심', category: 'food', type: 'expense' }),
+      expectedUpdatedAt: FROZEN, originalRawCardId: 'card-3', queueId: 'q1',
+    });
+    const { data, pendingIds, hiddenIds, orphanedFailedUpdates } = composeFinance(
+      server, [op], new Set(['txn-gone']),
+    );
+    const orphan = orphanedFailedUpdates.find((t) => t.id === 'txn-gone');
+    check(
+      'CASE 23d failed UPDATE + row gone -> display-only orphan, NOT in data.transactions',
+      !data.transactions.some((t) => t.id === 'txn-gone') &&
+        !pendingIds.includes('txn-gone') &&
+        !('txn-gone' in data.transactionMeta) &&
+        hiddenIds.length === 0 &&
+        !!orphan && orphan.amount === 12000 && orphan.memo === '점심' && orphan.category === 'food',
+      `orphan=${JSON.stringify(orphan)} txns=${data.transactions.map((t) => t.id)} pending=${pendingIds}`,
+    );
+  }
+
+  // 23d2 — AGGREGATE ISOLATION: an active server row is counted; the orphan
+  // amount is NOT (proves stats/budget/합계 inputs stay clean).
+  {
+    const server = financeWith(
+      [serverTxn('txn-a', { type: 'expense', amount: 10000 })],
+      { 'txn-a': serverMeta() },
+    );
+    const op = makePendingTransactionUpdate({
+      scope: A, entityId: 'txn-b', payload: draft({ type: 'expense', amount: 12000 }),
+      expectedUpdatedAt: FROZEN, originalRawCardId: null, queueId: 'q1',
+    });
+    const { data, orphanedFailedUpdates } = composeFinance(server, [op], new Set(['txn-b']));
+    const calcExpense = data.transactions
+      .filter((t) => t.type === 'expense')
+      .reduce((s, t) => s + t.amount, 0);
+    check(
+      'CASE 23d2 orphan amount excluded from finance calc source; server row still counted',
+      calcExpense === 10000 &&
+        data.transactions.length === 1 &&
+        !data.transactions.some((t) => t.id === 'txn-b') &&
+        orphanedFailedUpdates.some((t) => t.id === 'txn-b' && t.amount === 12000),
+      `calcExpense=${calcExpense} txns=${data.transactions.map((t) => t.id)}`,
+    );
+  }
+
+  // 23e — NOT-failed pending UPDATE + server row transiently MISSING -> NOT
+  // synthesized anywhere (no data row, no pendingId, no orphan)
+  {
+    const server = financeWith([], {});
+    const op = makePendingTransactionUpdate({
+      scope: A, entityId: 'txn-wait', payload: draft({ amount: 5 }),
+      expectedUpdatedAt: FROZEN, originalRawCardId: null, queueId: 'q1',
+    });
+    const { data, pendingIds, hiddenIds, orphanedFailedUpdates } = composeFinance(server, [op]); // no failed set
+    check(
+      'CASE 23e pending (not failed) UPDATE + row missing -> nothing synthesized, no orphan',
+      !data.transactions.some((t) => t.id === 'txn-wait') &&
+        !pendingIds.includes('txn-wait') &&
+        !hiddenIds.includes('txn-wait') &&
+        !('txn-wait' in data.transactionMeta) &&
+        orphanedFailedUpdates.length === 0,
+      `txns=${data.transactions.map((t) => t.id)} orphans=${orphanedFailedUpdates.length}`,
+    );
+  }
+
+  // 23f — the orphan path never mutates serverData and returns the SAME
+  // data reference when nothing else applied (only an orphan was produced)
+  {
+    const server = financeWith([], {});
+    const txnsRef = server.transactions;
+    const metaRef = server.transactionMeta;
+    const op = makePendingTransactionUpdate({
+      scope: A, entityId: 'txn-gone', payload: draft({ memo: 'local' }),
+      expectedUpdatedAt: FROZEN, originalRawCardId: null, queueId: 'q1',
+    });
+    const { data, orphanedFailedUpdates } = composeFinance(server, [op], new Set(['txn-gone']));
+    check(
+      'CASE 23f orphan-only compose: serverData untouched, data ref unchanged',
+      server.transactions === txnsRef && server.transactions.length === 0 &&
+        server.transactionMeta === metaRef && !('txn-gone' in server.transactionMeta) &&
+        data === server && data.transactions.length === 0 &&
+        orphanedFailedUpdates.length === 1,
+      `dataSame=${data === server} orphans=${orphanedFailedUpdates.length}`,
+    );
+  }
+
+  // 23g — failed CREATE regression: still overlaid in data.transactions via
+  // the CREATE path (NOT routed to orphanedFailedUpdates)
+  {
+    const server = financeWith([], {});
+    const c = makePendingTransactionCreate({ scope: A, entityId: 'txn-fc', payload: draft({ memo: 'fc' }), queueId: 'q1' });
+    const { data, pendingIds, orphanedFailedUpdates } = composeFinance(server, [c], new Set(['txn-fc']));
+    check(
+      'CASE 23g failed CREATE still overlays as a real synthetic row (unchanged, not orphan)',
+      data.transactions.some((t) => t.id === 'txn-fc' && t.memo === 'fc') &&
+        pendingIds.includes('txn-fc') &&
+        orphanedFailedUpdates.length === 0,
+      `pending=${pendingIds} orphans=${orphanedFailedUpdates.length}`,
+    );
+  }
+
   /* ---------------- response-loss retry contract ---------------- */
 
   // 24 — UPDATE response-loss: the FROZEN expectedUpdatedAt never changes
@@ -513,6 +643,162 @@ export async function runOfflineQueueB1Cases(): Promise<{
         newerToken.ok === false &&
         newerToken.reason === 'existing-pending',
       `same=${sameAgain.ok} newer=${JSON.stringify(newerToken)}`,
+    );
+  }
+
+  /* ---------------- serverRowConfirmsUpdate (STEP 16-H2-B2 §16 ack matcher) ---------------- */
+
+  const NO_CARDS: ReadonlySet<string> = new Set();
+  const LIVE_CARDS: ReadonlySet<string> = new Set(['card-live']);
+  // A server row that exactly reflects `d`.
+  const rowOf = (d: NewTransactionDraft): Transaction => ({
+    id: 'txn-1',
+    type: d.type,
+    category: d.category,
+    amount: d.amount,
+    memo: d.memo,
+    date: d.date,
+    ...(d.paymentMethod !== undefined ? { paymentMethod: d.paymentMethod } : {}),
+    ...(d.cardId !== undefined ? { cardId: d.cardId } : {}),
+    ...(d.installment !== undefined ? { installment: d.installment } : {}),
+    ...(d.splits !== undefined && d.splits.length > 0 ? { splits: d.splits } : {}),
+  });
+
+  // 26 — exact field match -> confirmed
+  {
+    const d = draft({ amount: 4200, memo: 'lunch' });
+    check(
+      'CASE 26 serverRowConfirmsUpdate: exact match -> true',
+      serverRowConfirmsUpdate(rowOf(d), d, NO_CARDS) === true,
+      'exact',
+    );
+  }
+  // 27 — amount differs -> not confirmed
+  {
+    const d = draft({ amount: 4200 });
+    const row = rowOf(draft({ amount: 4201 }));
+    check(
+      'CASE 27 amount mismatch -> false',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === false,
+      'amount',
+    );
+  }
+  // 28 — string amount vs number amount -> Number()-compared, confirmed
+  {
+    const d = draft({ amount: 1500 });
+    const row = { ...rowOf(d), amount: '1500' as unknown as number };
+    check(
+      'CASE 28 amount "1500" == 1500 (Number compare) -> true',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === true,
+      'coerce',
+    );
+  }
+  // 29 — memo undefined on the row vs '' in the draft -> lenient, confirmed
+  {
+    const d = draft({ memo: '' });
+    const row = { ...rowOf(d), memo: undefined as unknown as string };
+    check(
+      'CASE 29 memo undefined vs "" -> true',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === true,
+      'memo empty',
+    );
+  }
+  // 30 — same instant, different ISO spelling -> confirmed
+  {
+    const d = draft({ date: '2026-09-10T09:00:00.000Z' });
+    const row = { ...rowOf(d), date: '2026-09-10T09:00:00+00:00' };
+    check(
+      'CASE 30 date same instant, different string -> true',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === true,
+      'date instant',
+    );
+  }
+  // 31 — category / type differences -> not confirmed
+  {
+    const d = draft();
+    check(
+      'CASE 31 category & type mismatch -> false',
+      serverRowConfirmsUpdate(rowOf(draft({ category: 'cafe' })), d, NO_CARDS) === false &&
+        serverRowConfirmsUpdate(rowOf(draft({ type: 'income' })), d, NO_CARDS) === false,
+      'cat/type',
+    );
+  }
+  // 32 — installment months differ -> not confirmed
+  {
+    const d = draft({ installment: { months: 3 } });
+    const row = rowOf(draft({ installment: { months: 6 } }));
+    check(
+      'CASE 32 installment.months mismatch -> false',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === false,
+      'installment',
+    );
+  }
+  // 33 — paymentMethod differs -> not confirmed
+  {
+    const d = draft({ paymentMethod: 'cash' });
+    const row = rowOf(draft({ paymentMethod: 'credit', cardId: 'card-x' }));
+    check(
+      'CASE 33 paymentMethod mismatch -> false',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === false,
+      'pm',
+    );
+  }
+  // 34 — splits: order-significant compare
+  {
+    const s1 = [
+      { category: 'food', amount: 600 },
+      { category: 'cafe', amount: 400 },
+    ];
+    const d = draft({ amount: 1000, splits: s1 });
+    const same = rowOf(draft({ amount: 1000, splits: s1 }));
+    const reordered = rowOf(
+      draft({ amount: 1000, splits: [s1[1], s1[0]] }),
+    );
+    check(
+      'CASE 34 splits match in order -> true; reordered -> false',
+      serverRowConfirmsUpdate(same, d, NO_CARDS) === true &&
+        serverRowConfirmsUpdate(reordered, d, NO_CARDS) === false,
+      'splits',
+    );
+  }
+  // 35 — splits length differs -> not confirmed
+  {
+    const d = draft({ splits: [{ category: 'food', amount: 1000 }] });
+    const row = rowOf(draft({ splits: undefined }));
+    check(
+      'CASE 35 splits length mismatch -> false',
+      serverRowConfirmsUpdate(row, d, NO_CARDS) === false,
+      'splits len',
+    );
+  }
+  // 36 — cardId mismatch, draft card is CURRENTLY LIVE -> disqualifying
+  {
+    const d = draft({ paymentMethod: 'credit', cardId: 'card-live' });
+    const row = rowOf(draft({ paymentMethod: 'credit', cardId: 'card-other' }));
+    check(
+      'CASE 36 cardId mismatch + draft card is live -> false',
+      serverRowConfirmsUpdate(row, d, LIVE_CARDS) === false,
+      'live card',
+    );
+  }
+  // 37 — cardId mismatch, draft card NOT live (dangling / soft-deleted) -> lenient, confirmed
+  {
+    const d = draft({ paymentMethod: 'credit', cardId: 'card-dangling' });
+    const row = { ...rowOf(d), cardId: undefined as unknown as string };
+    check(
+      'CASE 37 cardId mismatch + draft card NOT live -> true (lenient)',
+      serverRowConfirmsUpdate(row, d, LIVE_CARDS) === true,
+      'dangling card',
+    );
+  }
+  // 38 — cardId exactly equal -> confirmed regardless of liveness set
+  {
+    const d = draft({ paymentMethod: 'credit', cardId: 'card-live' });
+    check(
+      'CASE 38 cardId exact equal -> true',
+      serverRowConfirmsUpdate(rowOf(d), d, LIVE_CARDS) === true &&
+        serverRowConfirmsUpdate(rowOf(d), d, NO_CARDS) === true,
+      'equal card',
     );
   }
 

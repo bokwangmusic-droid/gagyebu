@@ -14,6 +14,7 @@ import { sumByType } from '@/lib/aggregate';
 import { fmt, toDateKey } from '@/lib/format';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { hasSplits } from '@/lib/splits';
+import { pendingTransactionRowLabel } from '@/lib/pendingTransactionLabel';
 import { periodRange, prevPeriodRange } from '@/lib/period';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
@@ -34,8 +35,8 @@ export default function AllTransactions() {
     customCats,
     cards,
     refresh,
-    pendingTransactionIds,
-    failedTransactionIds,
+    pendingTransactionOps,
+    failedLocalTransactions,
   } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
@@ -183,6 +184,87 @@ export default function AllTransactions() {
         </View>
       )}
 
+      {/* STEP 16-H2-B2.2: display-only failed offline UPDATEs whose server
+          row was deleted elsewhere. Shown regardless of the period filter
+          (they need attention) — NOT real transactions, excluded from every
+          total, read-only, no edit entry. */}
+      {failedLocalTransactions.length > 0 && (
+        <View style={{ marginBottom: spacing.md }}>
+          <Text
+            style={{
+              fontFamily: fontFamily.bold,
+              fontSize: 11,
+              letterSpacing: 0.2,
+              color: colors.textSub,
+              marginHorizontal: spacing.xl,
+              marginBottom: 6,
+            }}
+          >
+            전송하지 못한 수정
+          </Text>
+          <View
+            style={{
+              marginHorizontal: spacing.lg,
+              backgroundColor: colors.white,
+              borderWidth: 1,
+              borderColor: colors.border,
+              borderRadius: radii.xxl,
+              paddingHorizontal: spacing.lg,
+            }}
+          >
+            {failedLocalTransactions.map(({ transaction: t, op, reason }, idx) => {
+              const cat = getCat(t.category, t.type, customCats);
+              return (
+                <View
+                  key={`failed-local-${t.id}`}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    gap: spacing.md,
+                    paddingVertical: 10,
+                    borderTopWidth: idx === 0 ? 0 : 1,
+                    borderTopColor: colors.track,
+                    opacity: 0.6,
+                  }}
+                >
+                  <View
+                    style={{
+                      width: 34,
+                      height: 34,
+                      borderRadius: 11,
+                      backgroundColor: cat.bg,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <AppIcon name={cat.icon} size={16} color={cat.color} />
+                  </View>
+                  <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+                    <Text numberOfLines={1} style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}>
+                      {t.memo || cat.name}
+                    </Text>
+                    <Text numberOfLines={1} style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+                      {pendingTransactionRowLabel({ op, failed: true, reason })}
+                    </Text>
+                  </View>
+                  <Text
+                    style={{
+                      fontFamily: fontFamily.bold,
+                      fontSize: 13,
+                      color: t.type === 'income' ? colors.incomeStrong : colors.text,
+                      ...tabularNums,
+                    }}
+                  >
+                    {t.type === 'income' ? '+' : '−'}
+                    {fmt(t.amount)}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
+        </View>
+      )}
+
       {filtered.length === 0 ? (
         <EmptyState icon="calendar" title="내역이 없어요" sub="아직 저장된 지출/수입이 없어요" />
       ) : (
@@ -226,11 +308,8 @@ export default function AllTransactions() {
                         t.installment ? ` ${t.installment.months}개월 할부` : ''
                       }`
                     : '';
-                const pendingState = failedTransactionIds.has(t.id)
-                  ? 'failed'
-                  : pendingTransactionIds.has(t.id)
-                    ? 'pending'
-                    : null;
+                const opState = pendingTransactionOps.get(t.id);
+                const pendingState = opState ? (opState.failed ? 'failed' : 'pending') : null;
                 return (
                   <Pressable
                     key={t.id}
@@ -267,11 +346,9 @@ export default function AllTransactions() {
                         {t.memo || cat.name}
                       </Text>
                       <Text numberOfLines={1} style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-                        {pendingState === 'failed'
-                          ? '전송 실패 · 아래로 당겨 다시 시도'
-                          : pendingState === 'pending'
-                            ? '전송 대기'
-                            : `${hm} · ${cat.name}${hasSplits(t) ? ` · 분할 ${t.splits!.length}` : ''}${card ? ` · ${card}` : ''}`}
+                        {opState
+                          ? pendingTransactionRowLabel(opState)
+                          : `${hm} · ${cat.name}${hasSplits(t) ? ` · 분할 ${t.splits!.length}` : ''}${card ? ` · ${card}` : ''}`}
                       </Text>
                     </View>
                     <Text

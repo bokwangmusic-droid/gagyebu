@@ -16,6 +16,7 @@ import { cardBillingForMonth } from '@/lib/card';
 import { fmt, formatMonthLabel, formatRelativeDateTime, toDateKey } from '@/lib/format';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { buildInsights, type Insight } from '@/lib/insights';
+import { pendingTransactionRowLabel } from '@/lib/pendingTransactionLabel';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -45,8 +46,8 @@ export default function HomeScreen() {
     cards,
     budgets,
     refresh,
-    pendingTransactionIds,
-    failedTransactionIds,
+    pendingTransactionOps,
+    failedLocalTransactions,
   } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
   const { income, expense, byCategory, totalBudget, remaining } = useMemo(
@@ -382,7 +383,7 @@ export default function HomeScreen() {
         <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>전체보기 →</Text>
       </Pressable>
 
-      {recent.length === 0 ? (
+      {recent.length === 0 && failedLocalTransactions.length === 0 ? (
         <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.md, paddingBottom: spacing.xxl }}>
           <View
             style={{
@@ -408,13 +409,11 @@ export default function HomeScreen() {
               row when transaction editing is off. */}
           {recent.map((t, i) => {
             const cat = getCat(t.category, t.type, customCats);
-            // STEP 16-H2-A2: an offline pending CREATE is visible but
-            // read-only until it sends (no UPDATE/DELETE queue yet).
-            const pendingState = failedTransactionIds.has(t.id)
-              ? 'failed'
-              : pendingTransactionIds.has(t.id)
-                ? 'pending'
-                : null;
+            // STEP 16-H2-A2/B2: an offline pending CREATE/UPDATE is visible,
+            // and a FAILED DELETE keeps its server row visible — all
+            // read-only until the queue settles.
+            const opState = pendingTransactionOps.get(t.id);
+            const pendingState = opState ? (opState.failed ? 'failed' : 'pending') : null;
             return (
               <Pressable
                 key={t.id}
@@ -454,11 +453,9 @@ export default function HomeScreen() {
                     {t.memo || cat.name}
                   </Text>
                   <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-                    {pendingState === 'failed'
-                      ? '전송 실패 · 아래로 당겨 다시 시도'
-                      : pendingState === 'pending'
-                        ? '전송 대기'
-                        : `${formatRelativeDateTime(t.date)} · ${cat.name}`}
+                    {opState
+                      ? pendingTransactionRowLabel(opState)
+                      : `${formatRelativeDateTime(t.date)} · ${cat.name}`}
                   </Text>
                 </View>
                 <Text
@@ -473,6 +470,61 @@ export default function HomeScreen() {
                   {fmt(t.amount)}원
                 </Text>
               </Pressable>
+            );
+          })}
+          {/* STEP 16-H2-B2.2: display-only rows for a failed offline UPDATE
+              whose server row was deleted elsewhere. NOT real transactions
+              (excluded from every total) — read-only, no edit entry. */}
+          {failedLocalTransactions.map(({ transaction: t, op, reason }, i) => {
+            const cat = getCat(t.category, t.type, customCats);
+            return (
+              <View
+                key={`failed-local-${t.id}`}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: spacing.md,
+                  paddingVertical: 10,
+                  borderTopWidth: recent.length === 0 && i === 0 ? 0 : 1,
+                  borderTopColor: colors.track,
+                  opacity: 0.6,
+                }}
+              >
+                <View
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 11,
+                    backgroundColor: cat.bg,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <AppIcon name={cat.icon} size={16} color={cat.color} />
+                </View>
+                <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+                  <Text
+                    numberOfLines={1}
+                    style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
+                  >
+                    {t.memo || cat.name}
+                  </Text>
+                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+                    {pendingTransactionRowLabel({ op, failed: true, reason })}
+                  </Text>
+                </View>
+                <Text
+                  style={{
+                    fontFamily: fontFamily.bold,
+                    fontSize: 13,
+                    color: t.type === 'income' ? colors.incomeStrong : colors.text,
+                    ...tabularNums,
+                  }}
+                >
+                  {t.type === 'income' ? '+' : '−'}
+                  {fmt(t.amount)}원
+                </Text>
+              </View>
             );
           })}
         </Card>

@@ -626,6 +626,39 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       originalRawCardId: mode.meta.rawCardId,
     });
     if (!res.ok) {
+      // STEP 16-H2-B2: a TRANSPORT failure (offline) -> durable UPDATE queue
+      // fallback. The FROZEN mount snapshot goes in verbatim — `token`
+      // (expectedUpdatedAtRef, captured at mount) and `mode.meta.rawCardId` —
+      // so the optimistic-concurrency check stays meaningful when the flush
+      // finally runs. The coordinator NEVER re-reads a newer token.
+      if (res.transport === true) {
+        const enq = await pending.enqueueTransactionUpdate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: mode.transaction.id,
+          payload: draft,
+          expectedUpdatedAt: token,
+          originalRawCardId: mode.meta.rawCardId,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        // Durable enqueue failed — DO NOT claim success, keep the form.
+        toast.show(
+          enq.reason === 'existing-pending'
+            ? '이미 전송 대기 중인 변경이 있어요.'
+            : enq.reason === 'not-hydrated'
+              ? '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.'
+              : enq.reason === 'cap'
+                ? '오프라인에 저장할 수 있는 거래 수를 초과했어요. 인터넷 연결 후 다시 시도해주세요.'
+                : '수정을 저장하지 못했어요. 잠시 후 다시 시도해주세요.',
+        );
+        return;
+      }
       submittingRef.current = false;
       setSubmitting(false);
       if (res.reason === 'identity' || res.reason === 'error') {
@@ -677,6 +710,35 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('삭제했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-B2: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue fallback with the FROZEN mount token (`token`). composeFinance
+    // hides the row from every useFinanceRead consumer right away.
+    if (res.transport === true) {
+      const enq = await pending.enqueueTransactionDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: mode.transaction.id,
+        expectedUpdatedAt: token,
+      });
+      deletingRef.current = false;
+      setDeleting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        router.back();
+        return;
+      }
+      toast.show(
+        enq.reason === 'existing-pending'
+          ? '이미 전송 대기 중인 변경이 있어요.'
+          : enq.reason === 'not-hydrated'
+            ? '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.'
+            : enq.reason === 'cap'
+              ? '오프라인에 저장할 수 있는 거래 수를 초과했어요. 인터넷 연결 후 다시 시도해주세요.'
+              : '삭제하지 못했어요. 잠시 후 다시 시도해주세요.',
+      );
       return;
     }
 
