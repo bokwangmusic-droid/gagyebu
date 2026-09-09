@@ -36,7 +36,18 @@ function insightTone(tone: Insight['tone']): { bg: string; fg: string } {
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { status, error, transactions, planned, customCats, cards, budgets, refresh } = useFinanceRead();
+  const {
+    status,
+    error,
+    transactions,
+    planned,
+    customCats,
+    cards,
+    budgets,
+    refresh,
+    pendingTransactionIds,
+    failedTransactionIds,
+  } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
   const { income, expense, byCategory, totalBudget, remaining } = useMemo(
     () => monthlyTotals(transactions, budgets),
@@ -397,11 +408,22 @@ export default function HomeScreen() {
               row when transaction editing is off. */}
           {recent.map((t, i) => {
             const cat = getCat(t.category, t.type, customCats);
+            // STEP 16-H2-A2: an offline pending CREATE is visible but
+            // read-only until it sends (no UPDATE/DELETE queue yet).
+            const pendingState = failedTransactionIds.has(t.id)
+              ? 'failed'
+              : pendingTransactionIds.has(t.id)
+                ? 'pending'
+                : null;
             return (
               <Pressable
                 key={t.id}
-                onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
-                disabled={!REMOTE_FINANCE_WRITE.transactionEdit}
+                onPress={
+                  pendingState
+                    ? undefined
+                    : () => router.push({ pathname: '/input', params: { id: t.id } })
+                }
+                disabled={!!pendingState || !REMOTE_FINANCE_WRITE.transactionEdit}
                 style={{
                   flexDirection: 'row',
                   alignItems: 'center',
@@ -409,6 +431,7 @@ export default function HomeScreen() {
                   paddingVertical: 10,
                   borderTopWidth: i === 0 ? 0 : 1,
                   borderTopColor: colors.track,
+                  opacity: pendingState ? 0.6 : 1,
                 }}
               >
                 <View
@@ -431,7 +454,11 @@ export default function HomeScreen() {
                     {t.memo || cat.name}
                   </Text>
                   <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-                    {formatRelativeDateTime(t.date)} · {cat.name}
+                    {pendingState === 'failed'
+                      ? '전송 실패 · 아래로 당겨 다시 시도'
+                      : pendingState === 'pending'
+                        ? '전송 대기'
+                        : `${formatRelativeDateTime(t.date)} · ${cat.name}`}
                   </Text>
                 </View>
                 <Text

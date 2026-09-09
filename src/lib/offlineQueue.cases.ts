@@ -6,8 +6,10 @@ import { DEFAULT_CAT_ORDER, DEFAULT_CUSTOM_CATS } from '@/data/categories';
 import type { RemoteFinanceData } from '@/lib/remoteFinanceMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
+  FLUSH_BACKOFF_MS,
   QUEUE_SCHEMA_VERSION,
   composeFinance,
+  computeBackoffDelay,
   enqueuePendingWrite,
   makePendingTransactionCreate,
   opsForScope,
@@ -280,6 +282,17 @@ export async function runOfflineQueueCases(): Promise<{
         a.length === 3 &&
         a[0] === 'txn-1699999999003-c',
       `a=${JSON.stringify(a)}`,
+    );
+  }
+
+  // CASE 13 — computeBackoffDelay: 5s -> 15s -> 30s -> 60s, held at 60s
+  {
+    const seq = [0, 1, 2, 3, 4, 10].map(computeBackoffDelay);
+    check(
+      'CASE 13 computeBackoffDelay ramps then holds at 60s',
+      JSON.stringify(seq) === JSON.stringify([5000, 15000, 30000, 60000, 60000, 60000]) &&
+        computeBackoffDelay(-3) === FLUSH_BACKOFF_MS[0],
+      `seq=${JSON.stringify(seq)}`,
     );
   }
 

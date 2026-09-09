@@ -26,10 +26,12 @@ import { useCallback, useRef, useState, type ReactElement } from 'react';
 import { RefreshControl, type RefreshControlProps } from 'react-native';
 
 import { useFinanceRead } from '@/store/financeRead';
+import { usePendingWrites } from '@/store/pendingFinance';
 import { colors } from '@/theme/tokens';
 
 export function useRemoteFinanceRefreshControl(): ReactElement<RefreshControlProps> | undefined {
   const { status, refresh } = useFinanceRead();
+  const { requestFlush } = usePendingWrites();
   const [refreshing, setRefreshing] = useState(false);
   const busyRef = useRef(false);
 
@@ -37,13 +39,17 @@ export function useRemoteFinanceRefreshControl(): ReactElement<RefreshControlPro
     if (busyRef.current) return;
     busyRef.current = true;
     setRefreshing(true);
+    // STEP 16-H2-A2: a pull is also the "다시 시도" gesture for pending /
+    // failed offline creates. Fire-and-forget so the gesture isn't held by
+    // the flush (single-flight, own backoff); then do the authoritative read.
+    requestFlush({ includeFailed: true });
     try {
       await refresh();
     } finally {
       busyRef.current = false;
       setRefreshing(false);
     }
-  }, [refresh]);
+  }, [refresh, requestFlush]);
 
   if (status !== 'ready') return undefined;
 

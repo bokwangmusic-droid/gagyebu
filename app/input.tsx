@@ -47,6 +47,7 @@ import {
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { PaymentMethod, Transaction } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
@@ -267,6 +268,9 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   // rendered at all (FinanceLoadState gate below), so cards/customCats/
   // catOrder are always trusted household data wherever they are used.
   const { status, error, cards, customCats, catOrder, refresh } = useFinanceRead();
+  // STEP 16-H2-A2: durable offline fallback for a transaction CREATE whose
+  // direct write hit a TRANSPORT failure. Never used for edit/delete.
+  const pending = usePendingWrites();
 
   // In edit mode, `editing` seeds every field; the concurrency token is
   // captured ONCE here (useRef initial value) from the meta this form was
@@ -550,19 +554,52 @@ function TransactionForm({ mode }: { mode: FormMode }) {
         draft,
         knownCardIds,
       });
-      if (!res.ok) {
-        // transactionIdRef is unchanged — a retry reuses the same id.
-        submittingRef.current = false;
-        setSubmitting(false);
-        toast.show(res.message);
+
+      if (res.ok) {
+        // Authoritative remote refresh, then leave — no optimistic local
+        // write, no stale-closure re-check (STEP 16-G2-A2 §13/§19).
+        await refresh();
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('저장했어요');
+        router.back();
         return;
       }
-      // Authoritative remote refresh, then leave — no optimistic local
-      // write, no stale-closure re-check (STEP 16-G2-A2 §13/§19).
-      await refresh();
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      toast.show('저장했어요');
-      router.back();
+
+      // STEP 16-H2-A2: a TRANSPORT failure (offline) -> durable queue
+      // fallback. The SAME client id (transactionIdRef, never regenerated)
+      // and SAME draft go into the PendingWrite, so a later flush replays
+      // the exact request and its 23505 reconcile stays idempotent.
+      if (res.transport === true) {
+        const enq = await pending.enqueueTransactionCreate({
+          entityId: transactionIdRef.current,
+          payload: draft,
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('저장했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        // Durable enqueue failed — DO NOT claim success, keep the form.
+        toast.show(
+          enq.reason === 'not-hydrated'
+            ? '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.'
+            : enq.reason === 'cap'
+              ? '오프라인에 저장할 수 있는 거래 수를 초과했어요. 인터넷 연결 후 다시 시도해주세요.'
+              : '거래를 저장하지 못했어요. 잠시 후 다시 시도해주세요.',
+        );
+        return;
+      }
+
+      // A non-transport terminal failure (identity / 23505 mismatch / …) —
+      // existing behaviour: message + stay. transactionIdRef is unchanged so
+      // a manual retry reuses the same id.
+      submittingRef.current = false;
+      setSubmitting(false);
+      toast.show(res.message);
       return;
     }
 

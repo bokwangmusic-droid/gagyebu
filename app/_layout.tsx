@@ -11,6 +11,7 @@ import { maybeAutoBackup } from '@/lib/backup';
 import { computeMissedOccurrences } from '@/lib/recurring';
 import { AuthProvider, useAuth } from '@/store/auth';
 import { HouseholdProvider, useHousehold } from '@/store/household';
+import { PendingWritesProvider } from '@/store/pendingFinance';
 import { RemoteFinanceProvider } from '@/store/remoteFinance';
 import { StoreProvider, useStore } from '@/store/store';
 import { colors } from '@/theme/tokens';
@@ -362,12 +363,18 @@ export default function RootLayout() {
                 touched by StoreProvider's persist-to-AsyncStorage effect.
                 See src/store/remoteFinance.tsx's header. */}
             <RemoteFinanceProvider>
-              <StoreProvider>
-                <ToastProvider>
-                  <StatusBar style="dark" />
-                  <RootNav />
-                </ToastProvider>
-              </StoreProvider>
+              {/* STEP 16-H2-A2: durable UNSENT finance writes (transaction
+                  CREATE only for now). Reads scope from Auth/Household and
+                  the trusted snapshot + refresh from RemoteFinanceProvider;
+                  never owns or copies the authoritative snapshot itself. */}
+              <PendingWritesProvider>
+                <StoreProvider>
+                  <ToastProvider>
+                    <StatusBar style="dark" />
+                    <RootNav />
+                  </ToastProvider>
+                </StoreProvider>
+              </PendingWritesProvider>
             </RemoteFinanceProvider>
           </HouseholdProvider>
         </AuthProvider>

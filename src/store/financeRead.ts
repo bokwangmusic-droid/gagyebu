@@ -33,8 +33,10 @@ import type {
   RemoteRecurringMeta,
   RemoteTransactionMeta,
 } from '@/lib/remoteFinanceMapping';
+import { composeFinance } from '@/lib/offlineQueue';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import { useRemoteFinance } from '@/store/remoteFinance';
 import type { BudgetMap, CreditCard, Goal, Loan, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
@@ -117,6 +119,21 @@ export interface FinanceReadResult {
   notes: string;
   catOrder: CatOrderMap;
 
+  /**
+   * STEP 16-H2-A2: transaction ids that are on screen ONLY because of a
+   * durable offline CREATE that hasn't sent yet ("전송 대기"). A superset
+   * `transactions`/`transactionMeta` already include the synthetic rows.
+   * Empty unless the offline queue is hydrated and has current-scope pending
+   * creates the server snapshot doesn't have.
+   */
+  pendingTransactionIds: ReadonlySet<string>;
+  /**
+   * STEP 16-H2-A2: pending-create transaction ids whose send hit a TERMINAL
+   * failure and are being held for a manual retry ("전송 실패"). Also present
+   * in `transactions` — a terminal failure never removes the user's row.
+   */
+  failedTransactionIds: ReadonlySet<string>;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -141,12 +158,19 @@ const EMPTY_SLICES = {
   customCats: DEFAULT_CUSTOM_CATS,
   notes: '',
   catOrder: DEFAULT_CAT_ORDER,
+  pendingTransactionIds: new Set<string>() as ReadonlySet<string>,
+  failedTransactionIds: new Set<string>() as ReadonlySet<string>,
 };
 
 export function useFinanceRead(): FinanceReadResult {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { data, error, loadedForUserId, loadedForHouseholdId, refreshRemoteFinance } = useRemoteFinance();
+  const {
+    pendingTransactionCreateOps,
+    failedTransactionIds: providerFailedIds,
+    hydrationReady,
+  } = usePendingWrites();
 
   // Same minimum trust condition as app/remote-data-preview.tsx — checked
   // again here rather than trusting any single upstream flag, so a bug in
@@ -160,6 +184,19 @@ export function useFinanceRead(): FinanceReadResult {
 
   return useMemo<FinanceReadResult>(() => {
     if (trusted && data) {
+      // STEP 16-H2-A2: overlay durable offline transaction CREATEs onto the
+      // authoritative snapshot. `composeFinance` never mutates `data`; it
+      // returns the same reference when nothing applies.
+      const { data: composed, pendingIds } =
+        hydrationReady && pendingTransactionCreateOps.length > 0
+          ? composeFinance(data, pendingTransactionCreateOps)
+          : { data, pendingIds: [] as string[] };
+      const overlaid = new Set(pendingIds);
+      const failed = new Set<string>();
+      const pending = new Set<string>();
+      for (const id of overlaid) {
+        (providerFailedIds.has(id) ? failed : pending).add(id);
+      }
       return {
         status: 'ready',
         ready: true,
@@ -167,8 +204,10 @@ export function useFinanceRead(): FinanceReadResult {
         error: null,
         readOnly: true,
         source: 'remote',
-        transactions: data.transactions,
-        transactionMeta: data.transactionMeta,
+        transactions: composed.transactions,
+        transactionMeta: composed.transactionMeta,
+        pendingTransactionIds: pending,
+        failedTransactionIds: failed,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -214,5 +253,13 @@ export function useFinanceRead(): FinanceReadResult {
       ...EMPTY_SLICES,
       refresh: refreshRemoteFinance,
     };
-  }, [trusted, data, error, refreshRemoteFinance]);
+  }, [
+    trusted,
+    data,
+    error,
+    refreshRemoteFinance,
+    hydrationReady,
+    pendingTransactionCreateOps,
+    providerFailedIds,
+  ]);
 }

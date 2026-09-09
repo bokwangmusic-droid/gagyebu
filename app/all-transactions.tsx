@@ -27,7 +27,16 @@ const WD = ['일', '월', '화', '수', '목', '금', '토'];
 export default function AllTransactions() {
   const router = useRouter();
   const params = useLocalSearchParams<{ filter?: string; scope?: string }>();
-  const { status, error, transactions, customCats, cards, refresh } = useFinanceRead();
+  const {
+    status,
+    error,
+    transactions,
+    customCats,
+    cards,
+    refresh,
+    pendingTransactionIds,
+    failedTransactionIds,
+  } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
   const [filter, setFilter] = useState<Filter>((params.filter as Filter) || 'all');
@@ -217,11 +226,20 @@ export default function AllTransactions() {
                         t.installment ? ` ${t.installment.months}개월 할부` : ''
                       }`
                     : '';
+                const pendingState = failedTransactionIds.has(t.id)
+                  ? 'failed'
+                  : pendingTransactionIds.has(t.id)
+                    ? 'pending'
+                    : null;
                 return (
                   <Pressable
                     key={t.id}
-                    onPress={() => router.push({ pathname: '/input', params: { id: t.id } })}
-                    disabled={!REMOTE_FINANCE_WRITE.transactionEdit}
+                    onPress={
+                      pendingState
+                        ? undefined
+                        : () => router.push({ pathname: '/input', params: { id: t.id } })
+                    }
+                    disabled={!!pendingState || !REMOTE_FINANCE_WRITE.transactionEdit}
                     style={{
                       flexDirection: 'row',
                       alignItems: 'center',
@@ -229,6 +247,7 @@ export default function AllTransactions() {
                       paddingVertical: 10,
                       borderTopWidth: idx === 0 ? 0 : 1,
                       borderTopColor: colors.track,
+                      opacity: pendingState ? 0.6 : 1,
                     }}
                   >
                     <View
@@ -248,9 +267,11 @@ export default function AllTransactions() {
                         {t.memo || cat.name}
                       </Text>
                       <Text numberOfLines={1} style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-                        {hm} · {cat.name}
-                        {hasSplits(t) ? ` · 분할 ${t.splits!.length}` : ''}
-                        {card ? ` · ${card}` : ''}
+                        {pendingState === 'failed'
+                          ? '전송 실패 · 아래로 당겨 다시 시도'
+                          : pendingState === 'pending'
+                            ? '전송 대기'
+                            : `${hm} · ${cat.name}${hasSplits(t) ? ` · 분할 ${t.splits!.length}` : ''}${card ? ` · ${card}` : ''}`}
                       </Text>
                     </View>
                     <Text

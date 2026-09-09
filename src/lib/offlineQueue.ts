@@ -18,6 +18,16 @@ import type { Transaction } from '@/store/types';
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
 
+/**
+ * Transport-failure retry backoff (STEP 16-H2-A2 §10): 5s -> 15s -> 30s ->
+ * 60s, then held at 60s. `attempt` is 0-based (0 = the first retry). Pure.
+ */
+export const FLUSH_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000] as const;
+export function computeBackoffDelay(attempt: number): number {
+  const i = Math.min(Math.max(0, Math.floor(attempt)), FLUSH_BACKOFF_MS.length - 1);
+  return FLUSH_BACKOFF_MS[i];
+}
+
 export interface PendingWriteScope {
   userId: string;
   householdId: string;
