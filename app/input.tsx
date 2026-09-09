@@ -8,6 +8,7 @@ import {
   BackHandler,
   Keyboard,
   KeyboardAvoidingView,
+  type LayoutChangeEvent,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -68,6 +69,16 @@ const INSTALLMENT_PRESETS = ['3', '6', '12'];
 
 const KEY_HEIGHT = 52;
 const KEY_GAP = 6;
+
+/**
+ * Breathing room left ABOVE the 결제수단 section (which now holds the
+ * freshly-rendered 신용카드 panel) when it is auto-scrolled into view —
+ * cosmetic padding on top of a *measured* onLayout coordinate, NOT a guessed
+ * scroll position (see the credit auto-scroll handler below).
+ */
+const CREDIT_SCROLL_HEADROOM = 16;
+/** Same idea for the 할부 상세 (개월 / preset / 직접 / preview) block. */
+const INSTALLMENT_SCROLL_HEADROOM = 12;
 
 /** YYYY-MM-DD shifted by n days. */
 function shiftDateKey(key: string, days: number): string {
@@ -485,6 +496,100 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   const deletingRef = useRef(false);
   const [deleting, setDeleting] = useState(false);
 
+  // ---- 결제수단 section auto-scroll (input auto-scroll fix) ----
+  // The form is ONE <ScrollView>; the number pad is a normal-flow sibling
+  // BELOW it (styles.numPad, no overlay), so opening it flex-shrinks the
+  // ScrollView. We track the ScrollView's OWN onLayout height as the real
+  // visible viewport (no numPad-height spacer — that double-counted the pad
+  // and over-scrolled). Targets are summed direct-parent onLayout offsets —
+  // no measureLayout/findNodeHandle (they throw on Android RN).
+  //
+  // Three ONE-SHOT intents, one consumer each, armed only by a direct tap:
+  //   creditScrollArmRef      "신용" chip  -> handlePaySectionLayout   (top-align)
+  //   installmentScrollArmRef "할부" chip  -> handleInstallmentBlockLayout (top-align)
+  //   pendingDirectScrollRef  "직접" box (pad closed) -> ScrollView onLayout
+  //     (fires once the pad has shrunk the viewport) -> BOTTOM-align above pad
+  const formScrollRef = useRef<ScrollView>(null);
+  const creditScrollArmRef = useRef(false);
+  const installmentScrollArmRef = useRef(false);
+  const pendingDirectScrollRef = useRef(false);
+  // Measured, cached-fresh geometry (all from plain onLayout events):
+  const paySectionYRef = useRef(0); // paySection.y in the scroll content
+  const creditPanelYRef = useRef(0); // creditPanel.y in paySection
+  const installmentBlockYRef = useRef(0); // 할부 상세 block.y in creditPanel
+  const installmentBlockHeightRef = useRef(0); // 할부 상세 block height
+  const formViewportHeightRef = useRef(0); // ScrollView's own visible height
+
+  /** 할부 상세 block top in scroll-content coords (summed parent offsets). */
+  const installmentBlockTop = () =>
+    paySectionYRef.current + creditPanelYRef.current + installmentBlockYRef.current;
+
+  /** "할부" path: bring the block's TOP just inside the viewport. */
+  const scrollInstallmentIntoView = () => {
+    formScrollRef.current?.scrollTo({
+      y: Math.max(0, installmentBlockTop() - INSTALLMENT_SCROLL_HEADROOM),
+      animated: true,
+    });
+  };
+
+  /** "직접" path: the number pad is up, so BOTTOM-align — the block's bottom
+   *  edge sits ~gap inside the (shrunk) viewport, right above the pad, not
+   *  yanked to the top. Falls back to top-align only if the block is taller
+   *  than the viewport. All measured, no fixed pixel target. */
+  const scrollInstallmentAbovePad = () => {
+    const top = installmentBlockTop();
+    const blockH = installmentBlockHeightRef.current;
+    const viewportH = formViewportHeightRef.current;
+    if (viewportH <= 0 || blockH <= 0) {
+      scrollInstallmentIntoView();
+      return;
+    }
+    const y =
+      blockH + INSTALLMENT_SCROLL_HEADROOM * 2 <= viewportH
+        ? top + blockH - viewportH + INSTALLMENT_SCROLL_HEADROOM // bottom-align
+        : top - INSTALLMENT_SCROLL_HEADROOM; // block bigger than viewport
+    formScrollRef.current?.scrollTo({ y: Math.max(0, y), animated: true });
+  };
+
+  /** ScrollView onLayout — records its real visible height. When a "직접"
+   *  scroll is pending (set only by a direct 직접 tap while the pad was
+   *  closed), this fires right after the pad mounts and shrinks the
+   *  ScrollView, so the measured height is already the post-shrink one. */
+  const handleFormScrollLayout = (e: LayoutChangeEvent) => {
+    formViewportHeightRef.current = e.nativeEvent.layout.height;
+    if (!pendingDirectScrollRef.current) return;
+    pendingDirectScrollRef.current = false;
+    requestAnimationFrame(scrollInstallmentAbovePad);
+  };
+
+  /** 결제수단 section onLayout — caches paySection.y; when the "신용" intent is
+   *  armed, brings the section (now holding the 신용카드 panel) to the top. */
+  const handlePaySectionLayout = (e: LayoutChangeEvent) => {
+    paySectionYRef.current = e.nativeEvent.layout.y;
+    if (!creditScrollArmRef.current) return;
+    creditScrollArmRef.current = false;
+    formScrollRef.current?.scrollTo({
+      y: Math.max(0, paySectionYRef.current - CREDIT_SCROLL_HEADROOM),
+      animated: true,
+    });
+  };
+
+  /** 신용카드 panel onLayout — caches its offset within paySection. */
+  const handleCreditPanelLayout = (e: LayoutChangeEvent) => {
+    creditPanelYRef.current = e.nativeEvent.layout.y;
+  };
+
+  /** 할부 상세 block onLayout — caches its y + height; when the "할부" intent
+   *  is armed (block just mounted from a 할부 tap), scroll it into view. A
+   *  later onLayout from 개월/preview 높이 변경 just refreshes the cache. */
+  const handleInstallmentBlockLayout = (e: LayoutChangeEvent) => {
+    installmentBlockYRef.current = e.nativeEvent.layout.y;
+    installmentBlockHeightRef.current = e.nativeEvent.layout.height;
+    if (!installmentScrollArmRef.current) return;
+    installmentScrollArmRef.current = false;
+    scrollInstallmentIntoView();
+  };
+
   /** Draft-state -> NewTransactionDraft, or null when the form isn't valid. */
   const buildDraft = (): NewTransactionDraft | null => {
     // Defensive re-validation — the DB has CHECK/FK constraints but we do
@@ -871,8 +976,10 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       {/* One vertical scroll for the whole form — only the header above and the
           keypad below stay fixed. */}
       <ScrollView
+        ref={formScrollRef}
         style={styles.formScroll}
         contentContainerStyle={styles.formContent}
+        onLayout={handleFormScrollLayout}
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
       >
@@ -1193,7 +1300,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
           )}
 
           {type === 'expense' && (
-            <View style={styles.paySection}>
+            <View style={styles.paySection} onLayout={handlePaySectionLayout}>
               <Text style={styles.catLabel}>결제수단 (선택)</Text>
               <View style={styles.payMethodRow}>
                 {PAY_METHODS.map((pm) => {
@@ -1204,7 +1311,13 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                       onPress={() => {
                         tap();
                         setPaymentMethod(active ? undefined : pm.value);
-                        if (pm.value === 'credit' && !active) setPadVisible(false);
+                        if (pm.value === 'credit' && !active) {
+                          setPadVisible(false);
+                          // non-credit -> credit by a DIRECT user tap: arm the
+                          // one-shot auto-scroll so the 신용카드 panel that is
+                          // about to render is brought into view.
+                          creditScrollArmRef.current = true;
+                        }
                       }}
                       style={[styles.payChip, active && styles.payChipOn]}
                     >
@@ -1217,7 +1330,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
               </View>
 
               {paymentMethod === 'credit' && (
-                <View style={styles.creditPanel}>
+                <View style={styles.creditPanel} onLayout={handleCreditPanelLayout}>
                   <Text style={styles.creditLabel}>카드</Text>
                   <View style={styles.payChipRow}>
                     {cards.map((c) => {
@@ -1260,6 +1373,12 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                           key={k}
                           onPress={() => {
                             tap();
+                            if (k === 'inst' && !installmentOn) {
+                              // non-installment -> 할부 by a DIRECT user tap:
+                              // arm the one-shot auto-scroll for the 할부 상세
+                              // block that is about to render.
+                              installmentScrollArmRef.current = true;
+                            }
                             setInstallmentOn(k === 'inst');
                             setPadVisible(false);
                           }}
@@ -1274,7 +1393,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                   </View>
 
                   {installmentOn && (
-                    <>
+                    <View onLayout={handleInstallmentBlockLayout}>
                       <Text style={[styles.creditLabel, { marginTop: 12 }]}>할부 개월</Text>
                       <View style={styles.payChipRow}>
                         {INSTALLMENT_PRESETS.map((m) => {
@@ -1296,8 +1415,21 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                         })}
                         <Pressable
                           onPress={() => {
+                            // "직접": open the pad for custom months, then
+                            // bottom-align the 할부 상세 block just above it.
+                            //   pad already open -> viewport already shrunk &
+                            //     measured, so one rAF is enough;
+                            //   pad closed -> mark the intent; the ScrollView's
+                            //     onLayout fires once the pad has shrunk it and
+                            //     runs the scroll with the post-shrink height.
+                            const padWasOpen = numTarget !== null;
                             Keyboard.dismiss();
                             setNumTarget({ kind: 'installment' });
+                            if (padWasOpen) {
+                              requestAnimationFrame(scrollInstallmentAbovePad);
+                            } else {
+                              pendingDirectScrollRef.current = true;
+                            }
                           }}
                           style={[
                             styles.instInput,
@@ -1331,7 +1463,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                       ) : (
                         <Text style={styles.creditWarn}>할부는 2개월 이상이어야 해요.</Text>
                       )}
-                    </>
+                    </View>
                   )}
                 </View>
               )}
