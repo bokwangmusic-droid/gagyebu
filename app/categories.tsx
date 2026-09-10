@@ -29,6 +29,11 @@ import {
   type IconKey,
   type TxnType,
 } from '@/data/categories';
+import {
+  CATEGORY_DELETE_MSG,
+  categoryDeleteFailureToast,
+  gateCategoryDelete,
+} from '@/lib/categoryDeleteFlow';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { uid } from '@/lib/id';
 import { pendingCategoryRowLabel } from '@/lib/pendingCategoryLabel';
@@ -39,11 +44,10 @@ import {
 } from '@/lib/remoteCategoryWriteMapping';
 import type { RemoteBudgetMeta, RemoteCategoryMeta } from '@/lib/remoteFinanceMapping';
 import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
-import { softDeleteBudget } from '@/services/remoteBudgetWrite';
+import { softDeleteCustomCategoryWithBudget } from '@/services/remoteCategoryBudgetWrite';
 import {
   createCustomCategory,
   saveCategoryOrder,
-  softDeleteCustomCategory,
   updateCustomCategory,
 } from '@/services/remoteCategoryWrite';
 import { useAuth } from '@/store/auth';
@@ -121,7 +125,7 @@ function CategoriesManager({
   const toast = useToast();
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
-  const { status, categoryManagementRows, pendingCategoryOps } = useFinanceRead();
+  const { status, categoryManagementRows, pendingCategoryOps, pendingBudgetOps } = useFinanceRead();
   // STEP 16-H2-C2-B2: durable offline fallback for a category CREATE / UPDATE
   // whose direct write hit a TRANSPORT failure. DELETE is deliberately NOT
   // wired here — its offline path stays blocked on the Budget queue (§19).
@@ -353,26 +357,28 @@ function CategoriesManager({
     toast.show('다른 곳에서 변경됐거나 삭제된 카테고리예요. 최신 내용을 불러왔어요.');
   };
 
-  /* ---------------- delete (A+C) ---------------- */
+  /* ---------------- delete (atomic category + budget RPC) ---------------- */
 
   const confirmDelete = (id: string, name: string) => {
-    if (!canDelete || deletingRef.current) return;
-    if (isPendingRow(id)) return; // §12: a pending / failed row is read-only
-    // STEP 16-G2-C4-B §17: capture BOTH tokens at initiation (before the
-    // Alert), so a background refresh can't swap them under us.
-    const categoryToken = categoryMeta[id]?.updatedAt ?? null;
-    if (!categoryToken) {
-      toast.show('카테고리 정보를 다시 불러온 뒤 삭제해 주세요.');
+    // STEP 16-G2-C4-B §17 / STEP 16-H2 A3 §11: BOTH tokens are read here, once,
+    // BEFORE the Alert — a background refresh must not be able to swap them
+    // under us, and `doDelete` never re-reads a fresher token. §9: an un-sent
+    // offline BUDGET op for this same category is refused here (no queue merge
+    // in A3). All branching lives in the pure `gateCategoryDelete`.
+    const gate = gateCategoryDelete({
+      canDelete,
+      deleting: deletingRef.current,
+      categoryRowPending: isPendingRow(id), // §12: a pending / failed row is read-only
+      budgetOpPending: pendingBudgetOps.has(id),
+      categoryToken: categoryMeta[id]?.updatedAt ?? null,
+      hasLiveBudget: Object.prototype.hasOwnProperty.call(budgets, id),
+      budgetToken: budgetMeta[id]?.updatedAt ?? null,
+    });
+    if (!gate.proceed) {
+      if (gate.toast) toast.show(gate.toast);
       return;
     }
-    const hasLiveBudget = Object.prototype.hasOwnProperty.call(budgets, id);
-    const budgetToken = hasLiveBudget ? budgetMeta[id]?.updatedAt ?? null : null;
-    if (hasLiveBudget && !budgetToken) {
-      // A live budget with no meta -> a safe concurrency-guarded budget
-      // delete is impossible; do NOT start a blind category delete.
-      toast.show('예산 정보를 다시 불러온 뒤 삭제해 주세요.');
-      return;
-    }
+    const { categoryToken, budgetToken } = gate; // frozen for the Alert closure
 
     Alert.alert(
       `${name} 카테고리를 삭제할까요?`,
@@ -395,54 +401,36 @@ function CategoriesManager({
     deletingRef.current = true;
     setDeletingId(id);
 
-    // 1. category soft delete FIRST.
-    const catRes = await softDeleteCustomCategory({
-      id,
+    // ONE atomic Postgres transaction (STEP 16-H2-C2-BUDGET): the category
+    // and — if the snapshot at confirm time carried one — its budget are both
+    // tombstoned, or neither is. "category deleted / budget still active" is
+    // no longer representable, so the old two-write orphan-budget path is gone
+    // with it. Both tokens were captured in `confirmDelete` before the Alert;
+    // `budgetToken === null` means "snapshot had no live budget" and is itself
+    // a server-side guard (a budget that appeared since -> conflict).
+    const res = await softDeleteCustomCategoryWithBudget({
       householdId: activeHousehold.id,
+      categoryId: id,
       expectedUserId: session.user.id,
-      expectedUpdatedAt: categoryToken,
+      expectedCategoryUpdatedAt: categoryToken,
+      expectedBudgetUpdatedAt: budgetToken,
     });
-
-    if (!catRes.ok) {
-      // §22: category failed -> do NOT attempt the budget delete.
-      await refresh();
-      deletingRef.current = false;
-      setDeletingId(null);
-      if (catRes.reason === 'identity' || catRes.reason === 'error') {
-        toast.show(catRes.message);
-        return;
-      }
-      toast.show('다른 곳에서 변경됐거나 삭제된 카테고리예요. 최신 내용을 불러왔어요.');
-      return;
-    }
-
-    // 2. A+C: only if the snapshot had a live budget for this category.
-    if (budgetToken) {
-      const budRes = await softDeleteBudget({
-        householdId: activeHousehold.id,
-        expectedUserId: session.user.id,
-        category: id,
-        expectedUpdatedAt: budgetToken,
-      });
-      await refresh();
-      deletingRef.current = false;
-      setDeletingId(null);
-      if (budRes.ok) {
-        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-        toast.show('카테고리를 삭제했어요');
-        return;
-      }
-      // §22: category is deleted; do NOT roll it back. Orphan budget is the
-      // benign policy-A state — surface it clearly.
-      toast.show('카테고리는 삭제됐지만 예산 정리에 실패했어요. 예산 관리에서 확인해 주세요.');
-      return;
-    }
 
     await refresh();
     deletingRef.current = false;
     setDeletingId(null);
-    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-    toast.show('카테고리를 삭제했어요');
+
+    if (res.ok) {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      toast.show(CATEGORY_DELETE_MSG.success);
+      return;
+    }
+
+    // A3 §5/§6: the atomic RPC contract means a failure mutated NEITHER table,
+    // so there is no partial-success ("category gone / budget orphaned") line
+    // left to describe — one message per reason, resolved by the pure helper.
+    // A transport failure is a plain "try again"; A3 does NOT enqueue DELETE.
+    toast.show(categoryDeleteFailureToast(res));
   };
 
   /* ---------------- reorder (shared, household_settings) ---------------- */
