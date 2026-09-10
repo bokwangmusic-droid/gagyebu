@@ -33,6 +33,7 @@ import {
   CATEGORY_DELETE_MSG,
   categoryDeleteFailureToast,
   gateCategoryDelete,
+  shouldEnqueueCompositeDelete,
 } from '@/lib/categoryDeleteFlow';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { uid } from '@/lib/id';
@@ -126,9 +127,9 @@ function CategoriesManager({
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, categoryManagementRows, pendingCategoryOps, pendingBudgetOps } = useFinanceRead();
-  // STEP 16-H2-C2-B2: durable offline fallback for a category CREATE / UPDATE
-  // whose direct write hit a TRANSPORT failure. DELETE is deliberately NOT
-  // wired here — its offline path stays blocked on the Budget queue (§19).
+  // Durable offline fallback for a direct write that hit a TRANSPORT failure:
+  // category CREATE / UPDATE (STEP 16-H2-C2-B2) and — STEP 16-H2 A4.4 — the
+  // composite atomic category+budget DELETE via `enqueueCategoryBudgetDelete`.
   const pending = usePendingWrites();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
@@ -170,12 +171,14 @@ function CategoriesManager({
   const canDelete = REMOTE_FINANCE_WRITE.categoryDelete;
   const canReorder = REMOTE_FINANCE_WRITE.categoryReorder;
 
-  /** "변경 버리기" — drop the local failed UPDATE record; the authoritative
-   *  server category is never touched (§3). */
+  /** "변경 버리기" — drop the local failed record (a terminal-failed UPDATE,
+   *  or an A4.4 terminal-failed composite category+budget DELETE); the
+   *  authoritative server category AND budget are never touched (§3 / A4.4
+   *  §13). One `discardPending(queueId)` for either kind. */
   const discardFailed = (queueId: string) => {
     Alert.alert(
-      '실패한 수정 내용을 버릴까요?',
-      '다른 기기에 저장된 최신 카테고리는 그대로 유지됩니다.',
+      '실패한 변경을 버릴까요?',
+      '다른 기기에 저장된 최신 카테고리와 예산은 그대로 유지됩니다.',
       [
         { text: '취소', style: 'cancel' },
         {
@@ -184,7 +187,7 @@ function CategoriesManager({
           onPress: () => {
             void (async () => {
               const r = await pending.discardPending(queueId);
-              if (r.ok) toast.show('실패한 수정 내용을 버렸어요');
+              if (r.ok) toast.show('실패한 변경을 버렸어요');
               else toast.show('변경을 버리지 못했어요. 잠시 후 다시 시도해주세요.');
             })();
           },
@@ -401,13 +404,11 @@ function CategoriesManager({
     deletingRef.current = true;
     setDeletingId(id);
 
-    // ONE atomic Postgres transaction (STEP 16-H2-C2-BUDGET): the category
-    // and — if the snapshot at confirm time carried one — its budget are both
-    // tombstoned, or neither is. "category deleted / budget still active" is
-    // no longer representable, so the old two-write orphan-budget path is gone
-    // with it. Both tokens were captured in `confirmDelete` before the Alert;
-    // `budgetToken === null` means "snapshot had no live budget" and is itself
-    // a server-side guard (a budget that appeared since -> conflict).
+    // DIRECT-FIRST (A3): ONE atomic Postgres transaction — the category and —
+    // if the confirm-time snapshot carried one — its budget are both
+    // tombstoned, or neither is. Both tokens were frozen in `confirmDelete`
+    // before the Alert; `budgetToken === null` means "snapshot had no live
+    // budget" and is itself a server-side guard.
     const res = await softDeleteCustomCategoryWithBudget({
       householdId: activeHousehold.id,
       categoryId: id,
@@ -415,6 +416,33 @@ function CategoriesManager({
       expectedCategoryUpdatedAt: categoryToken,
       expectedBudgetUpdatedAt: budgetToken,
     });
+
+    // STEP 16-H2 A4.4 — a TRANSPORT failure (offline) is the ONLY outcome that
+    // earns a durable fallback: enqueue the SAME ONE composite record with the
+    // SAME two frozen tokens (never re-read). No `refresh()` on this path — an
+    // offline refresh would just fail, and the A4.3 read-model projection
+    // hides the row on both management screens straight off the queue state.
+    // `deletingRef` stays set through the enqueue so a double-tap can't slip a
+    // second RPC in.
+    if (!res.ok && shouldEnqueueCompositeDelete(res)) {
+      const enq = await pending.enqueueCategoryBudgetDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: id,
+        expectedCategoryUpdatedAt: categoryToken,
+        expectedBudgetUpdatedAt: budgetToken,
+      });
+      deletingRef.current = false;
+      setDeletingId(null);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show(CATEGORY_DELETE_MSG.offlineQueued);
+        return;
+      }
+      // Durable persist failed / cap / existing-pending -> DO NOT claim
+      // success; the row stays visible. Raw coordinator reasons are never shown.
+      toast.show(enqueueFailMessage(enq.reason));
+      return;
+    }
 
     await refresh();
     deletingRef.current = false;
@@ -426,10 +454,8 @@ function CategoriesManager({
       return;
     }
 
-    // A3 §5/§6: the atomic RPC contract means a failure mutated NEITHER table,
-    // so there is no partial-success ("category gone / budget orphaned") line
-    // left to describe — one message per reason, resolved by the pure helper.
-    // A transport failure is a plain "try again"; A3 does NOT enqueue DELETE.
+    // conflict / gone / identity / generic non-transport error — one message
+    // per reason. No auto-retry, no token re-fetch (A3 §5/§6).
     toast.show(categoryDeleteFailureToast(res));
   };
 

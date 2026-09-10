@@ -45,6 +45,18 @@
  * and, for budget specifically, `monthlyTotals` / every other finance
  * aggregate that reads `data.budgets` directly — only ever see authoritative
  * server data. No cross-entity chaining is structurally possible.
+ *
+ * STEP 16-H2 A4.1 (PURE CORE ONLY): adds ONE more variant,
+ * `PendingCategoryBudgetDelete` (`entity: 'categoryBudget'`, `op: 'delete'`
+ * only) - the durable form of an ATOMIC "custom category + its related
+ * budget" soft delete, carrying TWO frozen tokens
+ * (`expectedCategoryUpdatedAt`, `expectedBudgetUpdatedAt: string | null`).
+ * It is deliberately NOT decomposed into a `PendingCategoryDelete` +
+ * `PendingBudgetDelete`; its replay (a later step, A4.2) is ONE
+ * `softDeleteCustomCategoryWithBudget()` call. `schemaVersion` STILL 1 - a
+ * stored transaction/card/category/budget queue loads with no migration; the
+ * new record simply has `entity:'categoryBudget'`. No runOp / coordinator /
+ * read-model / projection change lands in A4.1.
  */
 import type { Category, CustomCatMap } from '@/data/categories';
 import { isValidBudgetDraft, type NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
@@ -80,7 +92,7 @@ export interface PendingWriteScope {
  * optimistic-concurrency token lives in `expectedUpdatedAt` (UPDATE/DELETE),
  * NOT in `payload`.
  */
-export type PendingEntity = 'transaction' | 'card' | 'category' | 'budget';
+export type PendingEntity = 'transaction' | 'card' | 'category' | 'budget' | 'categoryBudget';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -246,6 +258,38 @@ export interface PendingBudgetDelete extends PendingWriteBase {
   expectedUpdatedAt: string;
 }
 
+/* ---- composite category + budget delete (STEP 16-H2 A4.1) ---- */
+
+/**
+ * The durable form of an ATOMIC "soft-delete this custom category AND its
+ * (optional) related budget" intent. Replayed (A4.2) through ONE call to
+ * `softDeleteCustomCategoryWithBudget()` (the
+ * `delete_custom_category_with_budget` RPC) — NEVER decomposed into a
+ * `PendingCategoryDelete` + `PendingBudgetDelete`. `op` is only ever
+ * `'delete'` (there is no composite CREATE/UPDATE).
+ *
+ * `entityId` IS the `category_id` — the same natural key
+ * `PendingCategoryDelete` / `PendingBudget*` use.
+ *
+ * BOTH tokens are FROZEN at enqueue time and handed to the RPC verbatim on
+ * every replay — never recomputed, never refreshed to a newer value (the
+ * same rule as every other UPDATE/DELETE record in this file).
+ * `expectedBudgetUpdatedAt === null` is an EXPLICIT optimistic-concurrency
+ * value meaning "the caller's snapshot had NO active budget for this
+ * category at delete-intent time" (a budget that has appeared since is a
+ * conflict) — it is NOT "don't care about the budget", and a record that is
+ * MISSING the field entirely is malformed (see `validatePendingWrite`).
+ */
+export interface PendingCategoryBudgetDelete extends PendingWriteBase {
+  entity: 'categoryBudget';
+  op: 'delete';
+  /** FROZEN — `custom_categories.updated_at` at delete-confirm time. */
+  expectedCategoryUpdatedAt: string;
+  /** FROZEN — `budgets.updated_at` at delete-confirm time, or `null` when
+   *  the snapshot had NO active budget for this category. */
+  expectedBudgetUpdatedAt: string | null;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
@@ -258,7 +302,8 @@ export type PendingWrite =
   | PendingCategoryDelete
   | PendingBudgetCreate
   | PendingBudgetUpdate
-  | PendingBudgetDelete;
+  | PendingBudgetDelete
+  | PendingCategoryBudgetDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -414,7 +459,8 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     r.entity !== 'transaction' &&
     r.entity !== 'card' &&
     r.entity !== 'category' &&
-    r.entity !== 'budget'
+    r.entity !== 'budget' &&
+    r.entity !== 'categoryBudget'
   ) {
     return null;
   }
@@ -503,6 +549,30 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
     if ('payload' in r) return null; // a DELETE carries no user payload
     return { ...base, entity: 'budget', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'categoryBudget') {
+    // STEP 16-H2 A4.1 — composite atomic category+budget delete. ONLY
+    // `op: 'delete'`; carries two independently-named frozen tokens and NO
+    // `payload` / base `expectedUpdatedAt`.
+    if (r.op !== 'delete') return null;
+    if ('payload' in r) return null;
+    if ('expectedUpdatedAt' in r) return null; // uses the two named tokens, not the base one
+    if (!isNonEmptyString(r.expectedCategoryUpdatedAt)) return null;
+    // `expectedBudgetUpdatedAt` MUST be present: an explicit `null` is a
+    // valid semantic value ("no active budget at delete-intent time"), but a
+    // record MISSING the key is malformed.
+    if (!('expectedBudgetUpdatedAt' in r)) return null;
+    if (r.expectedBudgetUpdatedAt !== null && !isNonEmptyString(r.expectedBudgetUpdatedAt)) {
+      return null;
+    }
+    return {
+      ...base,
+      entity: 'categoryBudget',
+      op: 'delete',
+      expectedCategoryUpdatedAt: r.expectedCategoryUpdatedAt,
+      expectedBudgetUpdatedAt: r.expectedBudgetUpdatedAt as string | null,
+    };
   }
 
   // ---- transaction ----
@@ -816,6 +886,33 @@ export function makePendingBudgetDelete(args: {
   };
 }
 
+export function makePendingCategoryBudgetDelete(args: {
+  scope: PendingWriteScope;
+  /** = the category_id natural key. */
+  entityId: string;
+  /** FROZEN — `custom_categories.updated_at` the user confirmed delete against. */
+  expectedCategoryUpdatedAt: string;
+  /** FROZEN — `budgets.updated_at` captured at the SAME moment, or `null`
+   *  when the snapshot had no active budget. An explicit `null` is preserved
+   *  verbatim (never coerced to `undefined` / a missing key). */
+  expectedBudgetUpdatedAt: string | null;
+  queueId?: string;
+  now?: () => string;
+}): PendingCategoryBudgetDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'categoryBudget',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedCategoryUpdatedAt: args.expectedCategoryUpdatedAt,
+    expectedBudgetUpdatedAt: args.expectedBudgetUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -914,6 +1011,21 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
       return a.expectedUpdatedAt === b.expectedUpdatedAt && Number(a.payload.amount) === Number(b.payload.amount);
     }
     if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
+  }
+
+  if (a.entity === 'categoryBudget' && b.entity === 'categoryBudget') {
+    // op is 'delete' on both (established above). The EXACT same request iff
+    // BOTH frozen tokens match: `null === null` is the same request, `null`
+    // vs a string is a DIFFERENT request (-> `existing-pending`, never a
+    // silent overwrite), and a differing category-only or budget-only token
+    // is likewise different.
+    if (a.op === 'delete' && b.op === 'delete') {
+      return (
+        a.expectedCategoryUpdatedAt === b.expectedCategoryUpdatedAt &&
+        a.expectedBudgetUpdatedAt === b.expectedBudgetUpdatedAt
+      );
+    }
     return false;
   }
 
@@ -1233,6 +1345,9 @@ function composeCategoryManagement(
   serverCats: CustomCatMap,
   ops: readonly PendingWrite[],
   failedCategoryIds?: ReadonlySet<string>,
+  /** STEP 16-H2 A4.3 — bare category-id set of TERMINAL-failed composite
+   *  (`entity:'categoryBudget'`) deletes for the current scope. */
+  failedCategoryBudgetIds?: ReadonlySet<string>,
 ): CategoryManagementView {
   const opById = new Map<string, 'create' | 'update' | 'delete'>();
   const failedIds = new Set<string>();
@@ -1243,7 +1358,15 @@ function composeCategoryManagement(
     (o): o is PendingCategoryCreate | PendingCategoryUpdate | PendingCategoryDelete =>
       o.entity === 'category',
   );
-  if (catOps.length === 0) {
+  // STEP 16-H2 A4.3 — a composite category+budget delete projects the SAME
+  // visual meaning as a single-table category delete onto THIS view (hide
+  // the row while pending; restore + mark it failed on a terminal). The
+  // record is NEVER converted to a `PendingCategoryDelete` — it stays its own
+  // `entity:'categoryBudget'` record and only its DELETE effect is mirrored.
+  const cbDeletes = ops.filter(
+    (o): o is PendingCategoryBudgetDelete => o.entity === 'categoryBudget',
+  );
+  if (catOps.length === 0 && cbDeletes.length === 0) {
     return { rows: serverCats, opById, failedIds, hiddenIds, syntheticIds, attemptedNameById };
   }
 
@@ -1311,6 +1434,24 @@ function composeCategoryManagement(
       hit.list.splice(hit.idx, 1);
       hiddenIds.push(op.entityId);
     }
+  }
+
+  // STEP 16-H2 A4.3 — composite deletes, applied AFTER the single-table
+  // category ops so that, in a malformed/legacy state where BOTH somehow
+  // target the same id (the A4.2 collision guard normally prevents it), the
+  // single-table op wins deterministically and this is a no-op — never a
+  // crash, never a precedence system.
+  for (const op of cbDeletes) {
+    if (opById.has(op.entityId)) continue; // a single-table category op already covers this id
+    const hit = findIn(op.entityId);
+    if (!hit) continue; // no authoritative category behind it (composite is never synthetic)
+    if (failedCategoryBudgetIds?.has(op.entityId)) {
+      opById.set(op.entityId, 'delete'); // restore + mark: authoritative row stays visible
+      failedIds.add(op.entityId);
+      continue;
+    }
+    hit.list.splice(hit.idx, 1); // not-failed pending delete -> optimistic hide
+    hiddenIds.push(op.entityId);
   }
 
   return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedNameById };
@@ -1382,6 +1523,9 @@ function composeBudgetManagement(
   serverBudgets: BudgetMap,
   ops: readonly PendingWrite[],
   failedBudgetIds?: ReadonlySet<string>,
+  /** STEP 16-H2 A4.3 — bare category-id set of TERMINAL-failed composite
+   *  (`entity:'categoryBudget'`) deletes for the current scope. */
+  failedCategoryBudgetIds?: ReadonlySet<string>,
 ): BudgetManagementView {
   const opById = new Map<string, 'create' | 'update' | 'delete'>();
   const failedIds = new Set<string>();
@@ -1391,7 +1535,16 @@ function composeBudgetManagement(
   const budgetOps = ops.filter(
     (o): o is PendingBudgetCreate | PendingBudgetUpdate | PendingBudgetDelete => o.entity === 'budget',
   );
-  if (budgetOps.length === 0) {
+  // STEP 16-H2 A4.3 — a composite category+budget delete mirrors a single-table
+  // budget DELETE's visual meaning here: hide the authoritative row while
+  // pending, restore + mark it failed on a terminal. It NEVER creates a
+  // synthetic budget row (a budget that was absent at intent time — incl. an
+  // `expectedBudgetUpdatedAt: null` record — stays absent here), and is never
+  // turned into a `PendingBudgetDelete`.
+  const cbDeletes = ops.filter(
+    (o): o is PendingCategoryBudgetDelete => o.entity === 'categoryBudget',
+  );
+  if (budgetOps.length === 0 && cbDeletes.length === 0) {
     return { rows: serverBudgets, opById, failedIds, hiddenIds, syntheticIds, attemptedAmountById };
   }
 
@@ -1466,6 +1619,23 @@ function composeBudgetManagement(
       delete rows[catId];
       hiddenIds.push(catId);
     }
+  }
+
+  // STEP 16-H2 A4.3 — composite deletes, applied AFTER the single-table budget
+  // ops (deterministic single-table-wins no-op if both ever target one id).
+  // NO synthetic row is ever created: a category with no authoritative budget
+  // is simply skipped.
+  for (const op of cbDeletes) {
+    const catId = op.entityId;
+    if (opById.has(catId)) continue; // a single-table budget op already covers this id
+    if (!hasServerRow(catId)) continue; // no authoritative budget -> nothing to hide / mark
+    if (failedCategoryBudgetIds?.has(catId)) {
+      opById.set(catId, 'delete'); // restore + mark: authoritative amount stays visible
+      failedIds.add(catId);
+      continue;
+    }
+    delete rows[catId]; // not-failed pending delete -> optimistic hide
+    hiddenIds.push(catId);
   }
 
   return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedAmountById };
@@ -1633,14 +1803,24 @@ export function composeFinance(
   failedCardIds?: ReadonlySet<string>,
   failedCategoryIds?: ReadonlySet<string>,
   failedBudgetIds?: ReadonlySet<string>,
+  /** STEP 16-H2 A4.3 — bare category-id set of TERMINAL-failed composite
+   *  category+budget deletes; drives the failed-vs-pending branch of the
+   *  composite-delete projection in BOTH management views. */
+  failedCategoryBudgetIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
   const categoryManagement = composeCategoryManagement(
     serverData.customCats,
     ops,
     failedCategoryIds,
+    failedCategoryBudgetIds,
   );
-  const budgetManagement = composeBudgetManagement(serverData.budgets, ops, failedBudgetIds);
+  const budgetManagement = composeBudgetManagement(
+    serverData.budgets,
+    ops,
+    failedBudgetIds,
+    failedCategoryBudgetIds,
+  );
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {

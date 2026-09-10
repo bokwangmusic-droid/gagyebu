@@ -34,6 +34,7 @@ import type {
   RemoteTransactionMeta,
 } from '@/lib/remoteFinanceMapping';
 import { composeFinance } from '@/lib/offlineQueue';
+import { buildPendingBudgetOps, buildPendingCategoryOps } from '@/lib/pendingManagementView';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { usePendingWrites } from '@/store/pendingFinance';
@@ -202,6 +203,12 @@ export interface FinanceReadResult {
    *                        tried; conflict metadata ONLY (the displayed row is
    *                        the authoritative server name when it still exists).
    * `reason` / `attemptedName` are only set when `failed` is true.
+   *
+   * STEP 16-H2 A4.3: a composite category+budget delete (`entity:'categoryBudget'`)
+   * also produces a `{ op: 'delete', synthetic: false, queueId, reason? }`
+   * entry here — same shape, the `queueId` is the composite record's, and
+   * `discardPending(queueId)` drops that one record (which clears the marker
+   * on BOTH the category and the budget screen next render).
    */
   pendingCategoryOps: ReadonlyMap<
     string,
@@ -227,10 +234,16 @@ export interface FinanceReadResult {
    */
   budgetManagementRows: BudgetMap;
   /**
-   * category id -> its pending offline-op state, for a future budget row
-   * label / read-only gate. Mirrors `pendingCategoryOps`, with
-   * `attemptedAmount` (number) in place of `attemptedName`. `reason` /
-   * `attemptedAmount` are only set when `failed` is true.
+   * category id -> its pending offline-op state, for the budget row label /
+   * read-only gate. Mirrors `pendingCategoryOps`, with `attemptedAmount`
+   * (number) in place of `attemptedName`. `reason` / `attemptedAmount` are
+   * only set when `failed` is true.
+   *
+   * STEP 16-H2 A4.3: a composite category+budget delete also produces a
+   * `{ op: 'delete', synthetic: false, queueId, reason? }` entry here (only
+   * when the category had an authoritative budget row) — the SAME composite
+   * `queueId` that appears in `pendingCategoryOps`, so a discard from either
+   * screen removes the one shared record.
    */
   pendingBudgetOps: ReadonlyMap<
     string,
@@ -298,6 +311,9 @@ export function useFinanceRead(): FinanceReadResult {
     pendingBudgetOps: providerBudgetOps,
     budgetFailedReasons,
     failedBudgetIds: providerFailedBudgetIds,
+    pendingCategoryBudgetOps: providerCategoryBudgetOps,
+    categoryBudgetFailedReasons,
+    failedCategoryBudgetIds: providerFailedCategoryBudgetIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -322,16 +338,24 @@ export function useFinanceRead(): FinanceReadResult {
         providerOps.length > 0 ||
         providerCardOps.length > 0 ||
         providerCategoryOps.length > 0 ||
-        providerBudgetOps.length > 0;
+        providerBudgetOps.length > 0 ||
+        providerCategoryBudgetOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
               data,
-              [...providerOps, ...providerCardOps, ...providerCategoryOps, ...providerBudgetOps],
+              [
+                ...providerOps,
+                ...providerCardOps,
+                ...providerCategoryOps,
+                ...providerBudgetOps,
+                ...providerCategoryBudgetOps,
+              ],
               providerFailedIds,
               providerFailedCardIds,
               providerFailedCategoryIds,
               providerFailedBudgetIds,
+              providerFailedCategoryBudgetIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -362,37 +386,20 @@ export function useFinanceRead(): FinanceReadResult {
       const categoryManagementRows = composedResult
         ? composedResult.categoryManagement.rows
         : data.customCats;
-      const pendingCategoryOps = new Map<
-        string,
-        {
-          op: 'create' | 'update' | 'delete';
-          failed: boolean;
-          reason?: WriteConflictReason;
-          queueId?: string;
-          synthetic: boolean;
-          attemptedName?: string;
-        }
-      >();
-      if (composedResult) {
-        const cm = composedResult.categoryManagement;
-        for (const [id, op] of cm.opById) {
-          const isFailed = cm.failedIds.has(id);
-          // `providerCategoryOps` is the durable `PendingWrite[]` — one op per
-          // (entity,id) by the dedup rule, so `find` gives the queueId for
-          // "변경 버리기".
-          const rec = providerCategoryOps.find((o) => o.entityId === id);
-          pendingCategoryOps.set(id, {
-            op,
-            failed: isFailed,
-            synthetic: cm.syntheticIds.has(id),
-            ...(rec ? { queueId: rec.queueId } : {}),
-            ...(isFailed ? { reason: categoryFailedReasons.get(id) } : {}),
-            ...(isFailed && cm.attemptedNameById.has(id)
-              ? { attemptedName: cm.attemptedNameById.get(id) }
-              : {}),
-          });
-        }
-      }
+      // STEP 16-H2 A4.3 — `buildPendingCategoryOps` folds the composite
+      // (`categoryBudget`) delete's marker into the SAME map the UI already
+      // reads, resolving its `queueId` + failure `reason` from the composite
+      // queue when no single-table category op backs the id (A4.2 collision
+      // invariant: never both). No fabricated `PendingCategoryDelete`.
+      const pendingCategoryOps: FinanceReadResult['pendingCategoryOps'] = composedResult
+        ? buildPendingCategoryOps(
+            composedResult.categoryManagement,
+            providerCategoryOps,
+            providerCategoryBudgetOps,
+            categoryFailedReasons,
+            categoryBudgetFailedReasons,
+          )
+        : new Map();
       // STEP 16-H2-C2-BUDGET A1: budget display-only surface. `composeFinance`
       // NEVER folded a budget row into `composed.budgets` — it feeds
       // `budgetManagement` only. `budgets`/`budgetMeta` below stay
@@ -400,34 +407,20 @@ export function useFinanceRead(): FinanceReadResult {
       const budgetManagementRows = composedResult
         ? composedResult.budgetManagement.rows
         : data.budgets;
-      const pendingBudgetOps = new Map<
-        string,
-        {
-          op: 'create' | 'update' | 'delete';
-          failed: boolean;
-          reason?: WriteConflictReason;
-          queueId?: string;
-          synthetic: boolean;
-          attemptedAmount?: number;
-        }
-      >();
-      if (composedResult) {
-        const bm = composedResult.budgetManagement;
-        for (const [id, op] of bm.opById) {
-          const isFailed = bm.failedIds.has(id);
-          const rec = providerBudgetOps.find((o) => o.entityId === id);
-          pendingBudgetOps.set(id, {
-            op,
-            failed: isFailed,
-            synthetic: bm.syntheticIds.has(id),
-            ...(rec ? { queueId: rec.queueId } : {}),
-            ...(isFailed ? { reason: budgetFailedReasons.get(id) } : {}),
-            ...(isFailed && bm.attemptedAmountById.has(id)
-              ? { attemptedAmount: bm.attemptedAmountById.get(id) }
-              : {}),
-          });
-        }
-      }
+      // STEP 16-H2 A4.3 — same composite fold as the category map above; a
+      // composite delete only reaches this budget map when the category had
+      // an authoritative budget row (`composeBudgetManagement` never invents
+      // one). The `queueId` is the SAME composite record's, so a discard from
+      // either screen removes it once.
+      const pendingBudgetOps: FinanceReadResult['pendingBudgetOps'] = composedResult
+        ? buildPendingBudgetOps(
+            composedResult.budgetManagement,
+            providerBudgetOps,
+            providerCategoryBudgetOps,
+            budgetFailedReasons,
+            categoryBudgetFailedReasons,
+          )
+        : new Map();
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -539,5 +532,8 @@ export function useFinanceRead(): FinanceReadResult {
     providerBudgetOps,
     budgetFailedReasons,
     providerFailedBudgetIds,
+    providerCategoryBudgetOps,
+    categoryBudgetFailedReasons,
+    providerFailedCategoryBudgetIds,
   ]);
 }

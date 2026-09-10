@@ -154,7 +154,11 @@ export async function runOfflineQueueB1Cases(): Promise<{
     const v = validatePendingWrite(deleteRecObj());
     check(
       'CASE 4 valid DELETE record accepted',
-      v != null && v.op === 'delete' && v.expectedUpdatedAt === FROZEN && !('payload' in v),
+      v != null &&
+        v.op === 'delete' &&
+        v.entity === 'transaction' &&
+        v.expectedUpdatedAt === FROZEN &&
+        !('payload' in v),
       JSON.stringify(v),
     );
   }

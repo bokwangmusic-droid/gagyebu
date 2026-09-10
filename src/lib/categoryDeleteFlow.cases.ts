@@ -11,6 +11,7 @@ import {
   CATEGORY_DELETE_MSG,
   categoryDeleteFailureToast,
   gateCategoryDelete,
+  shouldEnqueueCompositeDelete,
   type CategoryDeleteGateInput,
 } from '@/lib/categoryDeleteFlow';
 
@@ -179,6 +180,59 @@ export async function runCategoryDeleteFlowCases(): Promise<{
         categoryDeleteFailureToast({ reason: 'error', message: 'e' }),
       ];
       return all.every((m) => !m.includes('예산 정리에 실패'));
+    })(),
+  );
+
+  /* ---- STEP 16-H2 A4.4 — transport-only durable fallback decision ---- */
+
+  check(
+    'CASE 19 transport failure -> shouldEnqueueCompositeDelete true',
+    shouldEnqueueCompositeDelete({ reason: 'error', message: 'net', transport: true }) === true,
+  );
+  check(
+    'CASE 20 conflict -> NOT enqueued (terminal, no auto-retry)',
+    shouldEnqueueCompositeDelete({ reason: 'conflict', message: 'x' }) === false,
+  );
+  check(
+    'CASE 21 gone -> NOT enqueued',
+    shouldEnqueueCompositeDelete({ reason: 'gone', message: 'x' }) === false,
+  );
+  check(
+    'CASE 22 identity -> NOT enqueued',
+    shouldEnqueueCompositeDelete({ reason: 'identity', message: 'x' }) === false,
+  );
+  check(
+    'CASE 23 generic error WITHOUT transport -> NOT enqueued',
+    shouldEnqueueCompositeDelete({ reason: 'error', message: 'x' }) === false &&
+      shouldEnqueueCompositeDelete({ reason: 'error', message: 'x', transport: false }) === false,
+  );
+  check(
+    'CASE 24 offline-queued toast is distinct from the online-success toast',
+    (CATEGORY_DELETE_MSG.offlineQueued as string) !== (CATEGORY_DELETE_MSG.success as string) &&
+      CATEGORY_DELETE_MSG.offlineQueued.includes('인터넷에 연결되면') &&
+      CATEGORY_DELETE_MSG.offlineQueued.startsWith(CATEGORY_DELETE_MSG.success),
+  );
+
+  /* ---- STEP 16-H2 A4.4 — a terminal-failed COMPOSITE row is read-only ---- */
+  // The A4.3 read model folds a terminal-failed composite delete into
+  // `pendingCategoryOps` (op:'delete', queueId, reason). The screen's
+  // `isPendingRow(id)` therefore becomes true, which the gate reads as
+  // `categoryRowPending` -> a fresh delete on that row is a silent no-op
+  // (the row instead offers "변경 버리기").
+  check(
+    'CASE 25 failed composite surfaced via pendingCategoryOps -> gate blocks (silent, no new delete)',
+    (() => {
+      const g = gateCategoryDelete({ ...OK, categoryRowPending: true });
+      return g.proceed === false && g.toast === null;
+    })(),
+  );
+  // §16 — a pending/failed BUDGET op (single-table OR a composite folded into
+  // pendingBudgetOps) still blocks with the budget-in-flight toast.
+  check(
+    'CASE 26 pending/failed budget op (incl. folded composite) -> gate blocks with budget-in-flight toast',
+    (() => {
+      const g = gateCategoryDelete({ ...OK, budgetOpPending: true });
+      return g.proceed === false && g.toast === CATEGORY_DELETE_MSG.budgetOpInFlight;
     })(),
   );
 

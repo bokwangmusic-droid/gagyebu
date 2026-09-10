@@ -49,6 +49,10 @@ import {
   type SaveBudgetResult,
   type SoftDeleteBudgetResult,
 } from '@/services/remoteBudgetWrite';
+import {
+  softDeleteCustomCategoryWithBudget,
+  type SoftDeleteCustomCategoryWithBudgetResult,
+} from '@/services/remoteCategoryBudgetWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
@@ -160,6 +164,18 @@ export interface RunOpDeps {
     category: string;
     expectedUpdatedAt: string;
   }) => Promise<SoftDeleteBudgetResult>;
+  /**
+   * STEP 16-H2 A4.2 — injected in tests; defaults to the real
+   * `softDeleteCustomCategoryWithBudget`. The composite atomic delete has ONE
+   * service function (the RPC), so there is no create/update pair to inject.
+   */
+  softDeleteCustomCategoryWithBudget?: (args: {
+    householdId: string;
+    categoryId: string;
+    expectedUserId: string;
+    expectedCategoryUpdatedAt: string;
+    expectedBudgetUpdatedAt: string | null;
+  }) => Promise<SoftDeleteCustomCategoryWithBudgetResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -173,12 +189,33 @@ export async function runPendingWrite(
     op.entity !== 'transaction' &&
     op.entity !== 'card' &&
     op.entity !== 'category' &&
-    op.entity !== 'budget'
+    op.entity !== 'budget' &&
+    op.entity !== 'categoryBudget'
   ) {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
 
   try {
+    // ---- COMPOSITE CATEGORY + BUDGET DELETE (STEP 16-H2 A4.2) ----
+    if (op.entity === 'categoryBudget') {
+      // `op.op` is always 'delete' (type + validator). ONE atomic RPC call —
+      // NEVER decomposed into `softDeleteCustomCategory()` +
+      // `softDeleteBudget()`. Both FROZEN tokens are forwarded verbatim and
+      // are never refreshed on a replay.
+      const del = deps.softDeleteCustomCategoryWithBudget ?? softDeleteCustomCategoryWithBudget;
+      const res = await del({
+        householdId: op.scope.householdId,
+        categoryId: op.entityId,
+        expectedUserId: op.scope.userId,
+        expectedCategoryUpdatedAt: op.expectedCategoryUpdatedAt,
+        expectedBudgetUpdatedAt: op.expectedBudgetUpdatedAt,
+      });
+      if (res.ok) return { kind: 'success' }; // both/neither tombstoned (idempotent replay = ok)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // identity | conflict | gone | error — all already in WriteConflictReason.
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
     // ---- BUDGET (STEP 16-H2-C2-BUDGET A1) ----
     if (op.entity === 'budget') {
       if (op.op === 'delete') {

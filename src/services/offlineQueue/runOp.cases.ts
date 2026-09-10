@@ -6,10 +6,12 @@
  */
 import {
   QUEUE_SCHEMA_VERSION,
+  type PendingCategoryBudgetDelete,
   type PendingTransactionCreate,
   type PendingTransactionDelete,
   type PendingTransactionUpdate,
 } from '@/lib/offlineQueue';
+import type { SoftDeleteCustomCategoryWithBudgetResult } from '@/services/remoteCategoryBudgetWrite';
 import type {
   CreateTransactionResult,
   SoftDeleteResult,
@@ -423,6 +425,194 @@ export async function runQueueRunOpCases(): Promise<{
       'CASE 42 thrown UPDATE/DELETE service -> transport (conservative retain)',
       u.kind === 'transport' && d.kind === 'transport',
       `${u.kind} ${d.kind}`,
+    );
+  }
+
+  /* ------- STEP 16-H2 A4.2: composite category+budget delete adapter ------- */
+
+  const cbd = (
+    over: Partial<PendingCategoryBudgetDelete> = {},
+  ): PendingCategoryBudgetDelete => ({
+    queueId: 'q-cbd',
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: 'u-A', householdId: 'h-A' },
+    entity: 'categoryBudget',
+    op: 'delete',
+    entityId: 'c-1',
+    expectedCategoryUpdatedAt: 'CAT-FROZEN',
+    expectedBudgetUpdatedAt: 'BUD-FROZEN',
+    enqueuedAt: '2026-09-10T09:00:00.000Z',
+    attemptCount: 0,
+    ...over,
+  });
+
+  type CbdArgs = {
+    householdId: string;
+    categoryId: string;
+    expectedUserId: string;
+    expectedCategoryUpdatedAt: string;
+    expectedBudgetUpdatedAt: string | null;
+  };
+  const fakeCbd =
+    (
+      res: SoftDeleteCustomCategoryWithBudgetResult,
+      sink?: { args: CbdArgs | null; calls: number },
+    ): RunOpDeps['softDeleteCustomCategoryWithBudget'] =>
+    (args) => {
+      if (sink) {
+        sink.args = args;
+        sink.calls += 1;
+      }
+      return Promise.resolve(res);
+    };
+
+  // CASE 43 — composite success normalize
+  {
+    const out = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd({
+        ok: true,
+        categoryDeletedAt: '2026-09-11T00:00:00.000Z',
+        budgetDeletedAt: '2026-09-11T00:00:00.000Z',
+      }),
+    });
+    check('CASE 43 composite {ok:true} -> success', out.kind === 'success', JSON.stringify(out));
+  }
+
+  // CASE 44 — transport normalize
+  {
+    const out = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd({
+        ok: false,
+        reason: 'error',
+        message: 'net',
+        transport: true,
+      }),
+    });
+    check(
+      'CASE 44 composite transport -> {kind:transport}',
+      out.kind === 'transport' && out.message === 'net',
+      JSON.stringify(out),
+    );
+  }
+
+  // CASE 45 — conflict reason preserved (terminal, not collapsed)
+  {
+    const out = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd({ ok: false, reason: 'conflict', message: 'x' }),
+    });
+    check(
+      'CASE 45 composite conflict -> {kind:terminal, reason:"conflict"}',
+      out.kind === 'terminal' && out.reason === 'conflict',
+      JSON.stringify(out),
+    );
+  }
+
+  // CASE 46/47 — identity / gone reasons preserved
+  {
+    const i = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd({ ok: false, reason: 'identity', message: 'x' }),
+    });
+    const g = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd({ ok: false, reason: 'gone', message: 'x' }),
+    });
+    check(
+      'CASE 46/47 composite identity/gone reasons preserved',
+      i.kind === 'terminal' &&
+        i.reason === 'identity' &&
+        g.kind === 'terminal' &&
+        g.reason === 'gone',
+      `i=${JSON.stringify(i)} g=${JSON.stringify(g)}`,
+    );
+  }
+
+  // CASE 48 — generic error reason preserved
+  {
+    const out = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd({ ok: false, reason: 'error', message: 'boom' }),
+    });
+    check(
+      'CASE 48 composite generic error -> {kind:terminal, reason:"error"}',
+      out.kind === 'terminal' && out.reason === 'error',
+      JSON.stringify(out),
+    );
+  }
+
+  // CASE 49 — scope/id + BOTH frozen tokens forwarded verbatim (string budget token)
+  {
+    const sink = { args: null as CbdArgs | null, calls: 0 };
+    const o = cbd({
+      entityId: 'c-42',
+      scope: { userId: 'u-X', householdId: 'h-Y' },
+      expectedCategoryUpdatedAt: 'CAT-V1',
+      expectedBudgetUpdatedAt: 'BUD-V1',
+    });
+    await runPendingWrite(o, {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd(
+        { ok: true, categoryDeletedAt: 't', budgetDeletedAt: 't' },
+        sink,
+      ),
+    });
+    check(
+      'CASE 49 composite forwards householdId/categoryId/expectedUserId + BOTH frozen tokens verbatim',
+      !!sink.args &&
+        sink.args.householdId === 'h-Y' &&
+        sink.args.categoryId === 'c-42' &&
+        sink.args.expectedUserId === 'u-X' &&
+        sink.args.expectedCategoryUpdatedAt === 'CAT-V1' &&
+        sink.args.expectedBudgetUpdatedAt === 'BUD-V1',
+      JSON.stringify(sink.args),
+    );
+  }
+
+  // CASE 50 — expectedBudgetUpdatedAt null forwarded as null; RPC called EXACTLY once
+  {
+    const sink = { args: null as CbdArgs | null, calls: 0 };
+    await runPendingWrite(cbd({ expectedBudgetUpdatedAt: null }), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd(
+        { ok: true, categoryDeletedAt: 't', budgetDeletedAt: null },
+        sink,
+      ),
+    });
+    check(
+      'CASE 50 composite: null budget token forwarded verbatim, RPC called exactly once',
+      sink.args?.expectedBudgetUpdatedAt === null && sink.calls === 1,
+      JSON.stringify({ tok: sink.args?.expectedBudgetUpdatedAt, calls: sink.calls }),
+    );
+  }
+
+  // CASE 51 — replay = ONE atomic RPC; the single-table category / budget
+  // delete services are NEVER called for a composite record.
+  {
+    const rpcSink = { args: null as CbdArgs | null, calls: 0 };
+    const catCalls = { n: 0 };
+    const budCalls = { n: 0 };
+    const out = await runPendingWrite(cbd(), {
+      knownCardIds: new Set<string>(),
+      softDeleteCustomCategoryWithBudget: fakeCbd(
+        { ok: true, categoryDeletedAt: 't', budgetDeletedAt: 't' },
+        rpcSink,
+      ),
+      softDeleteCategory: (() => {
+        catCalls.n += 1;
+        return Promise.resolve({ ok: true });
+      }) as RunOpDeps['softDeleteCategory'],
+      softDeleteBudget: (() => {
+        budCalls.n += 1;
+        return Promise.resolve({ ok: true });
+      }) as RunOpDeps['softDeleteBudget'],
+    });
+    check(
+      'CASE 51 composite replay = ONE atomic RPC; single-table category/budget delete never called',
+      out.kind === 'success' && rpcSink.calls === 1 && catCalls.n === 0 && budCalls.n === 0,
+      JSON.stringify({ rpc: rpcSink.calls, cat: catCalls.n, bud: budCalls.n }),
     );
   }
 

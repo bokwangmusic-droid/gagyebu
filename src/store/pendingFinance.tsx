@@ -155,6 +155,21 @@ interface PendingFinanceValue {
     entityId: string;
     expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2 A4.2 — current-scope COMPOSITE category+budget delete ops
+   *  (only `op: 'delete'`, incl. terminal-failed), bare category-id keys,
+   *  `categoryBudget:` failed-state namespace. Not wired to `financeRead` /
+   *  any screen yet (projection is A4.3). */
+  pendingCategoryBudgetOps: PendingWrite[];
+  categoryBudgetOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  categoryBudgetFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingCategoryBudgetIds: ReadonlySet<string>;
+  failedCategoryBudgetIds: ReadonlySet<string>;
+  enqueueCategoryBudgetDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedCategoryUpdatedAt: string;
+    expectedBudgetUpdatedAt: string | null;
+  }) => Promise<EnqueueOutcome>;
   /** STEP 16-H2-C2-B2 conflict-UX — drop ONE queued record by `queueId`
    *  ("변경 버리기"). NOT a server delete; scope-guarded; awaits persistence. */
   discardPending: (queueId: string) => Promise<DiscardOutcome>;
@@ -313,6 +328,18 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
         state.budget.failedReasons.size > 0 ? state.budget.failedReasons : EMPTY_REASON_MAP,
       pendingBudgetIds: state.budget.pendingIds.size > 0 ? state.budget.pendingIds : EMPTY_SET,
       failedBudgetIds: state.budget.failedIds.size > 0 ? state.budget.failedIds : EMPTY_SET,
+      pendingCategoryBudgetOps:
+        state.categoryBudget.scopeOps.length > 0 ? state.categoryBudget.scopeOps : EMPTY_OPS,
+      categoryBudgetOpByEntity:
+        state.categoryBudget.opByEntity.size > 0 ? state.categoryBudget.opByEntity : EMPTY_KIND_MAP,
+      categoryBudgetFailedReasons:
+        state.categoryBudget.failedReasons.size > 0
+          ? state.categoryBudget.failedReasons
+          : EMPTY_REASON_MAP,
+      pendingCategoryBudgetIds:
+        state.categoryBudget.pendingIds.size > 0 ? state.categoryBudget.pendingIds : EMPTY_SET,
+      failedCategoryBudgetIds:
+        state.categoryBudget.failedIds.size > 0 ? state.categoryBudget.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
@@ -327,6 +354,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueBudgetCreate: coord.enqueueBudgetCreate,
       enqueueBudgetUpdate: coord.enqueueBudgetUpdate,
       enqueueBudgetDelete: coord.enqueueBudgetDelete,
+      enqueueCategoryBudgetDelete: coord.enqueueCategoryBudgetDelete,
       discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
     }),

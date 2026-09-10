@@ -31,6 +31,7 @@ import {
   makePendingCardCreate,
   makePendingCardDelete,
   makePendingCardUpdate,
+  makePendingCategoryBudgetDelete,
   makePendingCategoryCreate,
   makePendingCategoryDelete,
   makePendingCategoryUpdate,
@@ -108,9 +109,13 @@ export interface CoordinatorState {
    *  budget's natural key IS the category_id, same key space as `category`
    *  but a structurally separate entity/map). */
   budget: CoordinatorEntityState;
+  /** STEP 16-H2 A4.2 — the COMPOSITE category+budget delete view (bare
+   *  category-id keys, `categoryBudget:` opKey namespace). Only ever holds
+   *  `op: 'delete'` records. */
+  categoryBudget: CoordinatorEntityState;
   /** Total pending ops across ALL entities in the current scope (§28 — the
    *  future household-import guard must see cards + categories + budgets
-   *  too). */
+   *  + composite deletes too). */
   pendingCount: number;
   lastError: string | null;
   flushing: boolean;
@@ -176,6 +181,7 @@ export interface CoordinatorDeps {
   softDeleteCategory?: RunOpDeps['softDeleteCategory'];
   saveBudget?: RunOpDeps['saveBudget'];
   softDeleteBudget?: RunOpDeps['softDeleteBudget'];
+  softDeleteCustomCategoryWithBudget?: RunOpDeps['softDeleteCustomCategoryWithBudget'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -269,6 +275,20 @@ export interface PendingWriteCoordinator {
     entityId: string;
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2 A4.2 — the composite atomic "custom category + its related
+   *  budget" soft-delete. `entityId` is the category_id; BOTH tokens are
+   *  FROZEN by the caller (delete-confirm snapshot) and stored verbatim,
+   *  NEVER re-read. Refused with `existing-pending` when a single-entity
+   *  `category` OR `budget` op for the SAME (scope, categoryId) is already
+   *  queued — no dependency graph / compaction (an existing COMPOSITE record
+   *  for the same id still gets the normal idempotent-dedup /
+   *  differing-token handling). */
+  enqueueCategoryBudgetDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedCategoryUpdatedAt: string;
+    expectedBudgetUpdatedAt: string | null;
+  }): Promise<EnqueueOutcome>;
   /**
    * STEP 16-H2-C2-B2 conflict-UX — permanently DROP one queued record by its
    * `queueId` ("변경 버리기" for a terminal-failed UPDATE). This is NOT a
@@ -354,6 +374,9 @@ export function createPendingWriteCoordinator(
         ...(deps.softDeleteCategory ? { softDeleteCategory: deps.softDeleteCategory } : {}),
         ...(deps.saveBudget ? { saveBudget: deps.saveBudget } : {}),
         ...(deps.softDeleteBudget ? { softDeleteBudget: deps.softDeleteBudget } : {}),
+        ...(deps.softDeleteCustomCategoryWithBudget
+          ? { softDeleteCustomCategoryWithBudget: deps.softDeleteCustomCategoryWithBudget }
+          : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -501,6 +524,15 @@ export function createPendingWriteCoordinator(
                 rec.entity === 'budget' &&
                 serverBudgetConfirmsUpdate(amt, rec.payload);
             }
+          } else if (entity === 'categoryBudget') {
+            // STEP 16-H2 A4.2 — the composite delete acks ONLY when BOTH
+            // sides are gone from the authoritative snapshot: the category
+            // absent AND the same-category_id budget absent. NOT
+            // special-cased for a record whose `expectedBudgetUpdatedAt` was
+            // null — a budget that appeared during the offline window must be
+            // observed absent here too, else the composite op replays (its
+            // RPC replay then classifies the surviving budget as a conflict).
+            ok = !serverCategories.has(entityId) && !serverBudgets.has(entityId);
           } else if (entity === 'category') {
             // STEP 16-H2-C2-B1 §25/§26/§27
             if (op === 'delete') {
@@ -817,6 +849,39 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueueCategoryBudgetDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedCategoryUpdatedAt: string;
+    expectedBudgetUpdatedAt: string | null;
+  }): Promise<EnqueueOutcome> {
+    // A4.2 §6/§14 — no dependency graph / compaction. Refuse a composite
+    // delete while an UNRELATED single-entity `category` OR `budget` op for
+    // the SAME (scope, categoryId) is already queued. An existing COMPOSITE
+    // record for the same id is intentionally NOT caught here — it falls
+    // through to `enqueuePendingWrite`, whose dedup preserves the
+    // idempotent-duplicate (identical frozen tokens) and differing-token
+    // (`existing-pending`) semantics.
+    const clash = controller
+      .read()
+      .some(
+        (r) =>
+          (r.entity === 'category' || r.entity === 'budget') &&
+          r.entityId === args.entityId &&
+          r.scope.userId === args.scope.userId &&
+          r.scope.householdId === args.scope.householdId,
+      );
+    if (clash) return Promise.resolve({ ok: false, reason: 'existing-pending' });
+    return enqueue(
+      makePendingCategoryBudgetDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedCategoryUpdatedAt: args.expectedCategoryUpdatedAt, // FROZEN — never refreshed
+        expectedBudgetUpdatedAt: args.expectedBudgetUpdatedAt, // FROZEN (string | null)
+      }),
+    );
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -903,6 +968,7 @@ export function createPendingWriteCoordinator(
     const card = entityStateOf('card', allScopeOps);
     const category = entityStateOf('category', allScopeOps);
     const budget = entityStateOf('budget', allScopeOps);
+    const categoryBudget = entityStateOf('categoryBudget', allScopeOps);
     return {
       hydration,
       scopeOps: txn.scopeOps,
@@ -913,6 +979,7 @@ export function createPendingWriteCoordinator(
       card,
       category,
       budget,
+      categoryBudget,
       pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -934,6 +1001,7 @@ export function createPendingWriteCoordinator(
     enqueueBudgetCreate,
     enqueueBudgetUpdate,
     enqueueBudgetDelete,
+    enqueueCategoryBudgetDelete,
     discardPending,
     requestFlush,
     dispose,

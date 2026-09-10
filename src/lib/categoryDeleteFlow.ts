@@ -1,11 +1,14 @@
 /**
- * STEP 16-H2 A3 — pure decision helpers for the /categories ATOMIC
- * category + budget delete (ONLINE direct-write flow).
+ * STEP 16-H2 A3 / A4.4 — pure decision helpers for the /categories ATOMIC
+ * category + budget delete: the pre-Alert gate, the failure-reason -> toast
+ * map, and (A4.4) the "does this failure get a durable offline fallback?"
+ * predicate.
  *
  * app/categories.tsx stays a thin caller: it owns the refs, the confirm
- * Alert, `refresh()`, the haptic and the toast side effects. This module
- * owns the branching so every gate / message can be exhaustively cased
- * without a React renderer (see categoryDeleteFlow.cases.ts).
+ * Alert, `refresh()`, the haptic, the toast side effects, and the actual
+ * `pendingWrites.enqueueCategoryBudgetDelete(...)` call. This module owns the
+ * branching so every gate / message / enqueue-decision can be exhaustively
+ * cased without a React renderer (see categoryDeleteFlow.cases.ts).
  *
  * NOTHING here touches Supabase, the offline queue, CategoryOrder, or any
  * migration — it is a synchronous function of already-resolved primitives.
@@ -20,9 +23,15 @@ export const CATEGORY_DELETE_MSG = {
   needCategoryReload: '카테고리 정보를 다시 불러온 뒤 삭제해 주세요.',
   /** a live budget with no meta -> a guarded budget delete is impossible. */
   needBudgetReload: '예산 정보를 다시 불러온 뒤 삭제해 주세요.',
-  /** success (both category and, if present, budget tombstoned). */
+  /** success (both category and, if present, budget tombstoned on the server). */
   success: '카테고리를 삭제했어요',
-  /** §6 — transport failure. A3 does NOT enqueue DELETE: plain "try again". */
+  /** A4.4 — a transport failure that WAS durably enqueued. Distinct from
+   *  `success`: the server delete has NOT happened yet, only the intent is
+   *  saved. The A4.3 read-model projection hides the row meanwhile. */
+  offlineQueued: '카테고리를 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요',
+  /** Defensive fallback only — A4.4 intercepts a transport failure BEFORE
+   *  this map via `shouldEnqueueCompositeDelete` and routes it to the durable
+   *  queue. Shown only if an enqueue is somehow not attempted. */
   transport: '인터넷 연결을 확인하고 다시 시도해주세요.',
   /** §6 — optimistic-concurrency conflict on the category OR the budget. */
   conflict: '다른 기기에서 카테고리 또는 예산이 변경됐어요. 새로고침 후 다시 시도해주세요.',
@@ -85,11 +94,25 @@ export interface CategoryDeleteFailure {
 }
 
 /**
- * Failure result -> the single toast to show. §5/§6: the atomic RPC mutated
- * NEITHER table on failure, so there is no partial-success line to render;
- * one message per reason. A transport failure is checked first and is never
- * an offline-success (A3 does not enqueue DELETE). `identity` and a generic
- * `error` fall through to the service's own copy verbatim.
+ * STEP 16-H2 A4.4 — the ONE failure that earns a durable offline fallback: a
+ * TRANSPORT failure (the request never reached a server verdict). Everything
+ * else — `conflict` / `gone` / `identity` / a generic non-transport `error` —
+ * is terminal in the UI: no enqueue, no auto-retry, no token re-fetch. The
+ * caller enqueues the composite delete with the SAME two frozen tokens only
+ * when this returns true.
+ */
+export function shouldEnqueueCompositeDelete(f: CategoryDeleteFailure): boolean {
+  return f.transport === true;
+}
+
+/**
+ * Failure result -> the single toast to show, for a failure the caller did
+ * NOT enqueue (i.e. `shouldEnqueueCompositeDelete` was false). §5/§6: the
+ * atomic RPC mutated NEITHER table on failure, so there is no partial-success
+ * line to render; one message per reason. `identity` and a generic `error`
+ * fall through to the service's own copy verbatim. The `transport` branch is
+ * a defensive fallback — A4.4 routes a transport failure to the durable
+ * queue before this is reached.
  */
 export function categoryDeleteFailureToast(f: CategoryDeleteFailure): string {
   if (f.transport === true) return CATEGORY_DELETE_MSG.transport;
