@@ -43,6 +43,7 @@
 import type { PostgrestError } from '@supabase/supabase-js';
 
 import { supabase } from '@/lib/supabase';
+import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 import {
   buildRecurringInsert,
   buildRecurringUpdate,
@@ -59,17 +60,31 @@ export type RecurringWriteReason =
   | 'gone'
   | 'error';
 
+/**
+ * `transport: true` (STEP 16-H2-D0, mirrors STEP 16-H2-C2-0 for card /
+ * category / budget) marks a NETWORK/TRANSPORT failure of a recurring-rule
+ * write — the request never reached a server verdict — as opposed to a
+ * 23505, an RLS/PGRST verdict, or a successful-but-empty reconcile read.
+ * ONLY a `transport` failure is safe for a future Offline Write Queue to
+ * enqueue. Additive/optional; existing `res.ok`/`res.reason` callers are
+ * unaffected. This D0 step adds the flag ONLY — no queue wiring.
+ */
 export type CreateRecurringResult =
   | { ok: true; id: string }
-  | { ok: false; reason: RecurringWriteReason; message: string };
+  | { ok: false; reason: RecurringWriteReason; message: string; transport?: boolean };
 
 export type UpdateRecurringResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: RecurringWriteReason; message: string };
+  | { ok: false; reason: RecurringWriteReason; message: string; transport?: boolean };
 
 export type SoftDeleteRecurringResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<RecurringWriteReason, 'invalid' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<RecurringWriteReason, 'invalid' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 const GENERIC_ERROR = '반복 항목을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
@@ -173,7 +188,18 @@ export async function createRecurring(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+    // STEP 16-H2-D0: a TRANSPORT failure during the 23505 reconcile read is
+    // retryable; a non-transport read error stays terminal; a successful
+    // empty read stays terminal.
+    const readClass = classifyWriteReadError(readErr, describeWriteError);
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: GENERIC_ERROR };
     if (isSameCreateRow(existing as Record<string, unknown>, row, args.expectedUserId)) {
       return { ok: true, id: args.id };
@@ -183,7 +209,14 @@ export async function createRecurring(args: {
     return { ok: false, reason: 'conflict', message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: GENERIC_ERROR };
 }
 
@@ -215,7 +248,14 @@ export async function updateRecurring(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile against the authoritative row.
@@ -226,7 +266,17 @@ export async function updateRecurring(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true);
+  // non-transport -> plain server error; only a successful empty reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -268,7 +318,14 @@ export async function setRecurringActive(args: {
     .select('id, active, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile.
@@ -279,7 +336,16 @@ export async function setRecurringActive(args: {
     .eq('id', args.recurringId)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true).
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -313,7 +379,14 @@ export async function softDeleteRecurring(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile.
@@ -324,7 +397,16 @@ export async function softDeleteRecurring(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true).
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.

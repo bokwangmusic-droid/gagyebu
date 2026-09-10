@@ -1,25 +1,27 @@
 /**
  * Static verification for STEP 16-H2-C2-0 — the transport-taxonomy hardening
- * of the card / custom-category / budget remote write services.
+ * of the card / custom-category / budget remote write services — EXTENDED by
+ * STEP 16-H2-D0 to recurring / planned / goal / loan.
  *
  * The full write flows call `supabase` directly and cannot run here (same
- * limitation as src/services/remoteFinanceWrite.cases.ts). What this STEP
+ * limitation as src/services/remoteFinanceWrite.cases.ts). What these STEPs
  * changed is:
  *   1. every result union gained an additive optional `transport?: boolean`;
  *   2. every primary write error is now tagged via `isTransportError`;
- *   3. every reconcile-read error is now routed through
- *      `classifyWriteReadError` — transport read failure -> `transport:true`,
- *      non-transport read error -> plain server error, a SUCCESSFUL empty
- *      read still falls through unchanged to `gone` / the idempotent-match
+ *   3. every reconcile-read error (incl. every precheck SELECT) is now routed
+ *      through `classifyWriteReadError` — transport read failure ->
+ *      `transport:true`, non-transport read error -> plain server error, a
+ *      SUCCESSFUL empty read still falls through unchanged to
+ *      `gone` / `deleted` / `insufficient` / `paid_off` / the idempotent-match
  *      branch.
- * `saveCategoryOrder` is deliberately NOT hardened.
+ * `saveCategoryOrder` is deliberately NOT hardened. D0 does NOT touch loan
+ * payment's client-side split (H2-H3).
  *
  * These cases pin (1)–(3) against the shared pure helpers each service now
  * uses, entity-labelled to the spec's numbered checklist. The unchanged
- * ordering branches (`deleted` / `conflict` / `gone` / field-match idempotent
- * success) are covered by STEP 16-G2-C2/C3/C4's contracts + device tests;
- * here we only prove the transport layer never SHADOWS them (a successful
- * reconcile read -> helper returns `undefined` -> fall through).
+ * ordering branches are covered by each entity's own contract + device
+ * tests; here we only prove the transport layer never SHADOWS them (a
+ * successful reconcile read -> helper returns `undefined` -> fall through).
  */
 import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 import type { CreateCardResult, SoftDeleteCardResult, UpdateCardResult } from '@/services/remoteCardWrite';
@@ -30,6 +32,29 @@ import type {
   UpdateCategoryResult,
 } from '@/services/remoteCategoryWrite';
 import type { SaveBudgetResult, SoftDeleteBudgetResult } from '@/services/remoteBudgetWrite';
+import type {
+  CreateRecurringResult,
+  SoftDeleteRecurringResult,
+  UpdateRecurringResult,
+} from '@/services/remoteRecurringWrite';
+import type {
+  CreatePlannedResult,
+  SoftDeletePlannedResult,
+  UpdatePlannedResult,
+} from '@/services/remotePlannedWrite';
+import type {
+  AddGoalMovementResult,
+  CreateGoalResult,
+  SoftDeleteGoalResult,
+  UpdateGoalResult,
+} from '@/services/remoteGoalWrite';
+import type {
+  AddLoanPaymentResult,
+  CreateLoanResult,
+  SoftDeleteLoanPaymentResult,
+  SoftDeleteLoanResult,
+  UpdateLoanResult,
+} from '@/services/remoteLoanWrite';
 
 export interface CaseResult {
   name: string;
@@ -43,6 +68,8 @@ const TIMEOUT = { message: 'AbortError', hint: 'Request was aborted (timeout or 
 const RLS = { message: 'new row violates row-level security policy', code: '42501' };
 const HTTP500 = { message: 'Internal Server Error', code: '', status: 500 };
 const DUP = { message: 'duplicate key value violates unique constraint', code: '23505' };
+const FK = { message: 'insert or update violates foreign key constraint', code: '23503' };
+const CHECK = { message: 'new row violates check constraint', code: '23514' };
 
 const cardCopy = (e: { message?: string }) =>
   /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '카드를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
@@ -50,6 +77,20 @@ const catCopy = (e: { message?: string }) =>
   /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '카테고리를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const budgetCopy = (e: { message?: string }) =>
   /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '예산을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+// STEP 16-H2-D0 — mirror of each new service's `describeWriteError` (naive
+// network heuristic + entity-specific fallback copy).
+const recurCopy = (e: { message?: string }) =>
+  /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '반복 항목을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+const plannedCopy = (e: { message?: string }) =>
+  /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '예정 지출을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+const goalCopy = (e: { message?: string }) =>
+  /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '저축 목표를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+const goalMoveCopy = (e: { message?: string }) =>
+  /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '저축 금액을 반영하지 못했어요. 잠시 후 다시 시도해주세요.';
+const loanCopy = (e: { message?: string }) =>
+  /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '대출을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
+const loanPayCopy = (e: { message?: string }) =>
+  /network|fetch|timeout/i.test(e.message ?? '') ? '네트워크 연결을 확인한 뒤 다시 시도해주세요.' : '상환 기록을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 
 /** Mirror of each service's primary-error branch: `...(isTransportError(e) ? { transport:true } : {})`. */
 const primaryTag = (e: unknown) => (isTransportError(e) ? { transport: true as const } : {});
@@ -186,6 +227,142 @@ export async function runEntityWriteTransportCases(): Promise<{
     const c: SoftDeleteBudgetResult = { ok: false, reason: 'conflict', message: 'x' };
     const d: SoftDeleteBudgetResult = { ok: false, reason: 'error', message: 'x', transport: true };
     check('BUD type: transport?: boolean additive on SaveBudgetResult + SoftDeleteBudgetResult', a.ok === false && b.ok === false && c.ok === false && d.ok === false);
+  }
+
+  /* ======================= STEP 16-H2-D0 ======================= */
+  /* ========================= RECURRING ========================= */
+
+  // 32 — createRecurring primary transport
+  check('REC 32 createRecurring primary transport -> transport:true', isTransportError(NET) === true);
+  // 33 — createRecurring 23505 reconcile transport
+  check('REC 33 create 23505 reconcile transport -> {reason:error, transport:true}', (() => {
+    const r = reconcile(NET, recurCopy);
+    return !!r && r.reason === 'error' && r.transport === true;
+  })());
+  // 34 — successful reconcile read -> falls through to isSameCreateRow / conflict, unchanged
+  check('REC 34 create reconcile read ok -> undefined (idempotent/conflict branch unchanged)', reconcile(null, recurCopy) === undefined);
+  // 35 — a real 23505 verdict is NOT transport
+  check('REC 35 23505 real conflict is a verdict, not transport', isTransportError(DUP) === false);
+  // 36 — updateRecurring primary + reconcile transport
+  check('REC 36 updateRecurring primary transport -> transport:true', JSON.stringify(primaryTag(TIMEOUT)) === '{"transport":true}');
+  check('REC 37 update 0-row reconcile transport -> transport:true', reconcile(TIMEOUT, recurCopy)?.transport === true);
+  // 38 — non-transport read error on update reconcile is reason:error, NOT gone/deleted, no transport
+  check('REC 38 update reconcile non-transport readErr (HTTP500) -> reason:error, not gone, no transport', (() => {
+    const r = reconcile(HTTP500, recurCopy);
+    return !!r && r.reason === 'error' && !('transport' in r);
+  })());
+  // 39 — setRecurringActive toggle: primary + 0-row reconcile transport
+  check('REC 39 setRecurringActive primary transport -> transport:true', isTransportError(NET) === true);
+  check('REC 40 setRecurringActive 0-row reconcile transport -> transport:true', reconcile(NET, recurCopy)?.transport === true);
+  check('REC 41 setRecurringActive reconcile read ok -> undefined (active===desired idempotent / conflict unchanged)', reconcile(null, recurCopy) === undefined);
+  // 42 — softDeleteRecurring primary + reconcile transport
+  check('REC 42 softDeleteRecurring primary transport -> transport:true', JSON.stringify(primaryTag(NET)) === '{"transport":true}');
+  check('REC 43 softDeleteRecurring reconcile transport -> transport:true', reconcile(TIMEOUT, recurCopy)?.transport === true);
+  check('REC 44 softDeleteRecurring reconcile read ok -> undefined (already-deleted idempotent / conflict unchanged)', reconcile(null, recurCopy) === undefined);
+  // type additivity — all three unions accept AND omit `transport`
+  {
+    const a: CreateRecurringResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    const b: UpdateRecurringResult = { ok: false, reason: 'conflict', message: 'x' };
+    const c: SoftDeleteRecurringResult = { ok: false, reason: 'gone', message: 'x', transport: true };
+    check('REC type: transport?: boolean additive on create/update/softDelete', a.ok === false && b.ok === false && c.ok === false);
+  }
+
+  /* ========================== PLANNED ========================== */
+
+  check('PLN 45 createPlanned primary transport -> transport:true', isTransportError(NET) === true);
+  check('PLN 46 create 23505 reconcile transport -> transport:true', reconcile(NET, plannedCopy)?.transport === true);
+  check('PLN 47 create reconcile read ok -> undefined (idempotent/conflict unchanged)', reconcile(null, plannedCopy) === undefined);
+  check('PLN 48 updatePlanned primary transport -> transport:true', JSON.stringify(primaryTag(NET)) === '{"transport":true}');
+  check('PLN 49 update 0-row reconcile transport -> transport:true', reconcile(TIMEOUT, plannedCopy)?.transport === true);
+  check('PLN 50 update reconcile non-transport readErr (RLS) -> reason:error, not gone, no transport', (() => {
+    const r = reconcile(RLS, plannedCopy);
+    return !!r && r.reason === 'error' && !('transport' in r);
+  })());
+  check('PLN 51 softDeletePlanned primary transport -> transport:true', JSON.stringify(primaryTag(NET)) === '{"transport":true}');
+  check('PLN 52 softDeletePlanned reconcile transport -> transport:true', reconcile(NET, plannedCopy)?.transport === true);
+  check('PLN 53 softDeletePlanned reconcile read ok -> undefined (already-deleted / conflict unchanged)', reconcile(null, plannedCopy) === undefined);
+  {
+    const a: CreatePlannedResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    const b: UpdatePlannedResult = { ok: false, reason: 'deleted', message: 'x' };
+    const c: SoftDeletePlannedResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    check('PLN type: transport?: boolean additive on create/update/softDelete', a.ok === false && b.ok === false && c.ok === false);
+  }
+
+  /* =========================== GOAL =========================== */
+
+  check('GOL 54 createGoal primary transport -> transport:true', isTransportError(NET) === true);
+  check('GOL 55 create 23505 reconcile transport -> transport:true', reconcile(NET, goalCopy)?.transport === true);
+  check('GOL 56 create reconcile read ok -> undefined (isSameGoalCreate / conflict unchanged)', reconcile(null, goalCopy) === undefined);
+  check('GOL 57 updateGoal primary transport -> transport:true', JSON.stringify(primaryTag(TIMEOUT)) === '{"transport":true}');
+  check('GOL 58 update 0-row reconcile transport -> transport:true', reconcile(TIMEOUT, goalCopy)?.transport === true);
+  check('GOL 59 softDeleteGoal primary + reconcile transport -> transport:true', isTransportError(NET) === true && reconcile(NET, goalCopy)?.transport === true);
+  // addGoalMovement — parent-active PRECHECK read must not be shadowed to gone/deleted
+  check('GOL 60 addGoalMovement parent precheck transport -> {reason:error, transport:true} (NOT gone/deleted)', (() => {
+    const r = reconcile(NET, goalMoveCopy);
+    return !!r && r.reason === 'error' && r.transport === true;
+  })());
+  check('GOL 61 addGoalMovement parent precheck read ok -> undefined (gone/deleted branch runs unchanged)', reconcile(null, goalMoveCopy) === undefined);
+  // addGoalMovement — primary INSERT transport
+  check('GOL 62 addGoalMovement INSERT primary transport -> transport:true', JSON.stringify(primaryTag(NET)) === '{"transport":true}');
+  // addGoalMovement — 23505 movement reconcile transport
+  check('GOL 63 addGoalMovement 23505 reconcile transport -> transport:true', reconcile(TIMEOUT, goalMoveCopy)?.transport === true);
+  check('GOL 64 addGoalMovement 23505 reconcile read ok -> undefined (amount_delta idempotent / conflict unchanged)', reconcile(null, goalMoveCopy) === undefined);
+  // domain codes are verdicts, never transport
+  check('GOL 65 23514 (insufficient) is a verdict, not transport', isTransportError(CHECK) === false);
+  check('GOL 66 23503 (parent FK / gone) is a verdict, not transport', isTransportError(FK) === false);
+  {
+    const a: CreateGoalResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    const b: UpdateGoalResult = { ok: false, reason: 'conflict', message: 'x' };
+    const c: SoftDeleteGoalResult = { ok: false, reason: 'gone', message: 'x' };
+    const d: AddGoalMovementResult = { ok: false, reason: 'insufficient', message: 'x' }; // still valid WITHOUT transport
+    const e: AddGoalMovementResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    check('GOL type: transport?: boolean additive on create/update/softDelete/addMovement', a.ok === false && b.ok === false && c.ok === false && d.ok === false && e.ok === false);
+  }
+
+  /* =========================== LOAN =========================== */
+
+  check('LON 67 createLoan primary transport -> transport:true', isTransportError(NET) === true);
+  check('LON 68 create 23505 reconcile transport -> transport:true', reconcile(NET, loanCopy)?.transport === true);
+  check('LON 69 create reconcile read ok -> undefined (isSameLoanCreate / conflict unchanged)', reconcile(null, loanCopy) === undefined);
+  // updateLoan — principal/paid PRECHECK read must not be shadowed to gone/deleted/principal_low
+  check('LON 70 updateLoan principal/paid precheck transport -> {reason:error, transport:true} (NOT gone/deleted/principal_low)', (() => {
+    const r = reconcile(NET, loanCopy);
+    return !!r && r.reason === 'error' && r.transport === true;
+  })());
+  check('LON 71 updateLoan precheck read ok -> undefined (gone/deleted/principal_low branch runs unchanged)', reconcile(null, loanCopy) === undefined);
+  check('LON 72 updateLoan primary transport -> transport:true', JSON.stringify(primaryTag(TIMEOUT)) === '{"transport":true}');
+  check('LON 73 updateLoan 0-row reconcile transport -> transport:true', reconcile(TIMEOUT, loanCopy)?.transport === true);
+  check('LON 74 updateLoan reconcile non-transport readErr (HTTP500) -> reason:error, not gone, no transport', (() => {
+    const r = reconcile(HTTP500, loanCopy);
+    return !!r && r.reason === 'error' && !('transport' in r);
+  })());
+  check('LON 75 softDeleteLoan primary + reconcile transport -> transport:true', isTransportError(NET) === true && reconcile(NET, loanCopy)?.transport === true);
+  // addLoanPayment — authoritative loan re-SELECT (precheck) must not be shadowed to gone/deleted/paid_off
+  check('LON 76 addLoanPayment loan re-SELECT precheck transport -> {reason:error, transport:true} (NOT gone/deleted/paid_off)', (() => {
+    const r = reconcile(NET, loanPayCopy);
+    return !!r && r.reason === 'error' && r.transport === true;
+  })());
+  check('LON 77 addLoanPayment precheck read ok -> undefined (gone/deleted/paid_off branch runs unchanged)', reconcile(null, loanPayCopy) === undefined);
+  check('LON 78 addLoanPayment INSERT primary transport -> transport:true', JSON.stringify(primaryTag(NET)) === '{"transport":true}');
+  check('LON 79 addLoanPayment 23505 payment reconcile transport -> transport:true', reconcile(TIMEOUT, loanPayCopy)?.transport === true);
+  check('LON 80 addLoanPayment 23505 reconcile read ok -> undefined (split idempotent / conflict unchanged — H2-H3 will refine the match, not this)', reconcile(null, loanPayCopy) === undefined);
+  check('LON 81 23514 (stale, paid>principal) is a verdict, not transport', isTransportError(CHECK) === false);
+  check('LON 82 23503 (parent loan FK / gone) is a verdict, not transport', isTransportError(FK) === false);
+  // softDeleteLoanPayment — primary guarded UPDATE + 0-row reconcile transport
+  check('LON 83 softDeleteLoanPayment primary transport -> transport:true', JSON.stringify(primaryTag(NET)) === '{"transport":true}');
+  check('LON 84 softDeleteLoanPayment 0-row reconcile transport -> transport:true', reconcile(NET, loanPayCopy)?.transport === true);
+  check('LON 85 softDeleteLoanPayment reconcile read ok -> undefined (already-deleted / conflict unchanged)', reconcile(null, loanPayCopy) === undefined);
+  {
+    const a: CreateLoanResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    const b: UpdateLoanResult = { ok: false, reason: 'principal_low', message: 'x' }; // still valid WITHOUT transport
+    const c: SoftDeleteLoanResult = { ok: false, reason: 'gone', message: 'x' };
+    const d: AddLoanPaymentResult = { ok: false, reason: 'stale', message: 'x' };
+    const e: AddLoanPaymentResult = { ok: false, reason: 'error', message: 'x', transport: true };
+    const f: SoftDeleteLoanPaymentResult = { ok: false, reason: 'conflict', message: 'x' };
+    check(
+      'LON type: transport?: boolean additive on create/update/softDelete/addPayment/softDeletePayment',
+      a.ok === false && b.ok === false && c.ok === false && d.ok === false && e.ok === false && f.ok === false,
+    );
   }
 
   const failed = results.filter((r) => !r.pass).length;

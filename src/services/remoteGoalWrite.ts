@@ -39,6 +39,7 @@
 import type { PostgrestError } from '@supabase/supabase-js';
 
 import { supabase } from '@/lib/supabase';
+import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 import {
   buildGoalInsert,
   buildGoalMovementInsert,
@@ -61,21 +62,36 @@ export type GoalWriteReason =
 /** addGoalMovement can additionally fail with `insufficient` (23514). */
 export type GoalMovementReason = GoalWriteReason | 'insufficient';
 
+/**
+ * `transport: true` (STEP 16-H2-D0, mirrors STEP 16-H2-C2-0) marks a
+ * NETWORK/TRANSPORT failure of a goal / goal-movement write — the request
+ * never reached a server verdict — as opposed to a 23505 / 23503 / 23514, an
+ * RLS/PGRST verdict, or a successful-but-empty reconcile read. ONLY a
+ * `transport` failure is safe for a future Offline Write Queue to enqueue.
+ * Additive/optional; existing callers are unaffected. This D0 step adds the
+ * flag ONLY — `insufficient` / `gone` / `deleted` / `conflict` are NEVER
+ * `transport`.
+ */
 export type CreateGoalResult =
   | { ok: true; id: string }
-  | { ok: false; reason: GoalWriteReason; message: string };
+  | { ok: false; reason: GoalWriteReason; message: string; transport?: boolean };
 
 export type UpdateGoalResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: GoalWriteReason; message: string };
+  | { ok: false; reason: GoalWriteReason; message: string; transport?: boolean };
 
 export type SoftDeleteGoalResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<GoalWriteReason, 'invalid' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<GoalWriteReason, 'invalid' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 export type AddGoalMovementResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<GoalMovementReason, never>; message: string };
+  | { ok: false; reason: Exclude<GoalMovementReason, never>; message: string; transport?: boolean };
 
 const GENERIC_ERROR = '저축 목표를 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const MOVEMENT_ERROR = '저축 금액을 반영하지 못했어요. 잠시 후 다시 시도해주세요.';
@@ -173,7 +189,17 @@ export async function createGoal(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+    // STEP 16-H2-D0: transport failure during the 23505 reconcile read is
+    // retryable; a non-transport read error / successful empty read stay terminal.
+    const readClass = classifyWriteReadError(readErr, describeWriteError);
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: GENERIC_ERROR };
     if (isSameGoalCreate(existing as Record<string, unknown>, row, args.expectedUserId)) {
       return { ok: true, id: args.id };
@@ -181,7 +207,14 @@ export async function createGoal(args: {
     return { ok: false, reason: 'conflict', message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: GENERIC_ERROR };
 }
 
@@ -215,7 +248,14 @@ export async function updateGoal(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile against the authoritative row.
@@ -226,7 +266,17 @@ export async function updateGoal(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true);
+  // non-transport -> plain server error; only a successful empty reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -264,7 +314,14 @@ export async function softDeleteGoal(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile.
@@ -275,7 +332,16 @@ export async function softDeleteGoal(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true).
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.
@@ -313,7 +379,17 @@ export async function addGoalMovement(args: {
     .eq('id', args.goalId)
     .maybeSingle();
 
-  if (goalErr) return { ok: false, reason: 'error', message: describeWriteError(goalErr, MOVEMENT_ERROR) };
+  // STEP 16-H2-D0: a transport failure on the parent-active precheck read is
+  // retryable (transport:true); it must NOT fall through to `gone` / `deleted`.
+  const goalClass = classifyWriteReadError(goalErr, (e) => describeWriteError(e, MOVEMENT_ERROR));
+  if (goalClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: goalClass.message,
+      ...(goalClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!goal) return { ok: false, reason: 'gone', message: GOAL_GONE };
   if ((goal as Record<string, unknown>).deleted_at != null) {
     return { ok: false, reason: 'deleted', message: GOAL_GONE };
@@ -355,7 +431,17 @@ export async function addGoalMovement(args: {
       .eq('id', args.movementId)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr, MOVEMENT_ERROR) };
+    // STEP 16-H2-D0: transport failure during the 23505 reconcile read is
+    // retryable; a non-transport read error / successful empty read stay terminal.
+    const readClass = classifyWriteReadError(readErr, (e) => describeWriteError(e, MOVEMENT_ERROR));
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: MOVEMENT_ERROR };
     const ex = existing as Record<string, unknown>;
     if (
@@ -371,6 +457,13 @@ export async function addGoalMovement(args: {
     return { ok: false, reason: 'conflict', message: MOVEMENT_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error, MOVEMENT_ERROR) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error, MOVEMENT_ERROR),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: MOVEMENT_ERROR };
 }

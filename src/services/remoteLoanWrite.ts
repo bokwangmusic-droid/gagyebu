@@ -43,6 +43,7 @@
 import type { PostgrestError } from '@supabase/supabase-js';
 
 import { supabase } from '@/lib/supabase';
+import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 import {
   buildLoanInsert,
   buildLoanPaymentInsert,
@@ -68,25 +69,46 @@ export type UpdateLoanReason = LoanWriteReason | 'principal_low';
 /** addLoanPayment can additionally fail with `paid_off` or `stale` (23514). */
 export type AddLoanPaymentReason = LoanWriteReason | 'paid_off' | 'stale';
 
+/**
+ * `transport: true` (STEP 16-H2-D0, mirrors STEP 16-H2-C2-0) marks a
+ * NETWORK/TRANSPORT failure of a loan / loan-payment write — the request
+ * never reached a server verdict — as opposed to a 23505 / 23503 / 23514, an
+ * RLS/PGRST verdict, or a successful-but-empty reconcile read. ONLY a
+ * `transport` failure is safe for a future Offline Write Queue to enqueue.
+ * Additive/optional; existing callers are unaffected. This D0 step adds the
+ * flag ONLY — `principal_low` / `paid_off` / `stale` / `gone` / `deleted` /
+ * `conflict` are NEVER `transport`. It does NOT touch the client-side
+ * interest/principal split (that replay-idempotency hardening is H2-H3).
+ */
 export type CreateLoanResult =
   | { ok: true; id: string }
-  | { ok: false; reason: LoanWriteReason; message: string };
+  | { ok: false; reason: LoanWriteReason; message: string; transport?: boolean };
 
 export type UpdateLoanResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: UpdateLoanReason; message: string };
+  | { ok: false; reason: UpdateLoanReason; message: string; transport?: boolean };
 
 export type SoftDeleteLoanResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<LoanWriteReason, 'invalid' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<LoanWriteReason, 'invalid' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 export type AddLoanPaymentResult =
   | { ok: true }
-  | { ok: false; reason: AddLoanPaymentReason; message: string };
+  | { ok: false; reason: AddLoanPaymentReason; message: string; transport?: boolean };
 
 export type SoftDeleteLoanPaymentResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<LoanWriteReason, 'invalid' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<LoanWriteReason, 'invalid' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 const GENERIC_ERROR = '대출을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const PAYMENT_ERROR = '상환 기록을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
@@ -197,7 +219,17 @@ export async function createLoan(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+    // STEP 16-H2-D0: transport failure during the 23505 reconcile read is
+    // retryable; a non-transport read error / successful empty read stay terminal.
+    const readClass = classifyWriteReadError(readErr, describeWriteError);
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: GENERIC_ERROR };
     if (isSameLoanCreate(existing as Record<string, unknown>, row, args.expectedUserId)) {
       return { ok: true, id: args.id };
@@ -205,7 +237,14 @@ export async function createLoan(args: {
     return { ok: false, reason: 'conflict', message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: GENERIC_ERROR };
 }
 
@@ -237,7 +276,18 @@ export async function updateLoan(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (curErr) return { ok: false, reason: 'error', message: describeWriteError(curErr) };
+  // STEP 16-H2-D0: a transport failure on the principal/paid precheck read is
+  // retryable (transport:true); it must NOT fall through to gone / deleted /
+  // principal_low.
+  const curClass = classifyWriteReadError(curErr, describeWriteError);
+  if (curClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: curClass.message,
+      ...(curClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!current) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
   const cur = current as Record<string, unknown>;
   if (cur.deleted_at != null) return { ok: false, reason: 'deleted', message: EDIT_CONFLICT };
@@ -257,7 +307,14 @@ export async function updateLoan(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile against the authoritative row.
@@ -270,7 +327,17 @@ export async function updateLoan(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true);
+  // non-transport -> plain server error; only a successful empty reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -308,7 +375,14 @@ export async function softDeleteLoan(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile.
@@ -319,7 +393,16 @@ export async function softDeleteLoan(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true).
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.
@@ -357,7 +440,18 @@ export async function addLoanPayment(args: {
     .eq('id', args.loanId)
     .maybeSingle();
 
-  if (loanErr) return { ok: false, reason: 'error', message: describeWriteError(loanErr, PAYMENT_ERROR) };
+  // STEP 16-H2-D0: a transport failure on the authoritative loan re-SELECT is
+  // retryable (transport:true); it must NOT fall through to gone / deleted /
+  // paid_off.
+  const loanClass = classifyWriteReadError(loanErr, (e) => describeWriteError(e, PAYMENT_ERROR));
+  if (loanClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: loanClass.message,
+      ...(loanClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!loan) return { ok: false, reason: 'gone', message: LOAN_GONE };
   const lr = loan as Record<string, unknown>;
   if (lr.deleted_at != null) return { ok: false, reason: 'deleted', message: LOAN_GONE };
@@ -410,7 +504,17 @@ export async function addLoanPayment(args: {
       .eq('id', args.paymentId)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr, PAYMENT_ERROR) };
+    // STEP 16-H2-D0: transport failure during the 23505 reconcile read is
+    // retryable; a non-transport read error / successful empty read stay terminal.
+    const readClass = classifyWriteReadError(readErr, (e) => describeWriteError(e, PAYMENT_ERROR));
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: PAYMENT_ERROR };
     const ex = existing as Record<string, unknown>;
     if (
@@ -429,7 +533,14 @@ export async function addLoanPayment(args: {
     return { ok: false, reason: 'conflict', message: PAYMENT_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error, PAYMENT_ERROR) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error, PAYMENT_ERROR),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: PAYMENT_ERROR };
 }
 
@@ -457,7 +568,14 @@ export async function softDeleteLoanPayment(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error, PAYMENT_ERROR) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error, PAYMENT_ERROR),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true }; // trigger reversed loans.paid by old.principal_part
 
   // 0 rows — reconcile.
@@ -468,7 +586,16 @@ export async function softDeleteLoanPayment(args: {
     .eq('id', args.paymentId)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr, PAYMENT_ERROR) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true).
+  const readClass = classifyWriteReadError(readErr, (e) => describeWriteError(e, PAYMENT_ERROR));
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: PAYMENT_DELETE_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.

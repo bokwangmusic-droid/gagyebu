@@ -36,6 +36,7 @@
 import type { PostgrestError } from '@supabase/supabase-js';
 
 import { supabase } from '@/lib/supabase';
+import { classifyWriteReadError, isTransportError } from '@/lib/transportError';
 import {
   buildPlannedInsert,
   buildPlannedUpdate,
@@ -52,17 +53,30 @@ export type PlannedWriteReason =
   | 'gone'
   | 'error';
 
+/**
+ * `transport: true` (STEP 16-H2-D0, mirrors STEP 16-H2-C2-0) marks a
+ * NETWORK/TRANSPORT failure of a planned-expense write — the request never
+ * reached a server verdict — as opposed to a 23505, an RLS/PGRST verdict, or
+ * a successful-but-empty reconcile read. ONLY a `transport` failure is safe
+ * for a future Offline Write Queue to enqueue. Additive/optional; existing
+ * callers are unaffected. This D0 step adds the flag ONLY.
+ */
 export type CreatePlannedResult =
   | { ok: true; id: string }
-  | { ok: false; reason: PlannedWriteReason; message: string };
+  | { ok: false; reason: PlannedWriteReason; message: string; transport?: boolean };
 
 export type UpdatePlannedResult =
   | { ok: true; updatedAt: string }
-  | { ok: false; reason: PlannedWriteReason; message: string };
+  | { ok: false; reason: PlannedWriteReason; message: string; transport?: boolean };
 
 export type SoftDeletePlannedResult =
   | { ok: true }
-  | { ok: false; reason: Exclude<PlannedWriteReason, 'invalid' | 'deleted'>; message: string };
+  | {
+      ok: false;
+      reason: Exclude<PlannedWriteReason, 'invalid' | 'deleted'>;
+      message: string;
+      transport?: boolean;
+    };
 
 const GENERIC_ERROR = '예정 지출을 저장하지 못했어요. 잠시 후 다시 시도해주세요.';
 const IDENTITY_CHANGED = '로그인 정보가 변경됐어요. 다시 시도해 주세요.';
@@ -155,7 +169,17 @@ export async function createPlanned(args: {
       .eq('id', args.id)
       .maybeSingle();
 
-    if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+    // STEP 16-H2-D0: transport failure during the 23505 reconcile read is
+    // retryable; a non-transport read error / successful empty read stay terminal.
+    const readClass = classifyWriteReadError(readErr, describeWriteError);
+    if (readClass) {
+      return {
+        ok: false,
+        reason: 'error',
+        message: readClass.message,
+        ...(readClass.transport ? { transport: true } : {}),
+      };
+    }
     if (!existing) return { ok: false, reason: 'error', message: GENERIC_ERROR };
     if (isSameCreateRow(existing as Record<string, unknown>, row, args.expectedUserId)) {
       return { ok: true, id: args.id };
@@ -163,7 +187,14 @@ export async function createPlanned(args: {
     return { ok: false, reason: 'conflict', message: GENERIC_ERROR };
   }
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   return { ok: false, reason: 'error', message: GENERIC_ERROR };
 }
 
@@ -193,7 +224,14 @@ export async function updatePlanned(args: {
     .select('id, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.updated_at) return { ok: true, updatedAt: data.updated_at as string };
 
   // 0 rows — reconcile against the authoritative row.
@@ -204,7 +242,17 @@ export async function updatePlanned(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true);
+  // non-transport -> plain server error; only a successful empty reselect is 'gone'.
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
 
   const existingRow = existing as Record<string, unknown>;
@@ -238,7 +286,14 @@ export async function softDeletePlanned(args: {
     .select('id, deleted_at, updated_at')
     .maybeSingle();
 
-  if (error) return { ok: false, reason: 'error', message: describeWriteError(error) };
+  if (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: describeWriteError(error),
+      ...(isTransportError(error) ? { transport: true } : {}),
+    };
+  }
   if (data?.id) return { ok: true };
 
   // 0 rows — reconcile.
@@ -249,7 +304,16 @@ export async function softDeletePlanned(args: {
     .eq('id', args.id)
     .maybeSingle();
 
-  if (readErr) return { ok: false, reason: 'error', message: describeWriteError(readErr) };
+  // STEP 16-H2-D0: transport read failure -> retryable (transport:true).
+  const readClass = classifyWriteReadError(readErr, describeWriteError);
+  if (readClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: readClass.message,
+      ...(readClass.transport ? { transport: true } : {}),
+    };
+  }
   if (!existing) return { ok: false, reason: 'gone', message: EDIT_CONFLICT };
   if ((existing as Record<string, unknown>).deleted_at != null) {
     // Already soft-deleted — our earlier delete landed, response was lost.
