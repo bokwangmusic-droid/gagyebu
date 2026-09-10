@@ -319,9 +319,10 @@ export default function HomeScreen() {
         </Pressable>
       )}
 
-      {/* Category breakdown */}
+      {/* Category breakdown — "자세히" opens the dedicated
+          "카테고리별 지출 상세" screen (not the stats tab). */}
       {topCats.length > 0 && (
-        <Pressable onPress={() => router.push('/(tabs)/stats')}>
+        <Pressable onPress={() => router.push('/category-spending')}>
           <Card style={{ paddingVertical: spacing.lg, marginBottom: spacing.md }}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>

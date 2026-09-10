@@ -77,6 +77,7 @@ const HOUSEHOLD_READY_SCREENS = [
   '(tabs)',
   'all-transactions',
   'calendar',
+  'category-spending',
   'cards',
   'goals',
   'loans',
@@ -333,6 +334,7 @@ function RootNav() {
         <Stack.Screen name="input" options={MODAL} />
         <Stack.Screen name="all-transactions" options={MODAL} />
         <Stack.Screen name="calendar" options={MODAL} />
+        <Stack.Screen name="category-spending" options={MODAL} />
         <Stack.Screen name="recurring" options={MODAL} />
         <Stack.Screen name="recurring-add" options={MODAL} />
         <Stack.Screen name="goals" options={MODAL} />
