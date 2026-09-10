@@ -215,6 +215,11 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
   const catCreateLog: HCatCreateArgs[] = [];
   const catUpdateLog: HCatUpdateArgs[] = [];
   const catDeleteLog: HCatDeleteArgs[] = [];
+  // STEP 16-H2-C2-BUDGET A1: not exercised by this file's existing cases —
+  // present only so `createPendingWriteCoordinator`'s now-required
+  // `getServerBudgets` type-checks. Dedicated budget coverage lives in
+  // coordinator.budget.cases.ts.
+  const budgetServer = new Map<string, number>();
   let inFlight = 0;
 
   const h = {} as Harness;
@@ -299,6 +304,7 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     getServerTransactions: () => server,
     getServerCards: () => cardServer,
     getServerCategories: () => catServer,
+    getServerBudgets: () => budgetServer,
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();

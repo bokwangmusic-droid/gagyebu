@@ -13,13 +13,16 @@ import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { getAllCats, getCat, type CatOrderMap, type CustomCatMap } from '@/data/categories';
+import { runBudgetSaveBatch, type BudgetSavePlanItem } from '@/lib/budgetSaveBatch';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum } from '@/lib/format';
 import type { RemoteBudgetMeta } from '@/lib/remoteFinanceMapping';
 import { saveBudget } from '@/services/remoteBudgetWrite';
 import { useAuth } from '@/store/auth';
+import type { FinanceReadResult } from '@/store/financeRead';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { BudgetMap } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -63,7 +66,8 @@ export default function BudgetAddRoute() {
  */
 function BudgetFormRoute({ preselectCategory }: { preselectCategory?: string }) {
   const router = useRouter();
-  const { status, error, budgets, budgetMeta, customCats, catOrder, refresh } = useFinanceRead();
+  const { status, error, budgets, budgetMeta, customCats, catOrder, pendingBudgetOps, refresh } =
+    useFinanceRead();
 
   if (status !== 'ready') {
     return (
@@ -90,6 +94,7 @@ function BudgetFormRoute({ preselectCategory }: { preselectCategory?: string }) 
       budgetMeta={budgetMeta}
       customCats={customCats}
       catOrder={catOrder}
+      pendingBudgetOps={pendingBudgetOps}
       refresh={refresh}
       preselectCategory={preselectCategory}
     />
@@ -126,6 +131,7 @@ function BudgetForm({
   budgetMeta,
   customCats,
   catOrder,
+  pendingBudgetOps,
   refresh,
   preselectCategory,
 }: {
@@ -133,6 +139,9 @@ function BudgetForm({
   budgetMeta: Record<string, RemoteBudgetMeta>;
   customCats: CustomCatMap;
   catOrder: CatOrderMap;
+  /** STEP 16-H2-C2-BUDGET A2 §18 — categories that already carry an un-sent
+   *  offline write; `save()` refuses to stack a second one on top. */
+  pendingBudgetOps: FinanceReadResult['pendingBudgetOps'];
   refresh: () => Promise<void>;
   preselectCategory?: string;
 }) {
@@ -142,6 +151,11 @@ function BudgetForm({
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status } = useFinanceRead();
+  // STEP 16-H2-C2-BUDGET A2: durable offline fallback for a budget CREATE /
+  // UPDATE whose direct write hits a TRANSPORT failure. Mirrors input.tsx /
+  // card-add.tsx / categories.tsx. Named `pendingWrites` (not `pending`) —
+  // this screen already uses `pending` for the merged cart record below.
+  const pendingWrites = usePendingWrites();
 
   // STEP 16-G2-C3-B §6: shallow snapshot captured ONCE at mount. The
   // per-category concurrency token used at save time comes from THIS, not
@@ -226,6 +240,33 @@ function BudgetForm({
   const total = entries.reduce((sum, [, v]) => sum + v, 0);
   const canSave = entries.length > 0;
 
+  /**
+   * STEP 16-H2-C2-BUDGET A2 §5/§6 — one FROZEN plan built ONCE, synchronously,
+   * before any `await`. CREATE-vs-UPDATE and the `expectedUpdatedAt` token are
+   * decided from the MOUNT-time snapshot (`initialBudgetsRef` /
+   * `initialBudgetMetaRef` — never re-read mid-batch), so a background
+   * refresh firing while the batch is in flight can't reclassify an item or
+   * swap its concurrency token out from under it. The actual direct-write-
+   * first / transport-queue algorithm is `runBudgetSaveBatch`
+   * (src/lib/budgetSaveBatch.ts) — a pure function, unit-testable without
+   * React — this screen only builds the plan and wires the real services in.
+   */
+  const buildSavePlan = (): BudgetSavePlanItem[] => {
+    const plan: BudgetSavePlanItem[] = [];
+    for (const [catId, amt] of entries) {
+      const hadLiveRow = Object.prototype.hasOwnProperty.call(initialBudgetsRef.current, catId);
+      // Nothing to persist for an unchanged existing budget.
+      if (hadLiveRow && initialBudgetsRef.current[catId] === amt) continue;
+      plan.push({
+        categoryId: catId,
+        amount: amt,
+        op: hadLiveRow ? 'update' : 'create',
+        expectedUpdatedAt: hadLiveRow ? (initialBudgetMetaRef.current[catId]?.updatedAt ?? null) : null,
+      });
+    }
+    return plan;
+  };
+
   const save = async () => {
     if (submittingRef.current || !canSave) return;
     if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
@@ -233,63 +274,59 @@ function BudgetForm({
     submittingRef.current = true;
     setSubmitting(true);
 
-    let done = 0;
-    let attempted = 0;
-    let failure: { message: string; changedElsewhere: boolean } | null = null;
+    const plan = buildSavePlan();
+    const scope = { userId: session.user.id, householdId: activeHousehold.id };
+    const userId = session.user.id;
+    const householdId = activeHousehold.id;
 
-    for (const [catId, amt] of entries) {
-      // Nothing to persist for an unchanged existing budget.
-      const hadLiveRow = Object.prototype.hasOwnProperty.call(initialBudgetsRef.current, catId);
-      if (hadLiveRow && initialBudgetsRef.current[catId] === amt) continue;
-
-      const snapMeta = initialBudgetMetaRef.current[catId];
-      if (hadLiveRow && !snapMeta) {
-        // Should have been caught by BudgetFormRoute's invariant check.
-        failure = { message: '예산 정보를 다시 불러와 주세요.', changedElsewhere: false };
-        break;
-      }
-
-      const needed = hadLiveRow ? REMOTE_FINANCE_WRITE.budgetEdit : REMOTE_FINANCE_WRITE.budgetCreate;
-      if (!needed) {
-        failure = { message: '지금은 예산을 저장할 수 없어요.', changedElsewhere: false };
-        break;
-      }
-
-      attempted += 1;
-      const res = await saveBudget({
-        householdId: activeHousehold.id,
-        expectedUserId: session.user.id,
-        category: catId,
-        amount: amt,
-        expectedUpdatedAt: hadLiveRow ? snapMeta!.updatedAt : null,
-      });
-
-      if (!res.ok) {
-        const changedElsewhere =
-          res.reason === 'conflict' ||
-          res.reason === 'exists' ||
-          res.reason === 'deleted' ||
-          res.reason === 'gone';
-        failure = { message: res.message, changedElsewhere };
-        // STEP 16-G2-C3-B §25: stop at the first failure — never keep
-        // writing on a stale snapshot and widen the partial state.
-        break;
-      }
-      done += 1;
-    }
+    const { done, queued, attempted, failure } = await runBudgetSaveBatch(
+      plan,
+      { budgetCreate: REMOTE_FINANCE_WRITE.budgetCreate, budgetEdit: REMOTE_FINANCE_WRITE.budgetEdit },
+      {
+        pendingBudgetIds: new Set(pendingBudgetOps.keys()),
+        saveBudget: (item) =>
+          saveBudget({
+            householdId,
+            expectedUserId: userId,
+            category: item.categoryId,
+            amount: item.amount,
+            expectedUpdatedAt: item.expectedUpdatedAt,
+          }),
+        enqueueBudgetCreate: (item) =>
+          pendingWrites.enqueueBudgetCreate({
+            scope,
+            entityId: item.categoryId,
+            payload: { category: item.categoryId, amount: item.amount },
+          }),
+        enqueueBudgetUpdate: (item) =>
+          pendingWrites.enqueueBudgetUpdate({
+            scope,
+            entityId: item.categoryId,
+            payload: { category: item.categoryId, amount: item.amount },
+            expectedUpdatedAt: item.expectedUpdatedAt!,
+          }),
+      },
+    );
 
     // STEP 16-G2-C3-B §26/§27: exactly one authoritative refresh, then leave.
     await refresh();
 
     if (!failure) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      toast.show(done > 0 ? '예산을 저장했어요' : '변경된 예산이 없어요');
+      if (queued > 0) {
+        toast.show('저장했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+      } else {
+        toast.show(done > 0 ? '예산을 저장했어요' : '변경된 예산이 없어요');
+      }
       router.back();
       return;
     }
 
-    if (done > 0) {
-      toast.show(`일부 예산만 저장됐어요 (${done}/${attempted}). 최신 내용을 확인해 주세요.`);
+    if (done > 0 || queued > 0) {
+      // STEP 16-H2-C2-BUDGET A2 §7 item C — some items already landed
+      // (direct or durably queued) before this one stopped the batch; never
+      // report a blanket failure over a genuine partial result.
+      toast.show(`일부 예산은 저장됐지만 나머지는 저장하지 못했어요. (${done + queued}/${attempted})`);
     } else if (failure.changedElsewhere) {
       toast.show('다른 곳에서 예산이 변경됐어요. 최신 내용을 불러왔어요.');
     } else {

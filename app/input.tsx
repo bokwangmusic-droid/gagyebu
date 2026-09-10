@@ -71,6 +71,59 @@ const KEY_HEIGHT = 52;
 const KEY_GAP = 6;
 
 /**
+ * NUMPAD BACKSPACE LONG-PRESS REPEAT UX FIX — same interaction as
+ * src/components/ui/NumPad.tsx's backspace key, duplicated here (not
+ * imported) because this screen's keypad is its own inline copy, not the
+ * shared component. A tap deletes exactly one digit; holding repeats after a
+ * short delay until release. `onBackspace` is called repeatedly from a plain
+ * `setInterval` — this screen's `onKey('back')` already applies its edit via
+ * a functional `setState(prev => ...)` update, so calling it many times in a
+ * row is safe with no stale-value risk.
+ */
+const BACKSPACE_REPEAT_DELAY_MS = 400;
+const BACKSPACE_REPEAT_INTERVAL_MS = 80;
+
+/** `onPressIn`/`onPressOut` pair for a press-and-hold-to-repeat backspace key.
+ *  Deliberately NOT `onPress` — layering `onPress` on top of an immediate
+ *  onPressIn delete would double-delete every tap, and firing it again on
+ *  release after a long-press would delete one extra digit. */
+function useBackspaceRepeat(onBackspace: () => void) {
+  const delayTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const repeatTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearTimers = () => {
+    if (delayTimer.current != null) {
+      clearTimeout(delayTimer.current);
+      delayTimer.current = null;
+    }
+    if (repeatTimer.current != null) {
+      clearInterval(repeatTimer.current);
+      repeatTimer.current = null;
+    }
+  };
+
+  // Unmount / navigation-away safety — a held key never keeps deleting after
+  // the screen is gone.
+  useEffect(() => clearTimers, []);
+
+  const onPressIn = () => {
+    clearTimers(); // defensive: a stray leftover timer never survives a new press
+    onBackspace(); // the tap itself — exactly one digit, immediately
+    delayTimer.current = setTimeout(() => {
+      delayTimer.current = null;
+      repeatTimer.current = setInterval(onBackspace, BACKSPACE_REPEAT_INTERVAL_MS);
+    }, BACKSPACE_REPEAT_DELAY_MS);
+  };
+
+  // Release OR cancel (RN fires onPressOut in both cases) -> stop immediately.
+  const onPressOut = () => {
+    clearTimers();
+  };
+
+  return { onPressIn, onPressOut };
+}
+
+/**
  * Breathing room left ABOVE the 결제수단 section (which now holds the
  * freshly-rendered 신용카드 panel) when it is auto-scrolled into view —
  * cosmetic padding on top of a *measured* onLayout coordinate, NOT a guessed
@@ -465,6 +518,10 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       setInstallmentMonths((m) => applyMonthsKey(m, k));
     }
   };
+  // NUMPAD BACKSPACE LONG-PRESS REPEAT UX FIX — repeats the SAME onKey('back')
+  // (so amount / split / installment-months semantics per `numTarget` are
+  // completely unchanged) while the key is held; see `useBackspaceRepeat`.
+  const backspaceRepeat = useBackspaceRepeat(() => onKey('back'));
 
   // Android hardware back: close an open sub-sheet/panel first so a stray
   // back-press doesn't drop the whole input screen (losing the draft amount).
@@ -1498,7 +1555,8 @@ function TransactionForm({ mode }: { mode: FormMode }) {
             {/* backspace + 완료 */}
             <View style={{ flex: 1, gap: KEY_GAP }}>
               <Pressable
-                onPress={() => onKey('back')}
+                onPressIn={backspaceRepeat.onPressIn}
+                onPressOut={backspaceRepeat.onPressOut}
                 style={({ pressed }) => [
                   styles.key,
                   { height: KEY_HEIGHT },

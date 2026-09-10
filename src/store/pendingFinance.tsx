@@ -27,6 +27,7 @@ import { AppState, type AppStateStatus } from 'react-native';
 
 import type { Category } from '@/data/categories';
 import type { PendingWrite } from '@/lib/offlineQueue';
+import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
@@ -130,6 +131,30 @@ interface PendingFinanceValue {
     entityId: string;
     expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-C2-BUDGET A1 — current-scope BUDGET ops (create/update/delete,
+   *  incl. terminal-failed), bare category-id keys. ENGINE ONLY — no UI call
+   *  site enqueues these yet. */
+  pendingBudgetOps: PendingWrite[];
+  budgetOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  budgetFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingBudgetIds: ReadonlySet<string>;
+  failedBudgetIds: ReadonlySet<string>;
+  enqueueBudgetCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewBudgetDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueBudgetUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewBudgetDraft;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueBudgetDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
   /** STEP 16-H2-C2-B2 conflict-UX — drop ONE queued record by `queueId`
    *  ("변경 버리기"). NOT a server delete; scope-guarded; awaits persistence. */
   discardPending: (queueId: string) => Promise<DiscardOutcome>;
@@ -199,6 +224,13 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const serverCategoriesRef = useRef<ReadonlyMap<string, Category>>(serverCategories);
   serverCategoriesRef.current = serverCategories;
 
+  const serverBudgets = useMemo<ReadonlyMap<string, number>>(
+    () => new Map(Object.entries(rf.data?.budgets ?? {})),
+    [rf.data?.budgets],
+  );
+  const serverBudgetsRef = useRef<ReadonlyMap<string, number>>(serverBudgets);
+  serverBudgetsRef.current = serverBudgets;
+
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
   const coordRef = useRef<ReturnType<typeof createPendingWriteCoordinator> | null>(null);
@@ -210,6 +242,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getServerTransactions: () => serverTxnsRef.current,
       getServerCards: () => serverCardsRef.current,
       getServerCategories: () => serverCategoriesRef.current,
+      getServerBudgets: () => serverBudgetsRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -274,6 +307,12 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
         state.category.failedReasons.size > 0 ? state.category.failedReasons : EMPTY_REASON_MAP,
       pendingCategoryIds: state.category.pendingIds.size > 0 ? state.category.pendingIds : EMPTY_SET,
       failedCategoryIds: state.category.failedIds.size > 0 ? state.category.failedIds : EMPTY_SET,
+      pendingBudgetOps: state.budget.scopeOps.length > 0 ? state.budget.scopeOps : EMPTY_OPS,
+      budgetOpByEntity: state.budget.opByEntity.size > 0 ? state.budget.opByEntity : EMPTY_KIND_MAP,
+      budgetFailedReasons:
+        state.budget.failedReasons.size > 0 ? state.budget.failedReasons : EMPTY_REASON_MAP,
+      pendingBudgetIds: state.budget.pendingIds.size > 0 ? state.budget.pendingIds : EMPTY_SET,
+      failedBudgetIds: state.budget.failedIds.size > 0 ? state.budget.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
@@ -285,6 +324,9 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueCategoryCreate: coord.enqueueCategoryCreate,
       enqueueCategoryUpdate: coord.enqueueCategoryUpdate,
       enqueueCategoryDelete: coord.enqueueCategoryDelete,
+      enqueueBudgetCreate: coord.enqueueBudgetCreate,
+      enqueueBudgetUpdate: coord.enqueueBudgetUpdate,
+      enqueueBudgetDelete: coord.enqueueBudgetDelete,
       discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
     }),

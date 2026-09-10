@@ -14,12 +14,16 @@ import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
 import { useToast } from '@/components/ui/Toast';
 import { getCat } from '@/data/categories';
 import { monthlyTotals } from '@/lib/aggregate';
+import { sortBudgetEntriesByCategoryOrder } from '@/lib/budgetRowOrder';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { daysLeftInMonth, fmt } from '@/lib/format';
+import { pendingBudgetRowLabel } from '@/lib/pendingBudgetLabel';
 import { softDeleteBudget } from '@/services/remoteBudgetWrite';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
 
@@ -28,19 +32,65 @@ export default function BudgetScreen() {
   const toast = useToast();
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
-  const { status, error, transactions, budgets, budgetMeta, customCats, refresh } = useFinanceRead();
+  const {
+    status,
+    error,
+    transactions,
+    budgets,
+    budgetMeta,
+    customCats,
+    budgetManagementRows,
+    pendingBudgetOps,
+    catOrder,
+    refresh,
+  } = useFinanceRead();
+  // STEP 16-H2-C2-BUDGET A2: durable offline fallback for a budget DELETE
+  // whose direct write hits a TRANSPORT failure, and "변경 버리기" for a
+  // terminal-failed one. Mirrors app/categories.tsx.
+  const pendingWrites = usePendingWrites();
   const financeRefresh = useRemoteFinanceRefreshControl();
+  // STEP 16-H2-C2-BUDGET A2 §2 — the AGGREGATE (hero total / usage % / 남은
+  // budget) is computed from the AUTHORITATIVE `budgets` ONLY, exactly as
+  // before. A pending/failed amount never reaches this calculation.
   const { byCategory, expense, totalBudget, remaining } = useMemo(
     () => monthlyTotals(transactions, budgets),
     [transactions, budgets],
   );
 
-  const entries = Object.entries(budgets).sort((a, b) => (b[1] || 0) - (a[1] || 0));
+  // STEP 16-H2-C2-BUDGET A2 §8/§9/§10 — the ROW LIST is the DISPLAY-ONLY
+  // `budgetManagementRows` (authoritative budgets + pending/failed overlay),
+  // DELIBERATELY separate from the `budgets` used above for the aggregate.
+  //
+  // BUDGET ROW ORDER FIX: rows are ordered by the AUTHORITATIVE category
+  // display order (the same `catOrder` + built-in/custom category source
+  // app/categories.tsx and app/budget-add.tsx's picker already use) — never
+  // by amount, never by which order an offline op happened to enqueue in.
+  // A pending/failed row sits at its own category's normal spot, not
+  // appended to the bottom.
+  const entries = sortBudgetEntriesByCategoryOrder(
+    Object.entries(budgetManagementRows),
+    customCats,
+    catOrder,
+  );
 
   const deletingRef = useRef(false);
   const [deletingCat, setDeletingCat] = useState<string | null>(null);
 
   const canAdd = REMOTE_FINANCE_WRITE.budgetCreate || REMOTE_FINANCE_WRITE.budgetEdit;
+
+  /** Mirrors categories.tsx's `enqueueFailMessage`. */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '예산을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
 
   const doDelete = async (catId: string, token: string) => {
     if (deletingRef.current) return;
@@ -56,20 +106,63 @@ export default function BudgetScreen() {
       expectedUpdatedAt: token,
     });
 
-    await refresh();
-    deletingRef.current = false;
-    setDeletingCat(null);
-
     if (res.ok) {
+      await refresh();
+      deletingRef.current = false;
+      setDeletingCat(null);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('예산을 삭제했어요');
       return;
     }
+
+    // STEP 16-H2-C2-BUDGET A2 §16 — a TRANSPORT failure (offline) -> durable
+    // DELETE queue, using the SAME frozen token captured at confirm time.
+    if (res.transport === true) {
+      const enq = await pendingWrites.enqueueBudgetDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: catId,
+        expectedUpdatedAt: token,
+      });
+      await refresh();
+      deletingRef.current = false;
+      setDeletingCat(null);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        return;
+      }
+      // Durable enqueue failed — DO NOT claim success.
+      toast.show(enqueueFailMessage(enq.reason));
+      return;
+    }
+
+    await refresh();
+    deletingRef.current = false;
+    setDeletingCat(null);
     if (res.reason === 'identity' || res.reason === 'error') {
       toast.show(res.message);
       return;
     }
     toast.show('다른 곳에서 이미 변경됐거나 삭제된 예산이에요. 최신 내용을 불러왔어요.');
+  };
+
+  /** "변경 버리기" — drop the local failed record; the authoritative server
+   *  budget (if any) is never touched (STEP 16-H2-C2-BUDGET A2 §15). */
+  const discardFailed = (queueId: string) => {
+    Alert.alert('실패한 예산 변경을 버릴까요?', '서버에 저장된 최신 예산은 유지됩니다.', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '버리기',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            const r = await pendingWrites.discardPending(queueId);
+            if (r.ok) toast.show('실패한 예산 변경을 버렸어요');
+            else toast.show('변경을 버리지 못했어요. 잠시 후 다시 시도해주세요.');
+          })();
+        },
+      },
+    ]);
   };
 
   const confirmDelete = (catId: string, catName: string) => {
@@ -195,14 +288,21 @@ export default function BudgetScreen() {
           const pct = Math.round((spent / amount) * 100);
           const over = pct >= 100;
           const warn = pct >= 80;
-          const canDeleteThis = REMOTE_FINANCE_WRITE.budgetDelete && !!budgetMeta[catId];
+          // STEP 16-H2-C2-BUDGET A2 §18 — a row with an un-sent offline op
+          // (pending OR failed) is READ-ONLY: no tap-to-edit, no delete,
+          // until it lands or is discarded. Never stack a second write.
+          const pendingOp = pendingBudgetOps.get(catId);
+          const isPendingRow = !!pendingOp;
+          const pendingLabel = pendingOp ? pendingBudgetRowLabel(pendingOp) : null;
+          const discardQueueId = pendingOp?.failed && pendingOp.queueId ? pendingOp.queueId : null;
+          const canDeleteThis = REMOTE_FINANCE_WRITE.budgetDelete && !!budgetMeta[catId] && !isPendingRow;
           return (
             <BudgetRowShell
               key={catId}
               over={over}
-              dimmed={deletingCat === catId}
+              dimmed={deletingCat === catId || isPendingRow}
               onPress={
-                REMOTE_FINANCE_WRITE.budgetEdit
+                REMOTE_FINANCE_WRITE.budgetEdit && !isPendingRow
                   ? () => router.push({ pathname: '/budget-add', params: { category: catId } })
                   : undefined
               }
@@ -247,6 +347,34 @@ export default function BudgetScreen() {
                     {fmt(spent)} <Text style={{ color: over ? colors.expenseStrong : colors.textFaint }}>/ {fmt(amount)}원</Text>
                     {over ? <Text style={{ fontFamily: fontFamily.bold }}> (+{fmt(spent - amount)})</Text> : null}
                   </Text>
+                  {/* STEP 16-H2-C2-BUDGET A2 §8/§9/§11/§12, BUDGET CONFLICT
+                      LABEL UI FIX — pending/failed status. The row's own
+                      `amount` above is ALREADY the correct display value per
+                      composeBudgetManagement (authoritative wins on a failed
+                      conflict whose server row exists; only a genuinely
+                      synthetic row shows the attempted amount). `primary` /
+                      `detail` render as SEPARATE lines with no
+                      `numberOfLines` / ellipsis — a single combined string
+                      truncated to an unreadable "다른 기기 ..." in this
+                      narrow column, so the reason must never be folded back
+                      into one line. */}
+                  {pendingLabel && (
+                    <View style={{ marginTop: 2, gap: 1 }}>
+                      <Text style={{ fontFamily: fontFamily.semibold, fontSize: 10, color: colors.textMuted }}>
+                        {pendingLabel.primary}
+                      </Text>
+                      {pendingLabel.detail && (
+                        <Text style={{ fontFamily: fontFamily.medium, fontSize: 10, color: colors.textMuted }}>
+                          {pendingLabel.detail}
+                        </Text>
+                      )}
+                      {pendingOp?.failed && pendingOp.attemptedAmount !== undefined && (
+                        <Text style={{ fontFamily: fontFamily.medium, fontSize: 10, color: colors.textMuted }}>
+                          시도한 금액: {fmt(pendingOp.attemptedAmount)}원
+                        </Text>
+                      )}
+                    </View>
+                  )}
                 </View>
                 <Text
                   style={{
@@ -268,6 +396,24 @@ export default function BudgetScreen() {
                     hitSlop={8}
                   >
                     <AppIcon name="trash" size={14} color={colors.textFaint} />
+                  </Pressable>
+                )}
+                {discardQueueId && (
+                  <Pressable
+                    onPress={() => discardFailed(discardQueueId)}
+                    hitSlop={8}
+                    style={{
+                      paddingHorizontal: 8,
+                      paddingVertical: 5,
+                      borderRadius: radii.sm,
+                      borderWidth: 1,
+                      borderColor: colors.border,
+                      backgroundColor: colors.white,
+                    }}
+                  >
+                    <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>
+                      변경 버리기
+                    </Text>
                   </Pressable>
                 )}
               </View>

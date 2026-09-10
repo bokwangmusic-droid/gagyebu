@@ -1,6 +1,7 @@
 /**
  * Offline Write Queue — pure core. STEP 16-H2-A1, widened in H2-B1, again in
- * STEP 16-H2-C2-A1 (card), and again in STEP 16-H2-C2-B1 (custom category).
+ * STEP 16-H2-C2-A1 (card), STEP 16-H2-C2-B1 (custom category), and again in
+ * STEP 16-H2-C2-BUDGET A1 (budget, engine only — see below).
  *
  * NO Supabase, NO AsyncStorage, NO React. Just the record shapes, the
  * validator, the FIFO / idempotent enqueue, the scope filter, and the read
@@ -11,27 +12,48 @@
  * Scope: transaction CREATE/UPDATE/soft-DELETE (H2-A/B) + card
  * CREATE/UPDATE/soft-DELETE (H2-C2-A1) + custom-category CREATE/UPDATE/
  * soft-DELETE (H2-C2-B1, engine only — CREATE/UPDATE get UI wiring in B2,
- * DELETE stays UI-blocked on the Budget queue). `entity` is now
- * `'transaction' | 'card' | 'category'`; `op` is a 3-way union per entity.
- * `schemaVersion` STAYS 1 — a stored transaction/card queue loads with no
- * migration; a category record simply has `entity:'category'`.
+ * DELETE stays UI-blocked on the Budget queue) + budget CREATE/UPDATE/
+ * soft-DELETE (H2-C2-BUDGET A1, ENGINE ONLY — no UI enqueue call site yet;
+ * `app/budget-add.tsx` / `app/(tabs)/budget.tsx` / the category-delete->
+ * budget-delete chain in `app/categories.tsx` still call
+ * `saveBudget`/`softDeleteBudget` directly). `entity` is now
+ * `'transaction' | 'card' | 'category' | 'budget'`; `op` is a 3-way union
+ * per entity — budget reuses the SAME `create'|'update'|'delete'` union
+ * (no new `'save'` op kind) even though the server side is ONE `saveBudget()`
+ * function, so `PendingOpKind` and every generic op-kind switch elsewhere
+ * (label files, management-view shapes) need no changes.
+ * `schemaVersion` STAYS 1 — a stored transaction/card/category queue loads
+ * with no migration; a budget record simply has `entity:'budget'`.
  *
- * IMPORTANT (H2-C2-A1 §8/§9/§15, H2-C2-B1 §12/§13): a pending/failed CARD or
- * CATEGORY is NEVER folded into `RemoteFinanceData.cards` / `.customCats` /
- * `.categoryMeta` / `.catOrder`. `composeFinance` returns card and category
- * display rows in SEPARATE `cardManagement` / `categoryManagement`
- * collections so the transaction/planned/recurring/budget pickers, stats
- * name resolution, backup and household-import snapshots only ever see
- * authoritative server data — no cross-entity chaining is structurally
- * possible.
+ * Budget's natural key is `(household_id, category_id)` — there is NO
+ * client-generated surrogate id the way `card-…` / `c-…` ids exist for card/
+ * category. So a `PendingBudget*` record's `entityId` IS the plain
+ * `category_id` string (scoped by `scope.householdId` like every other
+ * record). This is a deliberate, unavoidable difference from card/category —
+ * NOT a bug — and it means a budget CREATE/UPDATE conflict against a
+ * DIFFERENT household member's row for the SAME category is a real,
+ * reachable race (unlike a card/category id collision, which is
+ * astronomically unlikely since those ids are client-generated per device).
+ *
+ * IMPORTANT (H2-C2-A1 §8/§9/§15, H2-C2-B1 §12/§13, H2-C2-BUDGET A1 §5): a
+ * pending/failed CARD, CATEGORY, or BUDGET is NEVER folded into
+ * `RemoteFinanceData.cards` / `.customCats` / `.categoryMeta` / `.catOrder` /
+ * `.budgets` / `.budgetMeta`. `composeFinance` returns card, category, and
+ * budget display rows in SEPARATE `cardManagement` / `categoryManagement` /
+ * `budgetManagement` collections so the transaction/planned/recurring
+ * pickers, stats name resolution, backup and household-import snapshots —
+ * and, for budget specifically, `monthlyTotals` / every other finance
+ * aggregate that reads `data.budgets` directly — only ever see authoritative
+ * server data. No cross-entity chaining is structurally possible.
  */
 import type { Category, CustomCatMap } from '@/data/categories';
+import { isValidBudgetDraft, type NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { CreditCard, Transaction } from '@/store/types';
+import type { BudgetMap, CreditCard, Transaction } from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
@@ -58,7 +80,7 @@ export interface PendingWriteScope {
  * optimistic-concurrency token lives in `expectedUpdatedAt` (UPDATE/DELETE),
  * NOT in `payload`.
  */
-export type PendingEntity = 'transaction' | 'card' | 'category';
+export type PendingEntity = 'transaction' | 'card' | 'category' | 'budget';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -186,6 +208,44 @@ export interface PendingCategoryDelete extends PendingWriteBase {
   expectedUpdatedAt: string;
 }
 
+/* ---------------- budget records (STEP 16-H2-C2-BUDGET A1) ---------------- */
+
+/**
+ * `payload` is exactly what `saveBudget({ ... })` is re-handed with
+ * `expectedUpdatedAt: null` — the UI-editable `NewBudgetDraft`
+ * (`category` / `amount`). `entityId` IS `payload.category` (the natural-key
+ * `category_id` — there is no separate client-generated budget id). No
+ * `expectedUpdatedAt` — a CREATE has no token, same as card/category.
+ */
+export interface PendingBudgetCreate extends PendingWriteBase {
+  entity: 'budget';
+  op: 'create';
+  payload: NewBudgetDraft;
+}
+
+/**
+ * `payload` is what `saveBudget({ ... })` is re-handed with a non-null
+ * `expectedUpdatedAt`. `expectedUpdatedAt` is FROZEN from the
+ * `budgetMeta.updatedAt` the form snapshot was taken against and is NEVER
+ * refreshed — a stale token is what turns a concurrent edit into a
+ * `conflict`, never a blind overwrite (same rule as every other UPDATE
+ * record in this file).
+ */
+export interface PendingBudgetUpdate extends PendingWriteBase {
+  entity: 'budget';
+  op: 'update';
+  payload: NewBudgetDraft;
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeleteBudget` guarded on the FROZEN
+ *  `expectedUpdatedAt`. NO `payload`. Never a hard DELETE. */
+export interface PendingBudgetDelete extends PendingWriteBase {
+  entity: 'budget';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
@@ -195,7 +255,10 @@ export type PendingWrite =
   | PendingCardDelete
   | PendingCategoryCreate
   | PendingCategoryUpdate
-  | PendingCategoryDelete;
+  | PendingCategoryDelete
+  | PendingBudgetCreate
+  | PendingBudgetUpdate
+  | PendingBudgetDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -308,13 +371,53 @@ function isValidCategoryDraft(p: unknown): p is NewCustomCategoryDraft {
   return true;
 }
 
+/**
+ * Structural validity for a stored `NewBudgetDraft` (STEP 16-H2-C2-BUDGET A1
+ * §7 — reuse the canonical `amount` rule rather than re-deriving one).
+ * `category` here is the category_id string (== `entityId`), NOT a display
+ * name. Any server / identity / timestamp / natural-key-column field present
+ * -> reject; the final `> 0` / finite check is delegated to
+ * `isValidBudgetDraft` (src/lib/remoteBudgetWriteMapping.ts) — the SAME
+ * function `saveBudget()` itself runs — so the queue can never accept a draft
+ * the write service would refuse.
+ */
+function isValidBudgetPayload(p: unknown): p is NewBudgetDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (!isNonEmptyString(d.category)) return false;
+  if (!isFiniteNumber(d.amount)) return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'category_id' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d ||
+    'deleted_at' in d
+  ) {
+    return false;
+  }
+  return isValidBudgetDraft({ category: d.category, amount: d.amount });
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
   const r = x as Record<string, unknown>;
   if (r.schemaVersion !== QUEUE_SCHEMA_VERSION) return null;
   if (!isNonEmptyString(r.queueId)) return null;
-  if (r.entity !== 'transaction' && r.entity !== 'card' && r.entity !== 'category') return null;
+  if (
+    r.entity !== 'transaction' &&
+    r.entity !== 'card' &&
+    r.entity !== 'category' &&
+    r.entity !== 'budget'
+  ) {
+    return null;
+  }
   if (r.op !== 'create' && r.op !== 'update' && r.op !== 'delete') return null;
   if (!isNonEmptyString(r.entityId)) return null;
   const scope = r.scope as Record<string, unknown> | undefined;
@@ -377,6 +480,29 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
     if ('payload' in r) return null; // a DELETE carries no user payload (§9)
     return { ...base, entity: 'category', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'budget') {
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token
+      if (!isValidBudgetPayload(r.payload)) return null;
+      return { ...base, entity: 'budget', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (!isValidBudgetPayload(r.payload)) return null;
+      return {
+        ...base,
+        entity: 'budget',
+        op: 'update',
+        payload: r.payload,
+        expectedUpdatedAt: r.expectedUpdatedAt,
+      };
+    }
+    // budget delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload
+    return { ...base, entity: 'budget', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
   }
 
   // ---- transaction ----
@@ -625,6 +751,71 @@ export function makePendingCategoryDelete(args: {
   };
 }
 
+export function makePendingBudgetCreate(args: {
+  scope: PendingWriteScope;
+  /** = payload.category (the category_id natural key). */
+  entityId: string;
+  payload: NewBudgetDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingBudgetCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'budget',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingBudgetUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewBudgetDraft;
+  /** FROZEN — the `budgetMeta.updatedAt` the form snapshot opened against. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingBudgetUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'budget',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingBudgetDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingBudgetDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'budget',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -684,7 +875,9 @@ function categoryEditableEqual(a: NewCustomCategoryDraft, b: NewCustomCategoryDr
  *   - card CREATE: identity AND same draft — a DIFFERING card CREATE for the
  *     same id is `existing-pending`, never a silent overwrite (§7/§10).
  *   - card UPDATE: same frozen `expectedUpdatedAt` AND same draft.
- *   - DELETE (either entity): same frozen `expectedUpdatedAt`.
+ *   - budget CREATE/UPDATE: same as card, but only `amount` can differ
+ *     (`category` is fixed by the shared `entityId`).
+ *   - DELETE (any entity): same frozen `expectedUpdatedAt`.
  */
 function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
   if (a.entity !== b.entity || a.op !== b.op) return false;
@@ -707,6 +900,18 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
     }
     if (a.op === 'update' && b.op === 'update') {
       return a.expectedUpdatedAt === b.expectedUpdatedAt && categoryEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
+  }
+
+  if (a.entity === 'budget' && b.entity === 'budget') {
+    // entityId equality (already established by the shared dedup key) means
+    // `payload.category` is identical on both sides — `amount` is the only
+    // field that can differ.
+    if (a.op === 'create' && b.op === 'create') return Number(a.payload.amount) === Number(b.payload.amount);
+    if (a.op === 'update' && b.op === 'update') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt && Number(a.payload.amount) === Number(b.payload.amount);
     }
     if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
     return false;
@@ -1111,6 +1316,161 @@ function composeCategoryManagement(
   return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedNameById };
 }
 
+/* ---------------- budget display model (STEP 16-H2-C2-BUDGET A1) ---------------- */
+
+/**
+ * Does an authoritative server budget amount already reflect a queued
+ * budget CREATE/UPDATE's desired draft? Mirrors `serverCardConfirmsUpdate` /
+ * `serverCategoryConfirmsUpdate` at the READ-MODEL level, but `BudgetMap`'s
+ * value is a bare `number` (no row object), so this takes the server amount
+ * directly. `serverAmount` MUST already be known-present (existence is the
+ * caller's `Map.has()` / `in` check) — this only compares the one editable
+ * field. Pure.
+ */
+export function serverBudgetConfirmsUpdate(serverAmount: number, draft: NewBudgetDraft): boolean {
+  return Number(serverAmount) === Number(draft.amount);
+}
+
+export interface BudgetManagementView {
+  /**
+   * The budgets to render on a BUDGET-MANAGEMENT surface ONLY: authoritative
+   * server `budgets`, with a NOT-failed pending UPDATE overlaid, plus a
+   * synthetic entry for a pending/failed CREATE, plus a synthetic entry for a
+   * FAILED UPDATE whose server row is GONE, minus a not-failed pending
+   * DELETE.
+   *
+   * STEP 16-H2-C2-BUDGET A1 §6 item C: a TERMINAL-failed CREATE whose natural
+   * key is now occupied by a DIFFERENT household member's row (a genuine
+   * `(household_id, category_id)` race — unlike card/category, budget has no
+   * client-generated id to make this astronomically unlikely) keeps the
+   * AUTHORITATIVE amount verbatim; the attempted local amount is exposed via
+   * `attemptedAmountById` as conflict metadata only, never used to replace
+   * the displayed row.
+   *
+   * DELIBERATELY separate from `data.budgets` (§5) so every finance
+   * aggregate (`monthlyTotals`, Home, insights, backup, household-import)
+   * only ever sees authoritative server budgets — the one entity where this
+   * separation matters most, since `budgets` feeds calculations directly
+   * (unlike `cards`/`customCats`, which only feed pickers/lookups). Equals
+   * `data.budgets` when there are no budget ops.
+   */
+  rows: BudgetMap;
+  /** category id -> the pending op that produced or marks it. */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** category ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server category ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+  /**
+   * category ids that are SYNTHETIC — present in `rows` only because of an
+   * op, with no authoritative server budget behind them (pending/failed
+   * CREATE, and a failed UPDATE whose server row is gone). A failed CREATE
+   * or failed UPDATE whose server row EXISTS (items C/E) is NOT here — its
+   * authoritative row stays a normal budget entry.
+   */
+  syntheticIds: ReadonlySet<string>;
+  /**
+   * category id -> the amount the user attempted in a TERMINAL-failed
+   * CREATE or UPDATE whose authoritative row shows something else. Conflict
+   * metadata ONLY — never used to replace the displayed row when the
+   * authoritative row exists (§6 items C/E).
+   */
+  attemptedAmountById: ReadonlyMap<string, number>;
+}
+
+function composeBudgetManagement(
+  serverBudgets: BudgetMap,
+  ops: readonly PendingWrite[],
+  failedBudgetIds?: ReadonlySet<string>,
+): BudgetManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const syntheticIds = new Set<string>();
+  const attemptedAmountById = new Map<string, number>();
+  const budgetOps = ops.filter(
+    (o): o is PendingBudgetCreate | PendingBudgetUpdate | PendingBudgetDelete => o.entity === 'budget',
+  );
+  if (budgetOps.length === 0) {
+    return { rows: serverBudgets, opById, failedIds, hiddenIds, syntheticIds, attemptedAmountById };
+  }
+
+  const failed = (id: string) => !!failedBudgetIds?.has(id);
+  const rows: BudgetMap = { ...serverBudgets }; // fresh object — never mutates serverBudgets
+  const hasServerRow = (id: string) => Object.prototype.hasOwnProperty.call(serverBudgets, id);
+
+  for (const op of budgetOps) {
+    const catId = op.entityId;
+
+    if (op.op === 'create') {
+      if (hasServerRow(catId)) {
+        // §6 item C: the natural-key slot is already occupied. A NOT-failed
+        // record here means OUR OWN create landed (response lost) — no
+        // marker needed, the ack reconcile will clear it. A TERMINAL-failed
+        // record means a DIFFERENT row (created/revived by someone else, or
+        // with a different amount) won the race — keep the authoritative
+        // amount verbatim, mark it, and expose the attempted amount as
+        // metadata only. Never synthetic (a real server row exists).
+        if (failed(catId)) {
+          opById.set(catId, 'create');
+          failedIds.add(catId);
+          attemptedAmountById.set(catId, op.payload.amount);
+        }
+        continue;
+      }
+      // §6 item A/B: no server row yet — synthetic pending/failed row.
+      rows[catId] = op.payload.amount;
+      opById.set(catId, 'create');
+      syntheticIds.add(catId); // no authoritative row behind it
+      if (failed(catId)) failedIds.add(catId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (hasServerRow(catId)) {
+        if (failed(catId)) {
+          // §6 item E: TERMINAL-failed UPDATE + authoritative row still on
+          // the server (the other device won). KEEP the authoritative
+          // amount verbatim — the stale local draft must NOT replace it.
+          opById.set(catId, 'update');
+          failedIds.add(catId);
+          attemptedAmountById.set(catId, op.payload.amount);
+          continue;
+        }
+        // §6 item D: still-pending (non-terminal) UPDATE -> overlay the draft.
+        rows[catId] = op.payload.amount;
+        opById.set(catId, 'update');
+        continue;
+      }
+      // §6 item F: server row GONE — only a TERMINAL-failed UPDATE gets a
+      // display-only synthetic row (a not-failed one just waits).
+      if (failed(catId)) {
+        rows[catId] = op.payload.amount;
+        opById.set(catId, 'update');
+        failedIds.add(catId);
+        syntheticIds.add(catId); // no authoritative row behind it
+        attemptedAmountById.set(catId, op.payload.amount);
+      }
+      continue;
+    }
+
+    // delete — §6 items G/H
+    if (failed(catId)) {
+      if (hasServerRow(catId)) {
+        opById.set(catId, 'delete'); // keep the server row visible, mark it failed
+        failedIds.add(catId);
+      }
+      continue;
+    }
+    if (hasServerRow(catId)) {
+      delete rows[catId];
+      hiddenIds.push(catId);
+    }
+  }
+
+  return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedAmountById };
+}
+
 export interface CardManagementView {
   /**
    * The cards to render on the card-management screen ONLY: authoritative
@@ -1230,6 +1590,13 @@ export interface ComposedFinance {
    * there are no category ops.
    */
   categoryManagement: CategoryManagementView;
+  /**
+   * STEP 16-H2-C2-BUDGET A1 — DISPLAY-ONLY budget rows + markers. NEVER
+   * merged into `data.budgets` / `data.budgetMeta` — `monthlyTotals` and
+   * every other finance aggregate keep reading `data.budgets` untouched.
+   * Equals `data.budgets` when there are no budget ops.
+   */
+  budgetManagement: BudgetManagementView;
 }
 
 /**
@@ -1265,6 +1632,7 @@ export function composeFinance(
   failedTransactionIds?: ReadonlySet<string>,
   failedCardIds?: ReadonlySet<string>,
   failedCategoryIds?: ReadonlySet<string>,
+  failedBudgetIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
   const categoryManagement = composeCategoryManagement(
@@ -1272,6 +1640,7 @@ export function composeFinance(
     ops,
     failedCategoryIds,
   );
+  const budgetManagement = composeBudgetManagement(serverData.budgets, ops, failedBudgetIds);
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
@@ -1282,6 +1651,7 @@ export function composeFinance(
       orphanedFailedUpdates: [],
       cardManagement,
       categoryManagement,
+      budgetManagement,
     };
   }
 
@@ -1356,6 +1726,7 @@ export function composeFinance(
       orphanedFailedUpdates,
       cardManagement,
       categoryManagement,
+      budgetManagement,
     };
   }
 
@@ -1370,5 +1741,6 @@ export function composeFinance(
     orphanedFailedUpdates,
     cardManagement,
     categoryManagement,
+    budgetManagement,
   };
 }

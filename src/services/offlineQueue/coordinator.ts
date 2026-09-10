@@ -25,6 +25,9 @@ import {
   MAX_PENDING_WRITES,
   computeBackoffDelay,
   enqueuePendingWrite,
+  makePendingBudgetCreate,
+  makePendingBudgetDelete,
+  makePendingBudgetUpdate,
   makePendingCardCreate,
   makePendingCardDelete,
   makePendingCardUpdate,
@@ -35,6 +38,7 @@ import {
   makePendingTransactionDelete,
   makePendingTransactionUpdate,
   opsForScope,
+  serverBudgetConfirmsUpdate,
   serverCardConfirmsUpdate,
   serverCategoryConfirmsUpdate,
   serverRowConfirmsUpdate,
@@ -42,6 +46,7 @@ import {
   type PendingWrite,
 } from '@/lib/offlineQueue';
 import type { Category } from '@/data/categories';
+import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
@@ -99,8 +104,13 @@ export interface CoordinatorState {
   card: CoordinatorEntityState;
   /** STEP 16-H2-C2-B1 — the CUSTOM-CATEGORY view (bare category-id keys). */
   category: CoordinatorEntityState;
+  /** STEP 16-H2-C2-BUDGET A1 — the BUDGET view (bare category-id keys — a
+   *  budget's natural key IS the category_id, same key space as `category`
+   *  but a structurally separate entity/map). */
+  budget: CoordinatorEntityState;
   /** Total pending ops across ALL entities in the current scope (§28 — the
-   *  future household-import guard must see cards + categories too). */
+   *  future household-import guard must see cards + categories + budgets
+   *  too). */
   pendingCount: number;
   lastError: string | null;
   flushing: boolean;
@@ -142,6 +152,14 @@ export interface CoordinatorDeps {
    * soft-deleted categories).
    */
   getServerCategories: () => ReadonlyMap<string, Category>;
+  /**
+   * Live getter — the trusted server snapshot's ACTIVE budgets, keyed by
+   * category_id (bare `RemoteFinanceData.budgets` values — a plain number,
+   * no row object). STEP 16-H2-C2-BUDGET A1: CREATE/UPDATE ack = category
+   * present AND amount matches the queued draft; DELETE ack = category
+   * absent (the read model already excludes soft-deleted budgets).
+   */
+  getServerBudgets: () => ReadonlyMap<string, number>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -156,6 +174,8 @@ export interface CoordinatorDeps {
   createCategory?: RunOpDeps['createCategory'];
   updateCategory?: RunOpDeps['updateCategory'];
   softDeleteCategory?: RunOpDeps['softDeleteCategory'];
+  saveBudget?: RunOpDeps['saveBudget'];
+  softDeleteBudget?: RunOpDeps['softDeleteBudget'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -224,6 +244,27 @@ export interface PendingWriteCoordinator {
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
   enqueueCategoryDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2-C2-BUDGET A1 — budget ops. ENGINE ONLY — no UI call site
+   *  enqueues these yet. `entityId` is the category_id (budget's natural
+   *  key — no separate client-generated budget id). `expectedUpdatedAt` is
+   *  FROZEN by the caller from the `budgetMeta.updatedAt` the form snapshot
+   *  opened against; stored verbatim, NEVER re-read. */
+  enqueueBudgetCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewBudgetDraft;
+  }): Promise<EnqueueOutcome>;
+  enqueueBudgetUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewBudgetDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueueBudgetDelete(args: {
     scope: CoordinatorScope;
     entityId: string;
     expectedUpdatedAt: string;
@@ -311,6 +352,8 @@ export function createPendingWriteCoordinator(
         ...(deps.createCategory ? { createCategory: deps.createCategory } : {}),
         ...(deps.updateCategory ? { updateCategory: deps.updateCategory } : {}),
         ...(deps.softDeleteCategory ? { softDeleteCategory: deps.softDeleteCategory } : {}),
+        ...(deps.saveBudget ? { saveBudget: deps.saveBudget } : {}),
+        ...(deps.softDeleteBudget ? { softDeleteBudget: deps.softDeleteBudget } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -433,13 +476,32 @@ export function createPendingWriteCoordinator(
         const serverRows = deps.getServerTransactions();
         const serverCards = deps.getServerCards();
         const serverCategories = deps.getServerCategories();
+        const serverBudgets = deps.getServerBudgets();
         const knownCards = deps.getKnownCardIds();
         const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
         for (const [queueId, { entity, entityId, op }] of awaitingAck) {
           const rec = controller.read().find((r) => r.queueId === queueId);
           let ok: boolean;
-          if (entity === 'category') {
+          if (entity === 'budget') {
+            // STEP 16-H2-C2-BUDGET A1 §7/§9
+            if (op === 'delete') {
+              ok = !serverBudgets.has(entityId);
+            } else {
+              // CREATE + UPDATE: category present AND amount matches the
+              // queued draft. A present category with a DIFFERENT amount
+              // (someone else's concurrent create/update) is NOT an ack —
+              // it drops back to the normal queue and replays, whose
+              // reconcile inside `saveBudget` classifies it as `exists`/
+              // `conflict` (never a blind success).
+              const amt = serverBudgets.get(entityId);
+              ok =
+                amt !== undefined &&
+                (rec?.op === 'create' || rec?.op === 'update') &&
+                rec.entity === 'budget' &&
+                serverBudgetConfirmsUpdate(amt, rec.payload);
+            }
+          } else if (entity === 'category') {
             // STEP 16-H2-C2-B1 §25/§26/§27
             if (op === 'delete') {
               ok = !serverCategories.has(entityId);
@@ -715,6 +777,46 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueueBudgetCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewBudgetDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingBudgetCreate({ scope: args.scope, entityId: args.entityId, payload: args.payload }),
+    );
+  }
+
+  function enqueueBudgetUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewBudgetDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingBudgetUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueBudgetDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingBudgetDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -800,6 +902,7 @@ export function createPendingWriteCoordinator(
     const txn = entityStateOf('transaction', allScopeOps);
     const card = entityStateOf('card', allScopeOps);
     const category = entityStateOf('category', allScopeOps);
+    const budget = entityStateOf('budget', allScopeOps);
     return {
       hydration,
       scopeOps: txn.scopeOps,
@@ -809,6 +912,7 @@ export function createPendingWriteCoordinator(
       failedReasons: txn.failedReasons,
       card,
       category,
+      budget,
       pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -827,6 +931,9 @@ export function createPendingWriteCoordinator(
     enqueueCategoryCreate,
     enqueueCategoryUpdate,
     enqueueCategoryDelete,
+    enqueueBudgetCreate,
+    enqueueBudgetUpdate,
+    enqueueBudgetDelete,
     discardPending,
     requestFlush,
     dispose,

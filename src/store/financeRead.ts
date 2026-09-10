@@ -215,6 +215,35 @@ export interface FinanceReadResult {
     }
   >;
 
+  /**
+   * STEP 16-H2-C2-BUDGET A1 — ENGINE ONLY (no screen reads this yet). The
+   * budget list for a BUDGET-MANAGEMENT surface: authoritative server
+   * `budgets` with a pending UPDATE overlaid, a synthetic entry for a
+   * pending/failed CREATE, a synthetic entry for a failed UPDATE whose
+   * server row is gone, minus a not-failed pending DELETE. DELIBERATELY
+   * separate from `budgets` (§5) — `budgets` stays authoritative-server-only
+   * so `monthlyTotals` / every other finance aggregate never sees an un-sent
+   * budget. Equals `budgets` when there are no budget ops.
+   */
+  budgetManagementRows: BudgetMap;
+  /**
+   * category id -> its pending offline-op state, for a future budget row
+   * label / read-only gate. Mirrors `pendingCategoryOps`, with
+   * `attemptedAmount` (number) in place of `attemptedName`. `reason` /
+   * `attemptedAmount` are only set when `failed` is true.
+   */
+  pendingBudgetOps: ReadonlyMap<
+    string,
+    {
+      op: 'create' | 'update' | 'delete';
+      failed: boolean;
+      reason?: WriteConflictReason;
+      queueId?: string;
+      synthetic: boolean;
+      attemptedAmount?: number;
+    }
+  >;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -247,6 +276,8 @@ const EMPTY_SLICES = {
   pendingCardOps: new Map() as FinanceReadResult['pendingCardOps'],
   categoryManagementRows: DEFAULT_CUSTOM_CATS,
   pendingCategoryOps: new Map() as FinanceReadResult['pendingCategoryOps'],
+  budgetManagementRows: {} as BudgetMap,
+  pendingBudgetOps: new Map() as FinanceReadResult['pendingBudgetOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -264,6 +295,9 @@ export function useFinanceRead(): FinanceReadResult {
     pendingCategoryOps: providerCategoryOps,
     categoryFailedReasons,
     failedCategoryIds: providerFailedCategoryIds,
+    pendingBudgetOps: providerBudgetOps,
+    budgetFailedReasons,
+    failedBudgetIds: providerFailedBudgetIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -285,15 +319,19 @@ export function useFinanceRead(): FinanceReadResult {
       // `providerFailedIds` (entity-id set) only changes DELETE behaviour —
       // a failed DELETE keeps its server row visible so it can be labelled.
       const anyOps =
-        providerOps.length > 0 || providerCardOps.length > 0 || providerCategoryOps.length > 0;
+        providerOps.length > 0 ||
+        providerCardOps.length > 0 ||
+        providerCategoryOps.length > 0 ||
+        providerBudgetOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
               data,
-              [...providerOps, ...providerCardOps, ...providerCategoryOps],
+              [...providerOps, ...providerCardOps, ...providerCategoryOps, ...providerBudgetOps],
               providerFailedIds,
               providerFailedCardIds,
               providerFailedCategoryIds,
+              providerFailedBudgetIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -355,6 +393,41 @@ export function useFinanceRead(): FinanceReadResult {
           });
         }
       }
+      // STEP 16-H2-C2-BUDGET A1: budget display-only surface. `composeFinance`
+      // NEVER folded a budget row into `composed.budgets` — it feeds
+      // `budgetManagement` only. `budgets`/`budgetMeta` below stay
+      // `data.budgets`/`data.budgetMeta` untouched (§5).
+      const budgetManagementRows = composedResult
+        ? composedResult.budgetManagement.rows
+        : data.budgets;
+      const pendingBudgetOps = new Map<
+        string,
+        {
+          op: 'create' | 'update' | 'delete';
+          failed: boolean;
+          reason?: WriteConflictReason;
+          queueId?: string;
+          synthetic: boolean;
+          attemptedAmount?: number;
+        }
+      >();
+      if (composedResult) {
+        const bm = composedResult.budgetManagement;
+        for (const [id, op] of bm.opById) {
+          const isFailed = bm.failedIds.has(id);
+          const rec = providerBudgetOps.find((o) => o.entityId === id);
+          pendingBudgetOps.set(id, {
+            op,
+            failed: isFailed,
+            synthetic: bm.syntheticIds.has(id),
+            ...(rec ? { queueId: rec.queueId } : {}),
+            ...(isFailed ? { reason: budgetFailedReasons.get(id) } : {}),
+            ...(isFailed && bm.attemptedAmountById.has(id)
+              ? { attemptedAmount: bm.attemptedAmountById.get(id) }
+              : {}),
+          });
+        }
+      }
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -400,6 +473,8 @@ export function useFinanceRead(): FinanceReadResult {
         pendingCardOps,
         categoryManagementRows,
         pendingCategoryOps,
+        budgetManagementRows,
+        pendingBudgetOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -461,5 +536,8 @@ export function useFinanceRead(): FinanceReadResult {
     providerCategoryOps,
     categoryFailedReasons,
     providerFailedCategoryIds,
+    providerBudgetOps,
+    budgetFailedReasons,
+    providerFailedBudgetIds,
   ]);
 }

@@ -1,4 +1,5 @@
 import { LinearGradient } from 'expo-linear-gradient';
+import { useEffect, useRef } from 'react';
 import {
   Pressable,
   StyleSheet,
@@ -11,6 +12,59 @@ import {
 import { AppIcon } from '@/components/AppIcon';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
+
+/**
+ * NUMPAD BACKSPACE LONG-PRESS REPEAT UX FIX — a tap deletes exactly one
+ * digit; holding repeats after a short delay until release. `onBackspace` is
+ * called repeatedly from a plain `setInterval`, never re-reading component
+ * state itself — every caller's own handler already applies its edit via a
+ * functional `setState(prev => ...)` update (verified across all 8 screens
+ * using this component), so calling the SAME closure many times in a row is
+ * safe with no stale-value risk, even though the closure identity captured
+ * by the running interval doesn't change mid-hold.
+ */
+const BACKSPACE_REPEAT_DELAY_MS = 400;
+const BACKSPACE_REPEAT_INTERVAL_MS = 80;
+
+/** `onPressIn`/`onPressOut` pair for a press-and-hold-to-repeat backspace key.
+ *  Deliberately NOT `onPress` — layering `onPress` on top of an immediate
+ *  onPressIn delete would double-delete every tap, and firing it again on
+ *  release after a long-press would delete one extra digit. */
+function useBackspaceRepeat(onBackspace: () => void) {
+  const delayTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const repeatTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearTimers = () => {
+    if (delayTimer.current != null) {
+      clearTimeout(delayTimer.current);
+      delayTimer.current = null;
+    }
+    if (repeatTimer.current != null) {
+      clearInterval(repeatTimer.current);
+      repeatTimer.current = null;
+    }
+  };
+
+  // Unmount / navigation-away safety — a held key never keeps deleting after
+  // the screen is gone.
+  useEffect(() => clearTimers, []);
+
+  const onPressIn = () => {
+    clearTimers(); // defensive: a stray leftover timer never survives a new press
+    onBackspace(); // the tap itself — exactly one digit, immediately
+    delayTimer.current = setTimeout(() => {
+      delayTimer.current = null;
+      repeatTimer.current = setInterval(onBackspace, BACKSPACE_REPEAT_INTERVAL_MS);
+    }, BACKSPACE_REPEAT_DELAY_MS);
+  };
+
+  // Release OR cancel (RN fires onPressOut in both cases) -> stop immediately.
+  const onPressOut = () => {
+    clearTimers();
+  };
+
+  return { onPressIn, onPressOut };
+}
 
 /**
  * The app's custom money keypad — 1–9 / 00 / 0 digit grid, a backspace key
@@ -46,6 +100,7 @@ export function NumPad({
   /** Opt-in: replace the "00" key with a "." key for decimal entry. */
   decimal?: boolean;
 }) {
+  const backspace = useBackspaceRepeat(onBackspace);
   return (
     <View style={[styles.numPad, style]}>
       <View style={{ flexDirection: 'row', gap: KEY_GAP }}>
@@ -76,7 +131,8 @@ export function NumPad({
         {/* backspace + 완료 */}
         <View style={{ flex: 1, gap: KEY_GAP }}>
           <Pressable
-            onPress={onBackspace}
+            onPressIn={backspace.onPressIn}
+            onPressOut={backspace.onPressOut}
             style={({ pressed }) => [
               styles.key,
               { height: KEY_HEIGHT },

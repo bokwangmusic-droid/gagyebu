@@ -1,14 +1,22 @@
 /**
  * Offline Write Queue — server replay adapter. STEP 16-H2-A1 §8,
- * widened in STEP 16-H2-B1 (§13/§14).
+ * widened in STEP 16-H2-B1 (§13/§14), STEP 16-H2-C2-A1/B1 (card/category),
+ * and STEP 16-H2-C2-BUDGET A1 (budget).
  *
  * Maps ONE `PendingWrite` back onto the EXISTING write service
- * (`createTransaction` / `updateTransaction` / `softDeleteTransaction`). It
- * NEVER re-implements validation, the session guard, the INSERT/UPDATE, the
- * 23505 reconcile, or the `expectedUpdatedAt` optimistic-concurrency check —
- * it just calls the service with the FROZEN queue values and normalises the
- * result. `expectedUpdatedAt` is taken verbatim from the record; it is never
+ * (`createTransaction` / `updateTransaction` / `softDeleteTransaction`, or
+ * the card/category/budget equivalents). It NEVER re-implements validation,
+ * the session guard, the INSERT/UPDATE, the 23505 reconcile, or the
+ * `expectedUpdatedAt` optimistic-concurrency check — it just calls the
+ * service with the FROZEN queue values and normalises the result.
+ * `expectedUpdatedAt` is taken verbatim from the record; it is never
  * refreshed to a newer token here (STEP 16-H2-B1 §5/§13).
+ *
+ * Budget is the one entity where the service layer is a SINGLE function
+ * (`saveBudget`) for both CREATE and UPDATE — this adapter still keeps the
+ * queue-level `op: 'create' | 'update'` distinction (so `PendingOpKind` and
+ * every generic op-kind switch elsewhere needs no changes) and only decides
+ * `expectedUpdatedAt: null` vs the frozen token when calling `saveBudget`.
  */
 import {
   createTransaction,
@@ -35,6 +43,12 @@ import {
   type SoftDeleteCategoryResult,
   type UpdateCategoryResult,
 } from '@/services/remoteCategoryWrite';
+import {
+  saveBudget,
+  softDeleteBudget,
+  type SaveBudgetResult,
+  type SoftDeleteBudgetResult,
+} from '@/services/remoteBudgetWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
@@ -126,6 +140,26 @@ export interface RunOpDeps {
     expectedUserId: string;
     expectedUpdatedAt: string;
   }) => Promise<SoftDeleteCategoryResult>;
+  /**
+   * STEP 16-H2-C2-BUDGET A1 — injected in tests; default to the real
+   * `saveBudget`/`softDeleteBudget`. Budget has ONE service function for
+   * BOTH create and update (`saveBudget`, branching on nullable
+   * `expectedUpdatedAt`) — there is no separate `createBudget`/`updateBudget`
+   * pair to inject, unlike card/category.
+   */
+  saveBudget?: (args: {
+    householdId: string;
+    expectedUserId: string;
+    category: string;
+    amount: number;
+    expectedUpdatedAt: string | null;
+  }) => Promise<SaveBudgetResult>;
+  softDeleteBudget?: (args: {
+    householdId: string;
+    expectedUserId: string;
+    category: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteBudgetResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -135,11 +169,62 @@ export async function runPendingWrite(
   op: PendingWrite,
   deps: RunOpDeps,
 ): Promise<RunOpOutcome> {
-  if (op.entity !== 'transaction' && op.entity !== 'card' && op.entity !== 'category') {
+  if (
+    op.entity !== 'transaction' &&
+    op.entity !== 'card' &&
+    op.entity !== 'category' &&
+    op.entity !== 'budget'
+  ) {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
 
   try {
+    // ---- BUDGET (STEP 16-H2-C2-BUDGET A1) ----
+    if (op.entity === 'budget') {
+      if (op.op === 'delete') {
+        const del = deps.softDeleteBudget ?? softDeleteBudget;
+        const res = await del({
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          category: op.entityId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+        });
+        if (res.ok) return { kind: 'success' }; // already-deleted is ok:true (idempotent)
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return { kind: 'terminal', reason: res.reason, message: res.message };
+      }
+
+      // CREATE and UPDATE both go through the ONE `saveBudget()` — the
+      // service itself branches on `expectedUpdatedAt` (null => INSERT +
+      // 23505 reconcile, string => guarded UPDATE). There is no separate
+      // createBudget/updateBudget to call.
+      const save = deps.saveBudget ?? saveBudget;
+      const res = await save({
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        category: op.entityId,
+        amount: op.payload.amount,
+        expectedUpdatedAt: op.op === 'update' ? op.expectedUpdatedAt : null,
+      });
+      if (res.ok) return { kind: 'success' };
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // STEP 16-H2-C2-BUDGET A1 §4 — normalize `BudgetWriteReason` (which
+      // adds `invalid` + `exists` on top of the shared `WriteConflictReason`)
+      // WITHOUT collapsing `exists` to reason-less:
+      //   - `exists` is a REAL concurrency conflict — the natural-key slot
+      //     is already occupied by a different row (another device's
+      //     create/revive, or the same category with a different amount).
+      //     Normalize to `conflict` so it is retained terminal-failed and
+      //     NEVER auto-retried into a blind overwrite. `message` is preserved
+      //     as-is.
+      //   - `invalid` cannot be fixed by retrying (structural draft
+      //     failure) -> reason-less generic terminal, same treatment as
+      //     category's `invalid`.
+      const reason: WriteConflictReason | undefined =
+        res.reason === 'exists' ? 'conflict' : res.reason === 'invalid' ? undefined : res.reason;
+      return { kind: 'terminal', ...(reason ? { reason } : {}), message: res.message };
+    }
+
     // ---- CATEGORY (STEP 16-H2-C2-B1 §21–§23) ----
     if (op.entity === 'category') {
       if (op.op === 'create') {
