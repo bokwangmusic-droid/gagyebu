@@ -35,6 +35,9 @@ import {
   makePendingCategoryCreate,
   makePendingCategoryDelete,
   makePendingCategoryUpdate,
+  makePendingPlannedCreate,
+  makePendingPlannedDelete,
+  makePendingPlannedUpdate,
   makePendingTransactionCreate,
   makePendingTransactionDelete,
   makePendingTransactionUpdate,
@@ -42,6 +45,7 @@ import {
   serverBudgetConfirmsUpdate,
   serverCardConfirmsUpdate,
   serverCategoryConfirmsUpdate,
+  serverPlannedConfirmsUpdate,
   serverRowConfirmsUpdate,
   type PendingEntity,
   type PendingWrite,
@@ -51,6 +55,7 @@ import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import {
   createQueueController,
@@ -61,7 +66,7 @@ import {
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
-import type { CreditCard, Transaction } from '@/store/types';
+import type { CreditCard, PlannedExpense, Transaction } from '@/store/types';
 
 /** STEP 16-H2-C2-A1 §21 — internal state is keyed by `${entity}:${entityId}`,
  *  NOT bare `entityId`, so a card op and a transaction op that happen to
@@ -113,6 +118,8 @@ export interface CoordinatorState {
    *  category-id keys, `categoryBudget:` opKey namespace). Only ever holds
    *  `op: 'delete'` records. */
   categoryBudget: CoordinatorEntityState;
+  /** STEP 16-H2-E1 — the PLANNED-EXPENSE view (bare planned-id keys). */
+  planned: CoordinatorEntityState;
   /** Total pending ops across ALL entities in the current scope (§28 — the
    *  future household-import guard must see cards + categories + budgets
    *  + composite deletes too). */
@@ -165,6 +172,15 @@ export interface CoordinatorDeps {
    * absent (the read model already excludes soft-deleted budgets).
    */
   getServerBudgets: () => ReadonlyMap<string, number>;
+  /**
+   * Live getter — the trusted server snapshot's ACTIVE planned expenses,
+   * keyed by id. STEP 16-H2-E1 §9/§10/§11/§12: planned CREATE ack = id
+   * present AND fields match the queued draft; UPDATE ack = row present AND
+   * fields match; DELETE ack = id absent (the finance snapshot already
+   * excludes soft-deleted planned rows). This is the AUTHORITATIVE state —
+   * the coordinator never creates a local planned truth of its own.
+   */
+  getServerPlanned: () => ReadonlyMap<string, PlannedExpense>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -182,6 +198,9 @@ export interface CoordinatorDeps {
   saveBudget?: RunOpDeps['saveBudget'];
   softDeleteBudget?: RunOpDeps['softDeleteBudget'];
   softDeleteCustomCategoryWithBudget?: RunOpDeps['softDeleteCustomCategoryWithBudget'];
+  createPlanned?: RunOpDeps['createPlanned'];
+  updatePlanned?: RunOpDeps['updatePlanned'];
+  softDeletePlanned?: RunOpDeps['softDeletePlanned'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -289,6 +308,26 @@ export interface PendingWriteCoordinator {
     expectedCategoryUpdatedAt: string;
     expectedBudgetUpdatedAt: string | null;
   }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2-E1 — planned-expense ops. `entityId` is the client-stable
+   *  `p-…` planned id. `expectedUpdatedAt` is FROZEN by the caller from the
+   *  `plannedMeta.updatedAt` the edit screen opened against; stored verbatim,
+   *  NEVER re-read. ENGINE ONLY — no UI call site enqueues these yet (E2). */
+  enqueuePlannedCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewPlannedExpenseDraft;
+  }): Promise<EnqueueOutcome>;
+  enqueuePlannedUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewPlannedExpenseDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueuePlannedDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
   /**
    * STEP 16-H2-C2-B2 conflict-UX — permanently DROP one queued record by its
    * `queueId` ("변경 버리기" for a terminal-failed UPDATE). This is NOT a
@@ -377,6 +416,9 @@ export function createPendingWriteCoordinator(
         ...(deps.softDeleteCustomCategoryWithBudget
           ? { softDeleteCustomCategoryWithBudget: deps.softDeleteCustomCategoryWithBudget }
           : {}),
+        ...(deps.createPlanned ? { createPlanned: deps.createPlanned } : {}),
+        ...(deps.updatePlanned ? { updatePlanned: deps.updatePlanned } : {}),
+        ...(deps.softDeletePlanned ? { softDeletePlanned: deps.softDeletePlanned } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -500,6 +542,7 @@ export function createPendingWriteCoordinator(
         const serverCards = deps.getServerCards();
         const serverCategories = deps.getServerCategories();
         const serverBudgets = deps.getServerBudgets();
+        const serverPlanned = deps.getServerPlanned();
         const knownCards = deps.getKnownCardIds();
         const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
@@ -558,6 +601,28 @@ export function createPendingWriteCoordinator(
                 (rec?.op === 'create' || rec?.op === 'update') &&
                 rec.entity === 'card' &&
                 serverCardConfirmsUpdate(card, rec.payload);
+            }
+          } else if (entity === 'planned') {
+            // STEP 16-H2-E1 §10/§11/§12
+            if (op === 'delete') {
+              // §12/§23: the finance snapshot's `planned` already excludes
+              // soft-deleted rows, so "not present" == deleted/gone — the
+              // desired outcome.
+              ok = !serverPlanned.has(entityId);
+            } else {
+              // CREATE + UPDATE: row present AND its fields SEMANTICALLY match
+              // the queued draft. Same id but a DIFFERENT server payload
+              // (someone else's concurrent create/edit) is NOT an ack — it
+              // drops back to the normal queue and replays, whose reconcile
+              // inside `createPlanned`/`updatePlanned` classifies it as
+              // `conflict` (never a blind success). `updatedAt` changing
+              // alone is never enough — content match is what matters (§11).
+              const row = serverPlanned.get(entityId);
+              ok =
+                !!row &&
+                (rec?.op === 'create' || rec?.op === 'update') &&
+                rec.entity === 'planned' &&
+                serverPlannedConfirmsUpdate(row, rec.payload);
             }
           } else if (op === 'create') {
             ok = serverRows.has(entityId);
@@ -882,6 +947,46 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueuePlannedCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewPlannedExpenseDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingPlannedCreate({ scope: args.scope, entityId: args.entityId, payload: args.payload }),
+    );
+  }
+
+  function enqueuePlannedUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewPlannedExpenseDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingPlannedUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueuePlannedDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingPlannedDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -969,6 +1074,7 @@ export function createPendingWriteCoordinator(
     const category = entityStateOf('category', allScopeOps);
     const budget = entityStateOf('budget', allScopeOps);
     const categoryBudget = entityStateOf('categoryBudget', allScopeOps);
+    const planned = entityStateOf('planned', allScopeOps);
     return {
       hydration,
       scopeOps: txn.scopeOps,
@@ -980,6 +1086,7 @@ export function createPendingWriteCoordinator(
       category,
       budget,
       categoryBudget,
+      planned,
       pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -1002,6 +1109,9 @@ export function createPendingWriteCoordinator(
     enqueueBudgetUpdate,
     enqueueBudgetDelete,
     enqueueCategoryBudgetDelete,
+    enqueuePlannedCreate,
+    enqueuePlannedUpdate,
+    enqueuePlannedDelete,
     discardPending,
     requestFlush,
     dispose,

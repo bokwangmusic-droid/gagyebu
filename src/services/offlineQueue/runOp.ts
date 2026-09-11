@@ -53,9 +53,18 @@ import {
   softDeleteCustomCategoryWithBudget,
   type SoftDeleteCustomCategoryWithBudgetResult,
 } from '@/services/remoteCategoryBudgetWrite';
+import {
+  createPlanned,
+  softDeletePlanned,
+  updatePlanned,
+  type CreatePlannedResult,
+  type SoftDeletePlannedResult,
+  type UpdatePlannedResult,
+} from '@/services/remotePlannedWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { PendingWrite } from '@/lib/offlineQueue';
 
 export type RunOpOutcome =
@@ -176,6 +185,28 @@ export interface RunOpDeps {
     expectedCategoryUpdatedAt: string;
     expectedBudgetUpdatedAt: string | null;
   }) => Promise<SoftDeleteCustomCategoryWithBudgetResult>;
+  /** STEP 16-H2-E1 — injected in tests; default to the real planned-expense
+   *  services. CREATE and UPDATE are SEPARATE service functions (unlike
+   *  budget's single `saveBudget`), same as card/category. */
+  createPlanned?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    draft: NewPlannedExpenseDraft;
+  }) => Promise<CreatePlannedResult>;
+  updatePlanned?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: NewPlannedExpenseDraft;
+  }) => Promise<UpdatePlannedResult>;
+  softDeletePlanned?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeletePlannedResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -190,7 +221,8 @@ export async function runPendingWrite(
     op.entity !== 'card' &&
     op.entity !== 'category' &&
     op.entity !== 'budget' &&
-    op.entity !== 'categoryBudget'
+    op.entity !== 'categoryBudget' &&
+    op.entity !== 'planned'
   ) {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
@@ -213,6 +245,61 @@ export async function runPendingWrite(
       if (res.ok) return { kind: 'success' }; // both/neither tombstoned (idempotent replay = ok)
       if (res.transport) return { kind: 'transport', message: res.message };
       // identity | conflict | gone | error — all already in WriteConflictReason.
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
+    // ---- PLANNED EXPENSE (STEP 16-H2-E1 §6/§7) ----
+    if (op.entity === 'planned') {
+      if (op.op === 'create') {
+        const create = deps.createPlanned ?? createPlanned;
+        const res = await create({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        // A 23505 on a lost-response replay where the server row is the SAME
+        // create is the service's own idempotent `ok: true` — honoured here.
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // PlannedWriteReason adds 'invalid' (structural) on top of the shared
+        // WriteConflictReason — flatten it to a reason-less terminal, same as
+        // card/category; a same-id-different-payload race is `conflict`.
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      if (op.op === 'update') {
+        const update = deps.updatePlanned ?? updatePlanned;
+        const res = await update({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      // planned delete
+      const del = deps.softDeletePlanned ?? softDeletePlanned;
+      const res = await del({
+        id: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-soft-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // SoftDeletePlannedResult's reason is already Exclude<…, 'invalid'|'deleted'>
+      // — every value is in WriteConflictReason.
       return { kind: 'terminal', reason: res.reason, message: res.message };
     }
 

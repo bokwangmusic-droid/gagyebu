@@ -20,10 +20,12 @@ import {
   type NewPlannedExpenseDraft,
 } from '@/lib/remotePlannedWriteMapping';
 import type { RemotePlannedMeta } from '@/lib/remoteFinanceMapping';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { createPlanned, softDeletePlanned, updatePlanned } from '@/services/remotePlannedWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { PlannedExpense } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
@@ -64,7 +66,7 @@ type FormMode =
  */
 function PlannedFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
-  const { status, error, planned, plannedMeta, refresh } = useFinanceRead();
+  const { status, error, planned, plannedMeta, pendingPlannedOps, refresh } = useFinanceRead();
 
   // STEP 16-G3-B2 §17-21: freeze the first resolved row + token for the
   // edit session so a later Realtime / foreground refresh that drops the
@@ -73,9 +75,30 @@ function PlannedFormRoute({ editId }: { editId: string }) {
   const frozenRef = useRef<{ planned: PlannedExpense; meta: RemotePlannedMeta } | null>(null);
   const liveTarget = planned.find((p) => p.id === editId) ?? null;
   const liveMeta = plannedMeta[editId] ?? null;
+
+  // STEP 16-H2-E2 §13: a row with an in-flight / terminal-failed offline op is
+  // read-only — never open the edit form on top of a queued write, and (for a
+  // failed op whose authoritative row still exists) never freeze it. This is
+  // checked BEFORE the freeze below so a first entry is blocked; a form
+  // already frozen for this session stays open. The user resolves it on the
+  // Planned tab first (pull-to-refresh retry, or "변경 버리기").
+  if (!frozenRef.current && pendingPlannedOps.has(editId)) {
+    return (
+      <EditUnavailable
+        body={
+          pendingPlannedOps.get(editId)?.failed
+            ? '전송에 실패한 변경이 있어요. 예정 지출 화면에서 다시 시도하거나 변경을 버린 뒤 수정해 주세요.'
+            : '전송 대기 중인 변경이 있어요. 반영된 뒤에 수정할 수 있어요.'
+        }
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+
   if (!frozenRef.current && liveTarget && liveMeta) {
     frozenRef.current = { planned: liveTarget, meta: liveMeta };
   }
+
   if (frozenRef.current) {
     return (
       <PlannedForm
@@ -157,6 +180,10 @@ function PlannedForm({ mode }: { mode: FormMode }) {
   // source — never useStore(). No local addPlanned/updatePlanned is ever
   // called from this screen.
   const { status, error, customCats, catOrder, refresh } = useFinanceRead();
+  // STEP 16-H2-E2: durable offline fallback for a planned CREATE / UPDATE /
+  // soft DELETE whose direct write hit a TRANSPORT failure (offline). Never
+  // used for a server/terminal verdict.
+  const pending = usePendingWrites();
 
   const editing = mode.kind === 'edit' ? mode.planned : null;
   const isEdit = mode.kind === 'edit';
@@ -222,6 +249,24 @@ function PlannedForm({ mode }: { mode: FormMode }) {
     setPadVisible(true);
   };
 
+  /**
+   * STEP 16-H2-E2 §1/§12: a durable-enqueue that itself failed — the change
+   * is NOT queued, so the form stays open and the user is told why. Raw
+   * coordinator reasons are never surfaced. Mirrors card-add / categories.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '예정 지출을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
   /** Draft-state -> NewPlannedExpenseDraft, or null when the form isn't valid. */
   const buildDraft = (): NewPlannedExpenseDraft | null => {
     // Defensive re-validation — do NOT lean on the DB CHECK for UX.
@@ -255,6 +300,30 @@ function PlannedForm({ mode }: { mode: FormMode }) {
         draft,
       });
       if (!res.ok) {
+        // STEP 16-H2-E2 §1: a TRANSPORT failure (offline) -> durable CREATE
+        // queue. The SAME stable client id (plannedIdRef, never regenerated)
+        // and the SAME draft go into the PendingWrite, so a later flush
+        // replays the exact request and its 23505 reconcile stays idempotent
+        // — no duplicate-planned accident on a lost response.
+        if (res.transport === true) {
+          const enq = await pending.enqueuePlannedCreate({
+            scope: { userId: session.user.id, householdId: activeHousehold.id },
+            entityId: plannedIdRef.current,
+            payload: draft,
+          });
+          submittingRef.current = false;
+          setSubmitting(false);
+          if (enq.ok) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+            toast.show('예정 지출을 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+            router.back();
+            return;
+          }
+          toast.show(enqueueFailMessage(enq.reason));
+          return;
+        }
+        // A non-transport terminal failure — existing behaviour: message +
+        // stay. plannedIdRef is unchanged so a manual retry reuses the same id.
         submittingRef.current = false;
         setSubmitting(false);
         toast.show(res.message);
@@ -283,6 +352,28 @@ function PlannedForm({ mode }: { mode: FormMode }) {
       draft,
     });
     if (!res.ok) {
+      // STEP 16-H2-E2 §2: a TRANSPORT failure (offline) -> durable UPDATE
+      // queue with the FROZEN mount token verbatim, so the optimistic-
+      // concurrency check still fires (as a conflict) when the flush runs —
+      // the token is NEVER swapped for a freshly refreshed one.
+      if (res.transport === true) {
+        const enq = await pending.enqueuePlannedUpdate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: mode.planned.id,
+          payload: draft,
+          expectedUpdatedAt: token,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('예정 지출을 수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        toast.show(enqueueFailMessage(enq.reason));
+        return;
+      }
       submittingRef.current = false;
       setSubmitting(false);
       if (res.reason === 'identity' || res.reason === 'error' || res.reason === 'invalid') {
@@ -334,6 +425,28 @@ function PlannedForm({ mode }: { mode: FormMode }) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('예정 지출을 삭제했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-E2 §3: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue with the FROZEN mount token. `composePlannedManagement` hides the
+    // row from the Planned tab right away; `data.planned` / Home stay
+    // server-authoritative until the flush lands.
+    if (res.transport === true) {
+      const enq = await pending.enqueuePlannedDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: mode.planned.id,
+        expectedUpdatedAt: token,
+      });
+      deletingRef.current = false;
+      setDeleting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('예정 지출을 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        router.back();
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
       return;
     }
 

@@ -63,9 +63,13 @@ import { isValidBudgetDraft, type NewBudgetDraft } from '@/lib/remoteBudgetWrite
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import {
+  isValidPlannedDraft,
+  type NewPlannedExpenseDraft,
+} from '@/lib/remotePlannedWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { BudgetMap, CreditCard, Transaction } from '@/store/types';
+import type { BudgetMap, CreditCard, PlannedExpense, Transaction } from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
@@ -92,7 +96,13 @@ export interface PendingWriteScope {
  * optimistic-concurrency token lives in `expectedUpdatedAt` (UPDATE/DELETE),
  * NOT in `payload`.
  */
-export type PendingEntity = 'transaction' | 'card' | 'category' | 'budget' | 'categoryBudget';
+export type PendingEntity =
+  | 'transaction'
+  | 'card'
+  | 'category'
+  | 'budget'
+  | 'categoryBudget'
+  | 'planned';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -290,6 +300,51 @@ export interface PendingCategoryBudgetDelete extends PendingWriteBase {
   expectedBudgetUpdatedAt: string | null;
 }
 
+/* ---------------- planned-expense records (STEP 16-H2-E1) ---------------- */
+
+/**
+ * `payload` is exactly what `createPlanned({ draft })` is re-handed — the
+ * UI-editable `NewPlannedExpenseDraft` (`name` / `amount` / `category` /
+ * `date` / `memo` / `type`). `entityId` is the SAME client `p-…` id the
+ * direct `createPlanned` used, so a lost-response replay hits the service's
+ * `unique(household_id, id)` 23505 idempotency path. No `expectedUpdatedAt`
+ * — a CREATE has no token. `planned_expenses` has NO natural-key
+ * uniqueness (name/date/category are free text), so a new planned item is
+ * always a brand-new id — this record never "revives" a soft-deleted row.
+ */
+export interface PendingPlannedCreate extends PendingWriteBase {
+  entity: 'planned';
+  op: 'create';
+  payload: NewPlannedExpenseDraft;
+}
+
+/**
+ * `payload` is what `updatePlanned({ draft })` is re-handed. Only
+ * `name` / `amount` / `category` / `date` / `memo` are ever written on the
+ * server (`type` is PRODUCT-IMMUTABLE after create — `buildPlannedUpdate`
+ * drops it), but the draft keeps its `type` for the management-only display
+ * row and so the shared validator still accepts it. `expectedUpdatedAt` is
+ * FROZEN from the `plannedMeta.updatedAt` the edit screen opened against and
+ * is NEVER refreshed — a stale token turns a concurrent edit into a
+ * `conflict`, never a blind overwrite (same rule as every other UPDATE
+ * record in this file).
+ */
+export interface PendingPlannedUpdate extends PendingWriteBase {
+  entity: 'planned';
+  op: 'update';
+  payload: NewPlannedExpenseDraft;
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeletePlanned` guarded on the FROZEN
+ *  `expectedUpdatedAt`. NO `payload`. Never a hard DELETE (the table has no
+ *  DELETE grant — every "delete" is an `UPDATE deleted_at`). */
+export interface PendingPlannedDelete extends PendingWriteBase {
+  entity: 'planned';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
@@ -303,7 +358,10 @@ export type PendingWrite =
   | PendingBudgetCreate
   | PendingBudgetUpdate
   | PendingBudgetDelete
-  | PendingCategoryBudgetDelete;
+  | PendingCategoryBudgetDelete
+  | PendingPlannedCreate
+  | PendingPlannedUpdate
+  | PendingPlannedDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -449,6 +507,50 @@ function isValidBudgetPayload(p: unknown): p is NewBudgetDraft {
   return isValidBudgetDraft({ category: d.category, amount: d.amount });
 }
 
+/**
+ * Structural validity for a stored `NewPlannedExpenseDraft` (STEP 16-H2-E1
+ * §3 — reuse `isValidPlannedDraft` from remotePlannedWriteMapping.ts rather
+ * than re-deriving the amount/date/name rules). Only the UI-editable shape —
+ * `name` / `amount` / `category` / `date` / `memo` / `type`. Any server /
+ * identity / timestamp / soft-delete column present -> reject; the final
+ * `amount > 0` / real-calendar-`date` / non-empty-`name` checks are delegated
+ * to `isValidPlannedDraft` — the SAME function `createPlanned()` /
+ * `updatePlanned()` themselves run — so the queue can never accept a draft
+ * the write service would refuse.
+ */
+function isValidPlannedPayload(p: unknown): p is NewPlannedExpenseDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (!isNonEmptyString(d.name)) return false;
+  if (!isFiniteNumber(d.amount)) return false;
+  if (!isNonEmptyString(d.category)) return false;
+  if (!isNonEmptyString(d.date)) return false;
+  if (typeof d.memo !== 'string') return false;
+  if (d.type !== 'income' && d.type !== 'expense') return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d ||
+    'deleted_at' in d
+  ) {
+    return false;
+  }
+  return isValidPlannedDraft({
+    name: d.name,
+    amount: d.amount,
+    category: d.category,
+    date: d.date,
+    memo: d.memo,
+    type: d.type,
+  });
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
@@ -460,7 +562,8 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     r.entity !== 'card' &&
     r.entity !== 'category' &&
     r.entity !== 'budget' &&
-    r.entity !== 'categoryBudget'
+    r.entity !== 'categoryBudget' &&
+    r.entity !== 'planned'
   ) {
     return null;
   }
@@ -573,6 +676,32 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
       expectedCategoryUpdatedAt: r.expectedCategoryUpdatedAt,
       expectedBudgetUpdatedAt: r.expectedBudgetUpdatedAt as string | null,
     };
+  }
+
+  if (r.entity === 'planned') {
+    // STEP 16-H2-E1 — planned-expense CREATE / UPDATE / soft DELETE. Mirrors
+    // the `category` branch: CREATE carries no token, UPDATE/DELETE carry a
+    // FROZEN `expectedUpdatedAt`, DELETE carries no user payload.
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token (§2)
+      if (!isValidPlannedPayload(r.payload)) return null;
+      return { ...base, entity: 'planned', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (!isValidPlannedPayload(r.payload)) return null;
+      return {
+        ...base,
+        entity: 'planned',
+        op: 'update',
+        payload: r.payload,
+        expectedUpdatedAt: r.expectedUpdatedAt,
+      };
+    }
+    // planned delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload (§2)
+    return { ...base, entity: 'planned', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
   }
 
   // ---- transaction ----
@@ -913,6 +1042,72 @@ export function makePendingCategoryBudgetDelete(args: {
   };
 }
 
+export function makePendingPlannedCreate(args: {
+  scope: PendingWriteScope;
+  /** Client-generated `p-…` id — stable across replays of ONE form mount. */
+  entityId: string;
+  payload: NewPlannedExpenseDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingPlannedCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'planned',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingPlannedUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewPlannedExpenseDraft;
+  /** FROZEN — the `plannedMeta.updatedAt` the edit screen opened against.
+   *  Handed to `updatePlanned` verbatim on every replay; never refreshed. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingPlannedUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'planned',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingPlannedDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingPlannedDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'planned',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -961,6 +1156,21 @@ function cardDraftEqual(a: NewCardDraft, b: NewCardDraft): boolean {
  *  is NOT compared here (STEP 16-H2-C2-B1 §10); the CREATE matcher adds it. */
 function categoryEditableEqual(a: NewCustomCategoryDraft, b: NewCustomCategoryDraft): boolean {
   return a.name === b.name && a.bg === b.bg && a.color === b.color && a.icon === b.icon;
+}
+
+/** Equality of the SERVER-editable planned-expense fields
+ *  (`name` / `amount` / `category` / `date` / `memo`). `type` is create-only
+ *  (`buildPlannedUpdate` drops it), so it is NOT compared here (STEP
+ *  16-H2-E1 §5); the CREATE matcher adds it. Raw values — the two drafts
+ *  come from the same form, same as the card/category matchers. */
+function plannedEditableEqual(a: NewPlannedExpenseDraft, b: NewPlannedExpenseDraft): boolean {
+  return (
+    a.name === b.name &&
+    Number(a.amount) === Number(b.amount) &&
+    a.category === b.category &&
+    a.date === b.date &&
+    a.memo === b.memo
+  );
 }
 
 /**
@@ -1026,6 +1236,20 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
         a.expectedBudgetUpdatedAt === b.expectedBudgetUpdatedAt
       );
     }
+    return false;
+  }
+
+  if (a.entity === 'planned' && b.entity === 'planned') {
+    // CREATE: identity + same draft INCLUDING type (create-only field). A
+    // DIFFERING CREATE for the same id is `existing-pending`, never a silent
+    // overwrite (§5/§15), mirroring the service's isSameCreateRow.
+    if (a.op === 'create' && b.op === 'create') {
+      return a.payload.type === b.payload.type && plannedEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'update' && b.op === 'update') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt && plannedEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
     return false;
   }
 
@@ -1641,6 +1865,180 @@ function composeBudgetManagement(
   return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedAmountById };
 }
 
+/* ---------------- planned-expense display model (STEP 16-H2-E1) ---------------- */
+
+/** A pending CREATE / failed-orphan UPDATE payload -> a synthetic domain
+ *  `PlannedExpense`. The row is read-only (never re-edited) — `createdAt` is
+ *  a synthetic `enqueuedAt` placeholder, never a real server timestamp. */
+function plannedDraftToDomain(op: PendingPlannedCreate | PendingPlannedUpdate): PlannedExpense {
+  const d = op.payload;
+  return {
+    id: op.entityId,
+    name: d.name,
+    amount: d.amount,
+    category: d.category,
+    date: d.date,
+    memo: d.memo,
+    type: d.type,
+    createdAt: op.enqueuedAt,
+  };
+}
+
+/** Overlay an UPDATE draft onto an existing domain planned expense. `id` /
+ *  `createdAt` (server identity) and `type` (product-immutable — never
+ *  written by an UPDATE) are preserved from `row`. */
+function applyPlannedUpdate(row: PlannedExpense, d: NewPlannedExpenseDraft): PlannedExpense {
+  return { ...row, name: d.name, amount: d.amount, category: d.category, date: d.date, memo: d.memo };
+}
+
+/**
+ * Does an authoritative server planned expense already reflect a queued
+ * CREATE/UPDATE's desired draft? STEP 16-H2-E1 §10/§11 — the pre-ack
+ * confirmation. Mirrors the write service's own `plannedFieldsMatch` /
+ * `isSameCreateRow` field set at the READ-MODEL level: `name` (trimmed) /
+ * `amount` / `category` / `date` / `memo` (trimmed) compared strictly —
+ * `name`/`memo` are trimmed because `buildPlannedInsert` / `buildPlannedUpdate`
+ * store them trimmed. `type` is NOT compared (product-immutable, never
+ * written by an UPDATE; the CREATE dedup matcher checks it). `updatedAt`
+ * changing is NEVER sufficient on its own — content match is what matters.
+ * Pure — no `JSON.stringify`.
+ */
+export function serverPlannedConfirmsUpdate(
+  serverRow: PlannedExpense,
+  draft: NewPlannedExpenseDraft,
+): boolean {
+  return (
+    serverRow.name === draft.name.trim() &&
+    Number(serverRow.amount) === Number(draft.amount) &&
+    serverRow.category === draft.category &&
+    serverRow.date === draft.date &&
+    serverRow.memo === draft.memo.trim()
+  );
+}
+
+export interface PlannedManagementView {
+  /**
+   * The planned expenses to render on a PLANNED-MANAGEMENT surface ONLY:
+   * authoritative server `planned`, with a NOT-failed pending UPDATE
+   * overlaid, plus a synthetic row for a pending/failed CREATE, plus a
+   * synthetic row for a FAILED UPDATE whose server row is GONE, minus a
+   * not-failed pending DELETE.
+   *
+   * STEP 16-H2-E1 §14 — a TERMINAL-failed UPDATE whose authoritative server
+   * row STILL EXISTS keeps the AUTHORITATIVE row verbatim (the other device
+   * won); the stale local draft is NEVER used to replace it. The attempted
+   * local draft is exposed via `attemptedDraftById` as conflict metadata
+   * only, and the row id is in `failedIds` so the UI can offer "변경 버리기".
+   *
+   * DELIBERATELY separate from `data.planned` / `data.plannedMeta` (§16/§19)
+   * so the Home upcoming banner, the planned list's own read path, backup and
+   * household-import only ever see authoritative server data. Equals
+   * `data.planned` when there are no planned ops.
+   */
+  rows: PlannedExpense[];
+  /** planned id -> the pending op that produced or marks it. */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** planned ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server planned ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+  /**
+   * row ids that are SYNTHETIC — present in `rows` only because of an op,
+   * with no authoritative server planned row behind them (pending/failed
+   * CREATE, and a failed UPDATE whose server row is gone). A failed UPDATE
+   * whose server row EXISTS is NOT here — its authoritative row stays a
+   * normal planned entry.
+   */
+  syntheticIds: ReadonlySet<string>;
+  /**
+   * planned id -> the full draft the user attempted in a TERMINAL-failed
+   * UPDATE. Conflict metadata ONLY — never used to replace the displayed row
+   * when the authoritative row exists (§14). Present for both the "row
+   * exists" and the orphan case.
+   */
+  attemptedDraftById: ReadonlyMap<string, NewPlannedExpenseDraft>;
+}
+
+function composePlannedManagement(
+  serverPlanned: readonly PlannedExpense[],
+  ops: readonly PendingWrite[],
+  failedPlannedIds?: ReadonlySet<string>,
+): PlannedManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const syntheticIds = new Set<string>();
+  const attemptedDraftById = new Map<string, NewPlannedExpenseDraft>();
+  const plannedOps = ops.filter(
+    (o): o is PendingPlannedCreate | PendingPlannedUpdate | PendingPlannedDelete =>
+      o.entity === 'planned',
+  );
+  if (plannedOps.length === 0) {
+    return { rows: serverPlanned.slice(), opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById };
+  }
+
+  const failed = (id: string) => !!failedPlannedIds?.has(id);
+  const rows = serverPlanned.slice(); // never mutates serverPlanned
+  const idxOf = (id: string) => rows.findIndex((p) => p.id === id);
+
+  for (const op of plannedOps) {
+    const idx = idxOf(op.entityId);
+
+    if (op.op === 'create') {
+      if (idx !== -1) continue; // the flush already landed — no marker
+      rows.push(plannedDraftToDomain(op));
+      opById.set(op.entityId, 'create');
+      syntheticIds.add(op.entityId); // no authoritative row behind it
+      if (failed(op.entityId)) failedIds.add(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (idx !== -1) {
+        if (failed(op.entityId)) {
+          // §14: TERMINAL-failed UPDATE + authoritative row still on the
+          // server (the other device won). KEEP the authoritative row
+          // verbatim — the stale local draft must NOT replace it. Mark it +
+          // keep the attempted draft as conflict metadata for "변경 버리기".
+          opById.set(op.entityId, 'update');
+          failedIds.add(op.entityId);
+          attemptedDraftById.set(op.entityId, op.payload);
+          continue;
+        }
+        // still-pending (non-terminal) UPDATE -> overlay the draft.
+        rows[idx] = applyPlannedUpdate(rows[idx], op.payload);
+        opById.set(op.entityId, 'update');
+        continue;
+      }
+      // server row GONE: only a TERMINAL-failed UPDATE gets a display-only
+      // synthetic row (a not-failed one just waits — like cards/categories).
+      if (failed(op.entityId)) {
+        rows.push(plannedDraftToDomain(op));
+        opById.set(op.entityId, 'update');
+        failedIds.add(op.entityId);
+        syntheticIds.add(op.entityId); // no authoritative row behind it
+        attemptedDraftById.set(op.entityId, op.payload);
+      }
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (idx !== -1) {
+        opById.set(op.entityId, 'delete'); // keep the server row visible, mark it failed
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+    if (idx !== -1) {
+      rows.splice(idx, 1);
+      hiddenIds.push(op.entityId);
+    }
+  }
+
+  return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById };
+}
+
 export interface CardManagementView {
   /**
    * The cards to render on the card-management screen ONLY: authoritative
@@ -1767,6 +2165,14 @@ export interface ComposedFinance {
    * Equals `data.budgets` when there are no budget ops.
    */
   budgetManagement: BudgetManagementView;
+  /**
+   * STEP 16-H2-E1 — DISPLAY-ONLY planned-expense rows + markers for a
+   * planned-management surface. NEVER merged into `data.planned` /
+   * `data.plannedMeta` — the Home upcoming banner and the planned list's own
+   * read path keep reading `data.planned` untouched (§16/§19). Equals
+   * `data.planned` when there are no planned ops.
+   */
+  plannedManagement: PlannedManagementView;
 }
 
 /**
@@ -1807,6 +2213,9 @@ export function composeFinance(
    *  category+budget deletes; drives the failed-vs-pending branch of the
    *  composite-delete projection in BOTH management views. */
   failedCategoryBudgetIds?: ReadonlySet<string>,
+  /** STEP 16-H2-E1 — bare planned-id set of TERMINAL-failed planned ops;
+   *  drives the failed-vs-pending branch of `plannedManagement`. */
+  failedPlannedIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
   const categoryManagement = composeCategoryManagement(
@@ -1821,6 +2230,7 @@ export function composeFinance(
     failedBudgetIds,
     failedCategoryBudgetIds,
   );
+  const plannedManagement = composePlannedManagement(serverData.planned, ops, failedPlannedIds);
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
@@ -1832,6 +2242,7 @@ export function composeFinance(
       cardManagement,
       categoryManagement,
       budgetManagement,
+      plannedManagement,
     };
   }
 
@@ -1907,6 +2318,7 @@ export function composeFinance(
       cardManagement,
       categoryManagement,
       budgetManagement,
+      plannedManagement,
     };
   }
 
@@ -1922,5 +2334,6 @@ export function composeFinance(
     cardManagement,
     categoryManagement,
     budgetManagement,
+    plannedManagement,
   };
 }

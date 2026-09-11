@@ -84,7 +84,25 @@ export function BottomTabBar({ state, navigation }: BottomTabBarProps) {
                 justifyContent: 'center',
               }}
             >
-              <Text style={{ fontFamily: fontFamily.bold, fontSize: 9, color: colors.white }}>
+              {/* BADGE ALIGNMENT FIX: the container already centers via
+                  `alignItems`/`justifyContent` — the number itself was
+                  drifting because the `<Text>` had no explicit `lineHeight`
+                  and (on Android) `includeFontPadding` defaults to `true`,
+                  which bakes extra ascent/descent padding into the glyph's
+                  own box and throws off the flex-centered result. Pinning a
+                  tight `lineHeight` + disabling that Android font padding +
+                  `textAlign: 'center'` (for "9+") fixes both axes with no
+                  translate/margin hack. */}
+              <Text
+                style={{
+                  fontFamily: fontFamily.bold,
+                  fontSize: 9,
+                  lineHeight: 11,
+                  color: colors.white,
+                  textAlign: 'center',
+                  includeFontPadding: false,
+                }}
+              >
                 {badge > 9 ? '9+' : badge}
               </Text>
             </View>

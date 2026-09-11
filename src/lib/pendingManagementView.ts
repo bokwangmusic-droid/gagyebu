@@ -18,7 +18,9 @@ import type {
   BudgetManagementView,
   CategoryManagementView,
   PendingWrite,
+  PlannedManagementView,
 } from '@/lib/offlineQueue';
+import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 
 export type ManagementOpKind = 'create' | 'update' | 'delete';
@@ -39,6 +41,18 @@ export interface BudgetRowOpState {
   queueId?: string;
   synthetic: boolean;
   attemptedAmount?: number;
+}
+
+export interface PlannedRowOpState {
+  op: ManagementOpKind;
+  failed: boolean;
+  reason?: WriteConflictReason;
+  queueId?: string;
+  synthetic: boolean;
+  /** For a TERMINAL-failed UPDATE, the FULL draft the user tried; conflict
+   *  metadata ONLY (the displayed row is the authoritative server row when it
+   *  still exists — STEP 16-H2-E1 §14). */
+  attemptedDraft?: NewPlannedExpenseDraft;
 }
 
 /** The durable `queueId` for `id` in a de-duped `PendingWrite[]` (≤1 op per
@@ -75,6 +89,38 @@ export function buildPendingCategoryOps(
       ...(failed ? { reason } : {}),
       ...(failed && view.attemptedNameById.has(id)
         ? { attemptedName: view.attemptedNameById.get(id) }
+        : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * STEP 16-H2-E1 — the screen-facing per-row op-state map for a
+ * planned-management surface. Planned has NO composite-delete counterpart
+ * (unlike category/budget), so this is the single-queue shape: `queueId` and
+ * failure `reason` come straight from the one `entity:'planned'` op for the
+ * id.
+ */
+export function buildPendingPlannedOps(
+  view: PlannedManagementView,
+  /** current-scope `entity:'planned'` ops (create/update/delete, incl. failed). */
+  ops: readonly PendingWrite[],
+  /** planned-id -> reason, for a terminal-failed planned op. */
+  failedReasons: ReadonlyMap<string, WriteConflictReason | undefined>,
+): Map<string, PlannedRowOpState> {
+  const out = new Map<string, PlannedRowOpState>();
+  for (const [id, op] of view.opById) {
+    const failed = view.failedIds.has(id);
+    const queueId = queueIdOf(ops, id);
+    out.set(id, {
+      op,
+      failed,
+      synthetic: view.syntheticIds.has(id),
+      ...(queueId !== undefined ? { queueId } : {}),
+      ...(failed ? { reason: failedReasons.get(id) } : {}),
+      ...(failed && view.attemptedDraftById.has(id)
+        ? { attemptedDraft: view.attemptedDraftById.get(id) }
         : {}),
     });
   }

@@ -34,7 +34,12 @@ import type {
   RemoteTransactionMeta,
 } from '@/lib/remoteFinanceMapping';
 import { composeFinance } from '@/lib/offlineQueue';
-import { buildPendingBudgetOps, buildPendingCategoryOps } from '@/lib/pendingManagementView';
+import {
+  buildPendingBudgetOps,
+  buildPendingCategoryOps,
+  buildPendingPlannedOps,
+} from '@/lib/pendingManagementView';
+import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { usePendingWrites } from '@/store/pendingFinance';
@@ -257,6 +262,38 @@ export interface FinanceReadResult {
     }
   >;
 
+  /**
+   * STEP 16-H2-E1 — ENGINE ONLY (no screen reads this yet; UI wiring is E2).
+   * The planned-expense list for a planned-management surface: authoritative
+   * server `planned` with a pending UPDATE overlaid, a synthetic row for a
+   * pending/failed CREATE, a synthetic row for a failed UPDATE whose server
+   * row is gone, minus a not-failed pending DELETE. DELIBERATELY separate
+   * from `planned` / `plannedMeta` (§16/§19) — those stay
+   * authoritative-server-only so the Home upcoming banner and the planned
+   * list's own read path never see an un-sent planned row. Equals `planned`
+   * when there are no planned ops.
+   */
+  plannedManagementRows: PlannedExpense[];
+  /**
+   * planned id -> its pending offline-op state, for the row label /
+   * read-only gate on a planned-management surface. Mirrors `pendingBudgetOps`,
+   * with `attemptedDraft` (the full attempted `NewPlannedExpenseDraft`) in
+   * place of `attemptedAmount`. `reason` / `attemptedDraft` are only set when
+   * `failed` is true; the displayed row stays authoritative when the server
+   * row still exists (§14).
+   */
+  pendingPlannedOps: ReadonlyMap<
+    string,
+    {
+      op: 'create' | 'update' | 'delete';
+      failed: boolean;
+      reason?: WriteConflictReason;
+      queueId?: string;
+      synthetic: boolean;
+      attemptedDraft?: NewPlannedExpenseDraft;
+    }
+  >;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -291,6 +328,8 @@ const EMPTY_SLICES = {
   pendingCategoryOps: new Map() as FinanceReadResult['pendingCategoryOps'],
   budgetManagementRows: {} as BudgetMap,
   pendingBudgetOps: new Map() as FinanceReadResult['pendingBudgetOps'],
+  plannedManagementRows: [] as PlannedExpense[],
+  pendingPlannedOps: new Map() as FinanceReadResult['pendingPlannedOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -314,6 +353,9 @@ export function useFinanceRead(): FinanceReadResult {
     pendingCategoryBudgetOps: providerCategoryBudgetOps,
     categoryBudgetFailedReasons,
     failedCategoryBudgetIds: providerFailedCategoryBudgetIds,
+    pendingPlannedOps: providerPlannedOps,
+    plannedFailedReasons,
+    failedPlannedIds: providerFailedPlannedIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -339,7 +381,8 @@ export function useFinanceRead(): FinanceReadResult {
         providerCardOps.length > 0 ||
         providerCategoryOps.length > 0 ||
         providerBudgetOps.length > 0 ||
-        providerCategoryBudgetOps.length > 0;
+        providerCategoryBudgetOps.length > 0 ||
+        providerPlannedOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
@@ -350,12 +393,14 @@ export function useFinanceRead(): FinanceReadResult {
                 ...providerCategoryOps,
                 ...providerBudgetOps,
                 ...providerCategoryBudgetOps,
+                ...providerPlannedOps,
               ],
               providerFailedIds,
               providerFailedCardIds,
               providerFailedCategoryIds,
               providerFailedBudgetIds,
               providerFailedCategoryBudgetIds,
+              providerFailedPlannedIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -421,6 +466,21 @@ export function useFinanceRead(): FinanceReadResult {
             categoryBudgetFailedReasons,
           )
         : new Map();
+      // STEP 16-H2-E1: planned-expense display-only surface. `composeFinance`
+      // NEVER folded a planned row into `composed.planned` — it feeds
+      // `plannedManagement` only. `planned`/`plannedMeta` below stay
+      // `data.planned`/`data.plannedMeta` untouched (§16/§19), so the Home
+      // upcoming banner and the planned list keep reading authoritative data.
+      const plannedManagementRows = composedResult
+        ? composedResult.plannedManagement.rows
+        : data.planned;
+      const pendingPlannedOps: FinanceReadResult['pendingPlannedOps'] = composedResult
+        ? buildPendingPlannedOps(
+            composedResult.plannedManagement,
+            providerPlannedOps,
+            plannedFailedReasons,
+          )
+        : new Map();
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -468,6 +528,8 @@ export function useFinanceRead(): FinanceReadResult {
         pendingCategoryOps,
         budgetManagementRows,
         pendingBudgetOps,
+        plannedManagementRows,
+        pendingPlannedOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -535,5 +597,8 @@ export function useFinanceRead(): FinanceReadResult {
     providerCategoryBudgetOps,
     categoryBudgetFailedReasons,
     providerFailedCategoryBudgetIds,
+    providerPlannedOps,
+    plannedFailedReasons,
+    providerFailedPlannedIds,
   ]);
 }
