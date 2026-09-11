@@ -22,6 +22,7 @@ import { fmt, parseNum } from '@/lib/format';
 import { uid } from '@/lib/id';
 import type { RemoteRecurringMeta } from '@/lib/remoteFinanceMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import {
   createRecurring,
   softDeleteRecurring,
@@ -30,6 +31,7 @@ import {
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { Frequency, RecurringRule } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
@@ -120,7 +122,7 @@ type FormMode =
  */
 function RecurringFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
-  const { status, error, recurring, recurringMeta, refresh } = useFinanceRead();
+  const { status, error, recurring, recurringMeta, pendingRecurringOps, refresh } = useFinanceRead();
 
   // STEP 16-G3-B2 §17-21: freeze the first resolved rule + token for the
   // edit session so a later Realtime / foreground refresh that drops the
@@ -129,9 +131,30 @@ function RecurringFormRoute({ editId }: { editId: string }) {
   const frozenRef = useRef<{ rule: RecurringRule; meta: RemoteRecurringMeta } | null>(null);
   const liveTarget = recurring.find((r) => r.id === editId) ?? null;
   const liveMeta = recurringMeta[editId] ?? null;
+
+  // STEP 16-H2-F2 §17: a row with an in-flight / terminal-failed offline op
+  // (CREATE, FULL UPDATE, ACTIVE toggle, or DELETE) is read-only — never open
+  // the edit form on top of a queued write. Checked BEFORE the freeze below
+  // so a fresh entry is blocked; a form already frozen for this session
+  // stays open. The user resolves it on the Recurring screen first (retry
+  // via pull-to-refresh, or "변경 버리기").
+  if (!frozenRef.current && pendingRecurringOps.has(editId)) {
+    return (
+      <EditUnavailable
+        body={
+          pendingRecurringOps.get(editId)?.failed
+            ? '전송에 실패한 변경이 있어요. 반복 항목 화면에서 다시 시도하거나 변경을 버린 뒤 수정해 주세요.'
+            : '전송 대기 중인 변경이 있어요. 반영된 뒤에 수정할 수 있어요.'
+        }
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+
   if (!frozenRef.current && liveTarget && liveMeta) {
     frozenRef.current = { rule: liveTarget, meta: liveMeta };
   }
+
   if (frozenRef.current) {
     return (
       <RecurringForm
@@ -213,6 +236,11 @@ function RecurringForm({ mode }: { mode: FormMode }) {
   // source — never useStore(). No local addRecurring/updateRecurring/
   // toggleRecurring/deleteRecurring is ever called from this screen.
   const { status, error, customCats, catOrder, refresh } = useFinanceRead();
+  // STEP 16-H2-F2: durable offline fallback for a recurring CREATE / FULL
+  // UPDATE / soft DELETE whose direct write hit a TRANSPORT failure
+  // (offline). Never used for a server/terminal verdict. The active toggle
+  // lives on app/recurring.tsx, not this form.
+  const pending = usePendingWrites();
 
   const editing = mode.kind === 'edit' ? mode.rule : null;
   const isEdit = mode.kind === 'edit';
@@ -322,6 +350,24 @@ function RecurringForm({ mode }: { mode: FormMode }) {
   const canSave = name.trim().length > 0 && parseNum(amount) > 0;
   const busy = submitting || deleting;
 
+  /**
+   * STEP 16-H2-F2 §1/§16: a durable-enqueue that itself failed — the change
+   * is NOT queued, so the form stays open and the user is told why. Raw
+   * coordinator reasons are never surfaced. Mirrors card-add / planned-add.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '반복 항목을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
   /** Draft-state -> NewRecurringDraft, or null when the form isn't valid. */
   const buildDraft = (): NewRecurringDraft | null => {
     // Defensive re-validation — do NOT lean on the DB CHECK for UX.
@@ -361,6 +407,28 @@ function RecurringForm({ mode }: { mode: FormMode }) {
         draft,
       });
       if (!res.ok) {
+        // STEP 16-H2-F2 §1: a TRANSPORT failure (offline) -> durable CREATE
+        // queue. The SAME stable client id (recurringIdRef, never
+        // regenerated) and the SAME draft go into the PendingWrite, so a
+        // later flush replays the exact request and its 23505 reconcile
+        // stays idempotent — no duplicate-rule accident on a lost response.
+        if (res.transport === true) {
+          const enq = await pending.enqueueRecurringCreate({
+            scope: { userId: session.user.id, householdId: activeHousehold.id },
+            entityId: recurringIdRef.current,
+            payload: draft,
+          });
+          submittingRef.current = false;
+          setSubmitting(false);
+          if (enq.ok) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+            toast.show('반복 항목을 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+            router.back();
+            return;
+          }
+          toast.show(enqueueFailMessage(enq.reason));
+          return;
+        }
         submittingRef.current = false;
         setSubmitting(false);
         toast.show(res.message);
@@ -373,7 +441,9 @@ function RecurringForm({ mode }: { mode: FormMode }) {
       return;
     }
 
-    // ---- edit ---- expectedUpdatedAt is the token captured at MOUNT.
+    // ---- edit (FULL UPDATE) ---- expectedUpdatedAt is the token captured
+    // at MOUNT (never the toggle's — the active toggle lives on
+    // app/recurring.tsx and is a SEPARATE op).
     const token = expectedUpdatedAtRef.current;
     if (!token) {
       submittingRef.current = false;
@@ -389,6 +459,28 @@ function RecurringForm({ mode }: { mode: FormMode }) {
       draft,
     });
     if (!res.ok) {
+      // STEP 16-H2-F2 §2: a TRANSPORT failure (offline) -> durable FULL
+      // UPDATE queue with the FROZEN mount token verbatim, so the
+      // optimistic-concurrency check still fires (as a conflict) when the
+      // flush runs — the token is NEVER refreshed before enqueue.
+      if (res.transport === true) {
+        const enq = await pending.enqueueRecurringUpdate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: mode.rule.id,
+          payload: draft,
+          expectedUpdatedAt: token,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('반복 항목을 수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        toast.show(enqueueFailMessage(enq.reason));
+        return;
+      }
       submittingRef.current = false;
       setSubmitting(false);
       if (res.reason === 'identity' || res.reason === 'error' || res.reason === 'invalid') {
@@ -440,6 +532,28 @@ function RecurringForm({ mode }: { mode: FormMode }) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('반복 항목을 삭제했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-F2 §4: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue with the FROZEN mount token. `composeRecurringManagement` hides
+    // the row from the Recurring screen right away; `data.recurring` stays
+    // server-authoritative until the flush lands.
+    if (res.transport === true) {
+      const enq = await pending.enqueueRecurringDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: mode.rule.id,
+        expectedUpdatedAt: token,
+      });
+      deletingRef.current = false;
+      setDeleting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('반복 항목을 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        router.back();
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
       return;
     }
 

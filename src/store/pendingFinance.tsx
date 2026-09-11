@@ -32,6 +32,7 @@ import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
+import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import {
   createPendingWriteCoordinator,
   type CoordinatorScope,
@@ -44,7 +45,7 @@ import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { useRemoteFinance } from '@/store/remoteFinance';
-import type { CreditCard, PlannedExpense, Transaction } from '@/store/types';
+import type { CreditCard, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_OPS: PendingWrite[] = [];
@@ -195,6 +196,38 @@ interface PendingFinanceValue {
     entityId: string;
     expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-F1 — current-scope RECURRING-RULE ops (create/update/delete,
+   *  incl. terminal-failed), bare recurring-id keys. A FULL update and an
+   *  ACTIVE toggle for the same id share one `op:'update'` entry here — the
+   *  discriminating `updateKind` lives on the raw `PendingWrite`. ENGINE
+   *  ONLY — no UI call site enqueues these yet (F2). */
+  pendingRecurringOps: PendingWrite[];
+  recurringOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  recurringFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingRecurringIds: ReadonlySet<string>;
+  failedRecurringIds: ReadonlySet<string>;
+  enqueueRecurringCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewRecurringDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueRecurringUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewRecurringDraft;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueRecurringActiveUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    active: boolean;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueRecurringDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
   /** STEP 16-H2-C2-B2 conflict-UX — drop ONE queued record by `queueId`
    *  ("변경 버리기"). NOT a server delete; scope-guarded; awaits persistence. */
   discardPending: (queueId: string) => Promise<DiscardOutcome>;
@@ -278,6 +311,13 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const serverPlannedRef = useRef<ReadonlyMap<string, PlannedExpense>>(serverPlanned);
   serverPlannedRef.current = serverPlanned;
 
+  const serverRecurring = useMemo<ReadonlyMap<string, RecurringRule>>(
+    () => new Map((rf.data?.recurring ?? []).map((r) => [r.id, r])),
+    [rf.data?.recurring],
+  );
+  const serverRecurringRef = useRef<ReadonlyMap<string, RecurringRule>>(serverRecurring);
+  serverRecurringRef.current = serverRecurring;
+
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
   const coordRef = useRef<ReturnType<typeof createPendingWriteCoordinator> | null>(null);
@@ -291,6 +331,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getServerCategories: () => serverCategoriesRef.current,
       getServerBudgets: () => serverBudgetsRef.current,
       getServerPlanned: () => serverPlannedRef.current,
+      getServerRecurring: () => serverRecurringRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -380,6 +421,14 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
         state.planned.failedReasons.size > 0 ? state.planned.failedReasons : EMPTY_REASON_MAP,
       pendingPlannedIds: state.planned.pendingIds.size > 0 ? state.planned.pendingIds : EMPTY_SET,
       failedPlannedIds: state.planned.failedIds.size > 0 ? state.planned.failedIds : EMPTY_SET,
+      pendingRecurringOps: state.recurring.scopeOps.length > 0 ? state.recurring.scopeOps : EMPTY_OPS,
+      recurringOpByEntity:
+        state.recurring.opByEntity.size > 0 ? state.recurring.opByEntity : EMPTY_KIND_MAP,
+      recurringFailedReasons:
+        state.recurring.failedReasons.size > 0 ? state.recurring.failedReasons : EMPTY_REASON_MAP,
+      pendingRecurringIds:
+        state.recurring.pendingIds.size > 0 ? state.recurring.pendingIds : EMPTY_SET,
+      failedRecurringIds: state.recurring.failedIds.size > 0 ? state.recurring.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
@@ -398,6 +447,10 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueuePlannedCreate: coord.enqueuePlannedCreate,
       enqueuePlannedUpdate: coord.enqueuePlannedUpdate,
       enqueuePlannedDelete: coord.enqueuePlannedDelete,
+      enqueueRecurringCreate: coord.enqueueRecurringCreate,
+      enqueueRecurringUpdate: coord.enqueueRecurringUpdate,
+      enqueueRecurringActiveUpdate: coord.enqueueRecurringActiveUpdate,
+      enqueueRecurringDelete: coord.enqueueRecurringDelete,
       discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
     }),

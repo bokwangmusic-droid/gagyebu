@@ -38,6 +38,10 @@ import {
   makePendingPlannedCreate,
   makePendingPlannedDelete,
   makePendingPlannedUpdate,
+  makePendingRecurringActiveUpdate,
+  makePendingRecurringCreate,
+  makePendingRecurringDelete,
+  makePendingRecurringUpdate,
   makePendingTransactionCreate,
   makePendingTransactionDelete,
   makePendingTransactionUpdate,
@@ -46,6 +50,8 @@ import {
   serverCardConfirmsUpdate,
   serverCategoryConfirmsUpdate,
   serverPlannedConfirmsUpdate,
+  serverRecurringConfirmsActive,
+  serverRecurringConfirmsUpdate,
   serverRowConfirmsUpdate,
   type PendingEntity,
   type PendingWrite,
@@ -56,6 +62,7 @@ import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
+import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import {
   createQueueController,
@@ -66,7 +73,7 @@ import {
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
-import type { CreditCard, PlannedExpense, Transaction } from '@/store/types';
+import type { CreditCard, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 /** STEP 16-H2-C2-A1 §21 — internal state is keyed by `${entity}:${entityId}`,
  *  NOT bare `entityId`, so a card op and a transaction op that happen to
@@ -120,6 +127,11 @@ export interface CoordinatorState {
   categoryBudget: CoordinatorEntityState;
   /** STEP 16-H2-E1 — the PLANNED-EXPENSE view (bare planned-id keys). */
   planned: CoordinatorEntityState;
+  /** STEP 16-H2-F1 — the RECURRING-RULE view (bare recurring-id keys). A
+   *  FULL update and an ACTIVE toggle for the SAME id share ONE entry here
+   *  (`opByEntity` reports the bare `'update'` op kind; the discriminating
+   *  `updateKind` lives on the raw `PendingWrite` in `scopeOps`). */
+  recurring: CoordinatorEntityState;
   /** Total pending ops across ALL entities in the current scope (§28 — the
    *  future household-import guard must see cards + categories + budgets
    *  + composite deletes too). */
@@ -181,6 +193,16 @@ export interface CoordinatorDeps {
    * the coordinator never creates a local planned truth of its own.
    */
   getServerPlanned: () => ReadonlyMap<string, PlannedExpense>;
+  /**
+   * Live getter — the trusted server snapshot's ACTIVE recurring rules,
+   * keyed by id. STEP 16-H2-F1 §10/§12/§13/§14: CREATE/FULL-UPDATE ack = row
+   * present AND fields match the queued draft; ACTIVE-toggle ack = row
+   * present AND `active` matches the desired value; DELETE ack = id absent
+   * (the finance snapshot already excludes soft-deleted rules). Materials
+   * bookkeeping (`lastRun`) is part of the domain row but never read or
+   * written by this coordinator.
+   */
+  getServerRecurring: () => ReadonlyMap<string, RecurringRule>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -201,6 +223,10 @@ export interface CoordinatorDeps {
   createPlanned?: RunOpDeps['createPlanned'];
   updatePlanned?: RunOpDeps['updatePlanned'];
   softDeletePlanned?: RunOpDeps['softDeletePlanned'];
+  createRecurring?: RunOpDeps['createRecurring'];
+  updateRecurring?: RunOpDeps['updateRecurring'];
+  setRecurringActive?: RunOpDeps['setRecurringActive'];
+  softDeleteRecurring?: RunOpDeps['softDeleteRecurring'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -328,6 +354,37 @@ export interface PendingWriteCoordinator {
     entityId: string;
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2-F1 — recurring-rule ops. `entityId` is the client-stable
+   *  `rec-…` id. `expectedUpdatedAt` is FROZEN by the caller from the
+   *  `recurringMeta.updatedAt` the edit/toggle opened against; stored
+   *  verbatim, NEVER re-read. `enqueueRecurringUpdate` is the FULL schedule
+   *  edit; `enqueueRecurringActiveUpdate` is the separate 정지/재개 toggle —
+   *  both are `op:'update'` at the SAME dedup identity, so a second one
+   *  queued for the same row while the first is pending is refused as
+   *  `existing-pending` (never stacked, never cross-op compacted). ENGINE
+   *  ONLY — no UI call site enqueues these yet (F2). */
+  enqueueRecurringCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewRecurringDraft;
+  }): Promise<EnqueueOutcome>;
+  enqueueRecurringUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewRecurringDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueueRecurringActiveUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    active: boolean;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueueRecurringDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
   /**
    * STEP 16-H2-C2-B2 conflict-UX — permanently DROP one queued record by its
    * `queueId` ("변경 버리기" for a terminal-failed UPDATE). This is NOT a
@@ -419,6 +476,10 @@ export function createPendingWriteCoordinator(
         ...(deps.createPlanned ? { createPlanned: deps.createPlanned } : {}),
         ...(deps.updatePlanned ? { updatePlanned: deps.updatePlanned } : {}),
         ...(deps.softDeletePlanned ? { softDeletePlanned: deps.softDeletePlanned } : {}),
+        ...(deps.createRecurring ? { createRecurring: deps.createRecurring } : {}),
+        ...(deps.updateRecurring ? { updateRecurring: deps.updateRecurring } : {}),
+        ...(deps.setRecurringActive ? { setRecurringActive: deps.setRecurringActive } : {}),
+        ...(deps.softDeleteRecurring ? { softDeleteRecurring: deps.softDeleteRecurring } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -543,6 +604,7 @@ export function createPendingWriteCoordinator(
         const serverCategories = deps.getServerCategories();
         const serverBudgets = deps.getServerBudgets();
         const serverPlanned = deps.getServerPlanned();
+        const serverRecurring = deps.getServerRecurring();
         const knownCards = deps.getKnownCardIds();
         const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
@@ -623,6 +685,31 @@ export function createPendingWriteCoordinator(
                 (rec?.op === 'create' || rec?.op === 'update') &&
                 rec.entity === 'planned' &&
                 serverPlannedConfirmsUpdate(row, rec.payload);
+            }
+          } else if (entity === 'recurring') {
+            // STEP 16-H2-F1 §12/§13/§14: DELETE = id absent. CREATE / FULL
+            // UPDATE share `serverRecurringConfirmsUpdate` (content match,
+            // never `updatedAt` alone); ACTIVE toggle uses the separate
+            // `serverRecurringConfirmsActive` (desired `active` matches). A
+            // row that's simply absent (orphan) is NEVER an ack for
+            // CREATE/UPDATE/ACTIVE — it drops back to the queue and replays,
+            // whose reconcile inside the write service classifies it
+            // terminal (`gone`/`deleted`/`conflict`).
+            if (op === 'delete') {
+              ok = !serverRecurring.has(entityId);
+            } else {
+              const row = serverRecurring.get(entityId);
+              if (!row) {
+                ok = false;
+              } else if (rec && rec.entity === 'recurring' && rec.op === 'create') {
+                ok = serverRecurringConfirmsUpdate(row, rec.payload);
+              } else if (rec && rec.entity === 'recurring' && rec.op === 'update' && rec.updateKind === 'full') {
+                ok = serverRecurringConfirmsUpdate(row, rec.payload);
+              } else if (rec && rec.entity === 'recurring' && rec.op === 'update' && rec.updateKind === 'active') {
+                ok = serverRecurringConfirmsActive(row, rec.payload.active);
+              } else {
+                ok = false;
+              }
             }
           } else if (op === 'create') {
             ok = serverRows.has(entityId);
@@ -987,6 +1074,62 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueueRecurringCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewRecurringDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingRecurringCreate({ scope: args.scope, entityId: args.entityId, payload: args.payload }),
+    );
+  }
+
+  function enqueueRecurringUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewRecurringDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingRecurringUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueRecurringActiveUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    active: boolean;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingRecurringActiveUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        active: args.active,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueRecurringDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingRecurringDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -1075,6 +1218,7 @@ export function createPendingWriteCoordinator(
     const budget = entityStateOf('budget', allScopeOps);
     const categoryBudget = entityStateOf('categoryBudget', allScopeOps);
     const planned = entityStateOf('planned', allScopeOps);
+    const recurring = entityStateOf('recurring', allScopeOps);
     return {
       hydration,
       scopeOps: txn.scopeOps,
@@ -1087,6 +1231,7 @@ export function createPendingWriteCoordinator(
       budget,
       categoryBudget,
       planned,
+      recurring,
       pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -1112,6 +1257,10 @@ export function createPendingWriteCoordinator(
     enqueuePlannedCreate,
     enqueuePlannedUpdate,
     enqueuePlannedDelete,
+    enqueueRecurringCreate,
+    enqueueRecurringUpdate,
+    enqueueRecurringActiveUpdate,
+    enqueueRecurringDelete,
     discardPending,
     requestFlush,
     dispose,

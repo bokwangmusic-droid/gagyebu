@@ -19,8 +19,10 @@ import type {
   CategoryManagementView,
   PendingWrite,
   PlannedManagementView,
+  RecurringManagementView,
 } from '@/lib/offlineQueue';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
+import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 
 export type ManagementOpKind = 'create' | 'update' | 'delete';
@@ -121,6 +123,69 @@ export function buildPendingPlannedOps(
       ...(failed ? { reason: failedReasons.get(id) } : {}),
       ...(failed && view.attemptedDraftById.has(id)
         ? { attemptedDraft: view.attemptedDraftById.get(id) }
+        : {}),
+    });
+  }
+  return out;
+}
+
+export interface RecurringRowOpState {
+  op: ManagementOpKind;
+  /** Present only when `op === 'update'` — which of the two update actions
+   *  produced/marks this row (a full schedule edit vs the 정지/재개 toggle). */
+  updateKind?: 'full' | 'active';
+  failed: boolean;
+  reason?: WriteConflictReason;
+  queueId?: string;
+  synthetic: boolean;
+  /** For a TERMINAL-failed FULL UPDATE, the full draft the user tried;
+   *  conflict metadata ONLY (STEP 16-H2-F1 §21). */
+  attemptedDraft?: NewRecurringDraft;
+  /** For a TERMINAL-failed ACTIVE toggle (row-present conflict OR the
+   *  row-absent orphan case — see `RecurringManagementView.attemptedActiveById`),
+   *  the desired `active` value the user tried; conflict metadata ONLY
+   *  (STEP 16-H2-F1 §22/§24) — the row (when it exists) always shows the
+   *  authoritative `active`, never this. */
+  attemptedActive?: boolean;
+}
+
+/**
+ * STEP 16-H2-F1 — the screen-facing per-row op-state map for a
+ * recurring-management surface. Recurring has NO composite-delete
+ * counterpart, so this is a single-queue shape like
+ * `buildPendingPlannedOps`, plus `updateKind` / `attemptedActive` to
+ * distinguish a full edit from an active toggle. An ORPHAN failed ACTIVE
+ * toggle (server row gone) has NO entry in `view.opById` (see
+ * `composeRecurringManagement` — nothing can be honestly rendered from an
+ * `{ active }`-only payload with no row behind it), so it has no entry here
+ * either; it stays traceable via the raw `PendingWrite` queue and
+ * `discardPending`.
+ */
+export function buildPendingRecurringOps(
+  view: RecurringManagementView,
+  /** current-scope `entity:'recurring'` ops (create/update/delete, incl. failed). */
+  ops: readonly PendingWrite[],
+  /** recurring-id -> reason, for a terminal-failed recurring op. */
+  failedReasons: ReadonlyMap<string, WriteConflictReason | undefined>,
+): Map<string, RecurringRowOpState> {
+  const out = new Map<string, RecurringRowOpState>();
+  for (const [id, op] of view.opById) {
+    const failed = view.failedIds.has(id);
+    const queueId = queueIdOf(ops, id);
+    const rec = ops.find((o) => o.entity === 'recurring' && o.entityId === id);
+    const updateKind = op === 'update' && rec?.entity === 'recurring' && rec.op === 'update' ? rec.updateKind : undefined;
+    out.set(id, {
+      op,
+      ...(updateKind ? { updateKind } : {}),
+      failed,
+      synthetic: view.syntheticIds.has(id),
+      ...(queueId !== undefined ? { queueId } : {}),
+      ...(failed ? { reason: failedReasons.get(id) } : {}),
+      ...(failed && view.attemptedDraftById.has(id)
+        ? { attemptedDraft: view.attemptedDraftById.get(id) }
+        : {}),
+      ...(failed && view.attemptedActiveById.has(id)
+        ? { attemptedActive: view.attemptedActiveById.get(id) }
         : {}),
     });
   }

@@ -38,6 +38,8 @@ import {
   buildPendingBudgetOps,
   buildPendingCategoryOps,
   buildPendingPlannedOps,
+  buildPendingRecurringOps,
+  type RecurringRowOpState,
 } from '@/lib/pendingManagementView';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import { useAuth } from '@/store/auth';
@@ -294,6 +296,27 @@ export interface FinanceReadResult {
     }
   >;
 
+  /**
+   * STEP 16-H2-F1 — ENGINE ONLY (no screen reads this yet; UI wiring is F2).
+   * The recurring-rule list for a recurring-management surface: authoritative
+   * server `recurring` with a pending FULL UPDATE or ACTIVE toggle overlaid,
+   * a synthetic row for a pending/failed CREATE, a synthetic row for a
+   * failed FULL UPDATE whose server row is gone, minus a not-failed pending
+   * DELETE. DELIBERATELY separate from `recurring` / `recurringMeta` (§26) —
+   * those stay authoritative-server-only; materialization (lastRun /
+   * BootEffects / transaction generation) is untouched and never reads this.
+   * Equals `recurring` when there are no recurring ops.
+   */
+  recurringManagementRows: RecurringRule[];
+  /**
+   * recurring id -> its pending offline-op state, for a future row label /
+   * read-only gate. Mirrors `pendingPlannedOps`, plus `updateKind` (`'full'`
+   * vs `'active'`) and `attemptedActive` for a failed toggle. An orphan
+   * failed ACTIVE toggle (server row gone) has NO entry here — see
+   * `RecurringManagementView.attemptedActiveById` / `buildPendingRecurringOps`.
+   */
+  pendingRecurringOps: ReadonlyMap<string, RecurringRowOpState>;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -330,6 +353,8 @@ const EMPTY_SLICES = {
   pendingBudgetOps: new Map() as FinanceReadResult['pendingBudgetOps'],
   plannedManagementRows: [] as PlannedExpense[],
   pendingPlannedOps: new Map() as FinanceReadResult['pendingPlannedOps'],
+  recurringManagementRows: [] as RecurringRule[],
+  pendingRecurringOps: new Map() as FinanceReadResult['pendingRecurringOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -356,6 +381,9 @@ export function useFinanceRead(): FinanceReadResult {
     pendingPlannedOps: providerPlannedOps,
     plannedFailedReasons,
     failedPlannedIds: providerFailedPlannedIds,
+    pendingRecurringOps: providerRecurringOps,
+    recurringFailedReasons,
+    failedRecurringIds: providerFailedRecurringIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -382,7 +410,8 @@ export function useFinanceRead(): FinanceReadResult {
         providerCategoryOps.length > 0 ||
         providerBudgetOps.length > 0 ||
         providerCategoryBudgetOps.length > 0 ||
-        providerPlannedOps.length > 0;
+        providerPlannedOps.length > 0 ||
+        providerRecurringOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
@@ -394,6 +423,7 @@ export function useFinanceRead(): FinanceReadResult {
                 ...providerBudgetOps,
                 ...providerCategoryBudgetOps,
                 ...providerPlannedOps,
+                ...providerRecurringOps,
               ],
               providerFailedIds,
               providerFailedCardIds,
@@ -401,6 +431,7 @@ export function useFinanceRead(): FinanceReadResult {
               providerFailedBudgetIds,
               providerFailedCategoryBudgetIds,
               providerFailedPlannedIds,
+              providerFailedRecurringIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -481,6 +512,21 @@ export function useFinanceRead(): FinanceReadResult {
             plannedFailedReasons,
           )
         : new Map();
+      // STEP 16-H2-F1: recurring-rule display-only surface. `composeFinance`
+      // NEVER folded a recurring row into `composed.recurring` — it feeds
+      // `recurringManagement` only. `recurring`/`recurringMeta` below stay
+      // `data.recurring`/`data.recurringMeta` untouched (§26) — materialization
+      // (lastRun / BootEffects) never reads this projection.
+      const recurringManagementRows = composedResult
+        ? composedResult.recurringManagement.rows
+        : data.recurring;
+      const pendingRecurringOps: FinanceReadResult['pendingRecurringOps'] = composedResult
+        ? buildPendingRecurringOps(
+            composedResult.recurringManagement,
+            providerRecurringOps,
+            recurringFailedReasons,
+          )
+        : new Map();
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -530,6 +576,8 @@ export function useFinanceRead(): FinanceReadResult {
         pendingBudgetOps,
         plannedManagementRows,
         pendingPlannedOps,
+        recurringManagementRows,
+        pendingRecurringOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -600,5 +648,8 @@ export function useFinanceRead(): FinanceReadResult {
     providerPlannedOps,
     plannedFailedReasons,
     providerFailedPlannedIds,
+    providerRecurringOps,
+    recurringFailedReasons,
+    providerFailedRecurringIds,
   ]);
 }

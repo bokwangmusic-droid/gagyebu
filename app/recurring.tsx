@@ -14,11 +14,14 @@ import { useToast } from '@/components/ui/Toast';
 import { getCat, type TxnType } from '@/data/categories';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
+import { attemptedActiveLabel, pendingRecurringRowLabel } from '@/lib/pendingRecurringLabel';
 import { describeSchedule } from '@/lib/recurring';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { setRecurringActive, softDeleteRecurring } from '@/services/remoteRecurringWrite';
 import { useAuth } from '@/store/auth';
-import { useFinanceRead } from '@/store/financeRead';
+import { useFinanceRead, type FinanceReadResult } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { RecurringRule } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -28,7 +31,23 @@ export default function RecurringList() {
   const toast = useToast();
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
-  const { status, error, recurring, recurringMeta, customCats, refresh } = useFinanceRead();
+  const {
+    status,
+    error,
+    recurring,
+    recurringMeta,
+    // STEP 16-H2-F2 §5: the LIST renders `recurringManagementRows`
+    // (authoritative server `recurring` + pending CREATE synthetic + a
+    // NOT-failed pending FULL UPDATE / ACTIVE toggle overlay − a not-failed
+    // pending DELETE + a failed-orphan FULL-UPDATE synthetic). The money
+    // total / active-paused counts below stay on AUTHORITATIVE `recurring`
+    // (Budget/Planned precedent).
+    recurringManagementRows,
+    pendingRecurringOps,
+    customCats,
+    refresh,
+  } = useFinanceRead();
+  const pending = usePendingWrites();
   const financeRefresh = useRemoteFinanceRefreshControl();
   const [tab, setTab] = useState<TxnType>('expense');
 
@@ -41,13 +60,83 @@ export default function RecurringList() {
   const canToggle = REMOTE_FINANCE_WRITE.recurringToggle;
   const canDelete = REMOTE_FINANCE_WRITE.recurringDelete;
 
-  const filtered = useMemo(() => recurring.filter((r) => r.type === tab), [recurring, tab]);
-  const monthlyTotal = filtered.filter((r) => r.active).reduce((s, r) => s + r.amount, 0);
+  const filtered = useMemo(
+    () => recurringManagementRows.filter((r) => r.type === tab),
+    [recurringManagementRows, tab],
+  );
+  // AGGREGATE ISOLATION (device QA regression, STEP 16-H2-F2 fix) — these
+  // three MUST read `recurring` (authoritative `financeRead().recurring`,
+  // untouched by any pending/failed queue op), NEVER `recurringManagementRows`.
+  // A pending DELETE optimistically hides its row from the LIST
+  // (`filtered`, above) but must NOT move this total/count until the server
+  // actually acks it — see src/lib/offlineQueue.recurring.cases.ts cases
+  // A–D for the exact regression this guards.
+  const monthlyTotal = recurring.filter((r) => r.type === tab && r.active).reduce((s, r) => s + r.amount, 0);
   const activeCount = recurring.filter((r) => r.active).length;
   const pausedCount = recurring.length - activeCount;
 
   const openAdd = () => router.push({ pathname: '/recurring-add', params: { type: tab } });
-  const openEdit = (id: string) => router.push({ pathname: '/recurring-add', params: { id } });
+  const openEdit = (id: string) => {
+    // §17: never open the edit form on a row with an in-flight/failed op —
+    // the route guard in recurring-add.tsx also blocks this, but the list
+    // never offers the tap in the first place (see the row below).
+    if (pendingRecurringOps.has(id)) return;
+    router.push({ pathname: '/recurring-add', params: { id } });
+  };
+
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '반복 항목을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
+  const discardFailed = (queueId: string) => {
+    Alert.alert('실패한 변경을 버릴까요?', '다른 기기에 저장된 최신 반복 항목은 그대로 유지됩니다.', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '버리기',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            const r = await pending.discardPending(queueId);
+            toast.show(r.ok ? '실패한 변경을 버렸어요' : '변경을 버리지 못했어요. 잠시 후 다시 시도해주세요.');
+          })();
+        },
+      },
+    ]);
+  };
+
+  // STEP 16-H2-F2 §13 — CRITICAL: an orphan failed ACTIVE toggle (server row
+  // deleted by another device while this one was offline) gets NO row in
+  // `recurringManagementRows` (an `{ active }`-only payload has no
+  // name/amount/category to fabricate a `RecurringRule` from — see
+  // `composeRecurringManagement`). It must still be visible + discardable,
+  // so this reads the RAW current-scope recurring ops directly (never a
+  // fabricated row) and renders a standalone notice for exactly the ones
+  // that are terminal-failed AND have no corresponding management row.
+  const managementRowIds = useMemo(
+    () => new Set(recurringManagementRows.map((r) => r.id)),
+    [recurringManagementRows],
+  );
+  const orphanActiveFailures = useMemo(
+    () =>
+      pending.pendingRecurringOps.filter(
+        (op) =>
+          op.entity === 'recurring' &&
+          op.op === 'update' &&
+          op.updateKind === 'active' &&
+          pending.failedRecurringIds.has(op.entityId) &&
+          !managementRowIds.has(op.entityId),
+      ),
+    [pending.pendingRecurringOps, pending.failedRecurringIds, managementRowIds],
+  );
 
   /* ---------------- active toggle ---------------- */
 
@@ -66,14 +155,37 @@ export default function RecurringList() {
       expectedUpdatedAt: token,
     });
 
-    await refresh();
-    pendingRef.current = false;
-    setPendingId(null);
-
     if (res.ok) {
+      await refresh();
+      pendingRef.current = false;
+      setPendingId(null);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       return;
     }
+
+    // STEP 16-H2-F2 §3: a TRANSPORT failure (offline) -> durable ACTIVE
+    // toggle queue with the SAME frozen token captured BEFORE the toggle.
+    if (res.transport === true) {
+      const enq = await pending.enqueueRecurringActiveUpdate({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: id,
+        active: nextActive,
+        expectedUpdatedAt: token,
+      });
+      pendingRef.current = false;
+      setPendingId(null);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('상태 변경을 저장했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
+      return;
+    }
+
+    await refresh();
+    pendingRef.current = false;
+    setPendingId(null);
     if (res.reason === 'identity' || res.reason === 'error') {
       toast.show(res.message);
       return;
@@ -82,7 +194,10 @@ export default function RecurringList() {
   };
 
   const toggleRule = (r: RecurringRule) => {
-    if (!canToggle || pendingRef.current) return;
+    // §3/§17: block a second write while ANY pending/failed op already sits
+    // on this row (CREATE/FULL-UPDATE/ACTIVE/DELETE) — never a second toggle
+    // stacked on top of an in-flight one.
+    if (!canToggle || pendingRef.current || pendingRecurringOps.has(r.id)) return;
     const token = recurringMeta[r.id]?.updatedAt ?? null;
     if (!token) {
       toast.show('반복 항목 정보를 불러오지 못했어요. 새로고침 후 다시 시도해 주세요.');
@@ -107,15 +222,37 @@ export default function RecurringList() {
       expectedUpdatedAt: token,
     });
 
-    await refresh();
-    pendingRef.current = false;
-    setPendingId(null);
-
     if (res.ok) {
+      await refresh();
+      pendingRef.current = false;
+      setPendingId(null);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('반복 항목을 삭제했어요');
       return;
     }
+
+    // STEP 16-H2-F2 §4: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue with the SAME frozen token captured before the confirm Alert.
+    if (res.transport === true) {
+      const enq = await pending.enqueueRecurringDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: id,
+        expectedUpdatedAt: token,
+      });
+      pendingRef.current = false;
+      setPendingId(null);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('반복 항목을 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
+      return;
+    }
+
+    await refresh();
+    pendingRef.current = false;
+    setPendingId(null);
     if (res.reason === 'identity' || res.reason === 'error') {
       toast.show(res.message);
       return;
@@ -124,7 +261,7 @@ export default function RecurringList() {
   };
 
   const confirmDelete = (r: RecurringRule) => {
-    if (!canDelete || pendingRef.current) return;
+    if (!canDelete || pendingRef.current || pendingRecurringOps.has(r.id)) return;
     // Capture the concurrency token BEFORE the Alert — a background refresh
     // can't swap it under us. No token => no safe concurrency-guarded delete.
     const token = recurringMeta[r.id]?.updatedAt ?? null;
@@ -237,6 +374,19 @@ export default function RecurringList() {
             const cat = getCat(r.category, r.type, customCats);
             const rowPending = pendingId === r.id;
 
+            // STEP 16-H2-F2 §6–§11/§17: a row with an in-flight / terminal-
+            // failed offline op (CREATE, FULL UPDATE, ACTIVE toggle, or
+            // DELETE) is READ-ONLY — no tap-to-edit, no toggle, no delete,
+            // no second queued write. It shows a status block instead; a
+            // terminal-failed op also offers "변경 버리기". The displayed
+            // row is ALWAYS the authoritative server value when one exists
+            // (`recurringManagementRows` already resolved that — a failed
+            // ACTIVE toggle's row here always shows the authoritative
+            // `active`, never the failed attempted one) — `attemptedDraft`/
+            // `attemptedActive` are conflict metadata only.
+            const pendingOp = pendingRecurringOps.get(r.id);
+            const pl = pendingOp ? pendingRecurringRowLabel(pendingOp) : null;
+
             // The row body (tap -> edit) and the toggle / trash controls are
             // SIBLINGS, not nested — a tap lands on exactly one, so toggling
             // or deleting never also navigates to the edit screen.
@@ -283,58 +433,120 @@ export default function RecurringList() {
               <View
                 key={r.id}
                 style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: spacing.sm,
                   marginHorizontal: spacing.lg,
                   marginBottom: spacing.sm,
                   paddingVertical: 12,
                   paddingHorizontal: spacing.lg,
                   backgroundColor: colors.white,
                   borderWidth: 1,
-                  borderColor: colors.border,
+                  borderColor: pendingOp ? colors.primaryLight : colors.border,
                   borderRadius: radii.xl,
                   opacity: rowPending ? 0.5 : r.active ? 1 : 0.6,
                 }}
               >
-                {canEdit ? (
-                  <Pressable
-                    onPress={() => openEdit(r.id)}
-                    disabled={rowPending}
-                    style={({ pressed }) => [{ flex: 1 }, pressed && { opacity: 0.6 }]}
-                  >
-                    {body}
-                  </Pressable>
-                ) : (
-                  body
-                )}
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
+                  {canEdit && !pendingOp ? (
+                    <Pressable
+                      onPress={() => openEdit(r.id)}
+                      disabled={rowPending}
+                      style={({ pressed }) => [{ flex: 1 }, pressed && { opacity: 0.6 }]}
+                    >
+                      {body}
+                    </Pressable>
+                  ) : (
+                    <View style={{ flex: 1 }}>{body}</View>
+                  )}
 
-                {canToggle && (
-                  <Toggle
-                    value={r.active}
-                    onChange={() => toggleRule(r)}
-                    disabled={rowPending}
-                  />
-                )}
+                  {canToggle && !pendingOp && <Toggle value={r.active} onChange={() => toggleRule(r)} disabled={rowPending} />}
 
-                {canDelete && (
-                  <Pressable
-                    onPress={() => confirmDelete(r)}
-                    disabled={rowPending}
-                    hitSlop={8}
-                    style={{
-                      width: 30,
-                      height: 30,
-                      borderRadius: radii.sm,
-                      borderWidth: 1,
-                      borderColor: colors.expenseLight,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                    }}
-                  >
-                    <AppIcon name="trash" size={13} color={colors.expenseText} />
-                  </Pressable>
+                  {canDelete && !pendingOp && (
+                    <Pressable
+                      onPress={() => confirmDelete(r)}
+                      disabled={rowPending}
+                      hitSlop={8}
+                      style={{
+                        width: 30,
+                        height: 30,
+                        borderRadius: radii.sm,
+                        borderWidth: 1,
+                        borderColor: colors.expenseLight,
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    >
+                      <AppIcon name="trash" size={13} color={colors.expenseText} />
+                    </Pressable>
+                  )}
+                </View>
+
+                {pl && pendingOp && (
+                  <View style={{ marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.border, gap: 2 }}>
+                    <Text
+                      style={{
+                        fontFamily: fontFamily.bold,
+                        fontSize: 11,
+                        color: pendingOp.failed ? colors.expenseText : colors.primaryStrong,
+                      }}
+                    >
+                      {pl.primary}
+                    </Text>
+                    {pl.detail && (
+                      <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub }}>{pl.detail}</Text>
+                    )}
+                    {pendingOp.failed && pendingOp.attemptedDraft && (
+                      <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted, ...tabularNums }}>
+                        시도한 금액: {fmt(pendingOp.attemptedDraft.amount)}원
+                      </Text>
+                    )}
+                    {pendingOp.failed && pendingOp.attemptedActive !== undefined && (
+                      <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted }}>
+                        {attemptedActiveLabel(pendingOp.attemptedActive)}
+                      </Text>
+                    )}
+                    {pendingOp.failed && pendingOp.queueId && (
+                      <Pressable onPress={() => discardFailed(pendingOp.queueId!)} hitSlop={8} style={{ alignSelf: 'flex-start', marginTop: 2 }}>
+                        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.primaryStrong }}>변경 버리기</Text>
+                      </Pressable>
+                    )}
+                  </View>
                 )}
+              </View>
+            );
+          })}
+        </View>
+      )}
+
+      {/* STEP 16-H2-F2 §13 — orphan failed ACTIVE toggle: the recurring row
+          it targeted is gone on the server, so there is nothing to overlay a
+          row onto. Rendered as a small standalone, read-only notice —
+          NEVER a fabricated RecurringRule — with the SAME generic
+          discardPending(queueId) path as every other "변경 버리기". */}
+      {orphanActiveFailures.length > 0 && (
+        <View style={{ marginTop: spacing.md, marginHorizontal: spacing.lg, gap: spacing.sm }}>
+          {orphanActiveFailures.map((op) => {
+            if (op.entity !== 'recurring' || op.op !== 'update' || op.updateKind !== 'active') return null;
+            return (
+              <View
+                key={op.queueId}
+                style={{
+                  paddingVertical: 12,
+                  paddingHorizontal: spacing.lg,
+                  backgroundColor: colors.white,
+                  borderWidth: 1,
+                  borderColor: colors.expenseLight,
+                  borderRadius: radii.xl,
+                  gap: 2,
+                }}
+              >
+                <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.expenseText }}>
+                  삭제된 반복거래의 상태 변경을 반영하지 못했어요
+                </Text>
+                <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted }}>
+                  {attemptedActiveLabel(op.payload.active)}
+                </Text>
+                <Pressable onPress={() => discardFailed(op.queueId)} hitSlop={8} style={{ alignSelf: 'flex-start', marginTop: 4 }}>
+                  <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.primaryStrong }}>변경 버리기</Text>
+                </Pressable>
               </View>
             );
           })}

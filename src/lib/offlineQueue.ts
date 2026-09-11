@@ -67,9 +67,13 @@ import {
   isValidPlannedDraft,
   type NewPlannedExpenseDraft,
 } from '@/lib/remotePlannedWriteMapping';
+import {
+  isValidRecurringDraft,
+  type NewRecurringDraft,
+} from '@/lib/remoteRecurringWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { BudgetMap, CreditCard, PlannedExpense, Transaction } from '@/store/types';
+import type { BudgetMap, CreditCard, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
@@ -102,7 +106,8 @@ export type PendingEntity =
   | 'category'
   | 'budget'
   | 'categoryBudget'
-  | 'planned';
+  | 'planned'
+  | 'recurring';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -345,6 +350,75 @@ export interface PendingPlannedDelete extends PendingWriteBase {
   expectedUpdatedAt: string;
 }
 
+/* ---------------- recurring-rule records (STEP 16-H2-F1) ---------------- */
+
+/**
+ * `payload` is exactly what `createRecurring({ draft })` is re-handed — the
+ * UI-editable `NewRecurringDraft` (`type` / `name` / `amount` / `category` /
+ * `frequency` / `dayOfMonth` / `dayOfWeek`). `entityId` is the SAME client
+ * `rec-…` id the direct `createRecurring` used, so a lost-response replay
+ * hits the service's `unique(household_id, id)` 23505 idempotency path. No
+ * `expectedUpdatedAt` — a CREATE has no token. No natural-key uniqueness, so
+ * this record never "revives" a soft-deleted row — a new rule is always a
+ * brand-new id.
+ */
+export interface PendingRecurringCreate extends PendingWriteBase {
+  entity: 'recurring';
+  op: 'create';
+  payload: NewRecurringDraft;
+}
+
+/**
+ * A FULL schedule edit — `payload` is what `updateRecurring({ draft })` is
+ * re-handed. Only `name` / `amount` / `category` / `frequency` /
+ * `dayOfMonth` / `dayOfWeek` are ever written on the server (`type` is
+ * product-immutable, `active` has its own action — `buildRecurringUpdate`
+ * emits neither), but the draft keeps both for the shared validator / a
+ * management-only display row. `updateKind: 'full'` is the discriminant
+ * against `PendingRecurringActiveUpdate` — both share
+ * `entity:'recurring', op:'update'` (STEP 16-H2-F1 §3/§7: this is
+ * DELIBERATE — a full edit and an active toggle on the SAME row dedup-collide
+ * instead of stacking as two independent pending writes; a differing
+ * `updateKind` for the same id is `existing-pending`, never silently
+ * replaced or merged). `expectedUpdatedAt` is FROZEN from the
+ * `recurringMeta.updatedAt` the edit screen opened against and is NEVER
+ * refreshed — a stale token turns a concurrent edit into a `conflict`, never
+ * a blind overwrite.
+ */
+export interface PendingRecurringUpdate extends PendingWriteBase {
+  entity: 'recurring';
+  op: 'update';
+  updateKind: 'full';
+  payload: NewRecurringDraft;
+  expectedUpdatedAt: string;
+}
+
+/**
+ * The 정지/재개 toggle — `payload` is EXACTLY `{ active: boolean }`, nothing
+ * else (STEP 16-H2-F1 §5): no schedule field ever rides along on a toggle,
+ * mirroring `setRecurringActive`'s own `{ active }`-only PATCH body.
+ * `updateKind: 'active'` distinguishes it from a full edit at the SAME
+ * dedup identity (`entity:'recurring', op:'update'`, same `entityId`).
+ * `expectedUpdatedAt` is FROZEN from the `recurringMeta.updatedAt` captured
+ * BEFORE the toggle and is NEVER refreshed.
+ */
+export interface PendingRecurringActiveUpdate extends PendingWriteBase {
+  entity: 'recurring';
+  op: 'update';
+  updateKind: 'active';
+  payload: { active: boolean };
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeleteRecurring` guarded on the FROZEN
+ *  `expectedUpdatedAt`. NO `payload`. Never a hard DELETE (no DELETE grant —
+ *  every "delete" is an `UPDATE deleted_at`). */
+export interface PendingRecurringDelete extends PendingWriteBase {
+  entity: 'recurring';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
@@ -361,7 +435,11 @@ export type PendingWrite =
   | PendingCategoryBudgetDelete
   | PendingPlannedCreate
   | PendingPlannedUpdate
-  | PendingPlannedDelete;
+  | PendingPlannedDelete
+  | PendingRecurringCreate
+  | PendingRecurringUpdate
+  | PendingRecurringActiveUpdate
+  | PendingRecurringDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -551,6 +629,68 @@ function isValidPlannedPayload(p: unknown): p is NewPlannedExpenseDraft {
   });
 }
 
+/**
+ * Structural validity for a stored `NewRecurringDraft` (STEP 16-H2-F1 §5 —
+ * reuse `isValidRecurringDraft` from remoteRecurringWriteMapping.ts rather
+ * than re-deriving the amount/day-of-month/day-of-week rules). Only the
+ * UI-editable shape — `type` / `name` / `amount` / `category` / `frequency` /
+ * `dayOfMonth` / `dayOfWeek`. `active` must NEVER be present (it has its own
+ * op — `isValidActiveTogglePayload` below). Any server / identity / timestamp
+ * / soft-delete / `last_run` column present -> reject; the final
+ * amount>0 / day-range checks are delegated to `isValidRecurringDraft` — the
+ * SAME function `createRecurring()` / `updateRecurring()` themselves run.
+ */
+function isValidRecurringPayload(p: unknown): p is NewRecurringDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (d.type !== 'income' && d.type !== 'expense') return false;
+  if (!isNonEmptyString(d.name)) return false;
+  if (!isFiniteNumber(d.amount)) return false;
+  if (!isNonEmptyString(d.category)) return false;
+  if (d.frequency !== 'monthly' && d.frequency !== 'weekly') return false;
+  if (!(d.dayOfMonth === null || isFiniteNumber(d.dayOfMonth))) return false;
+  if (!(d.dayOfWeek === null || isFiniteNumber(d.dayOfWeek))) return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d ||
+    'deleted_at' in d ||
+    'last_run' in d ||
+    'lastRun' in d ||
+    'active' in d
+  ) {
+    return false;
+  }
+  return isValidRecurringDraft({
+    type: d.type,
+    name: d.name,
+    amount: d.amount,
+    category: d.category,
+    frequency: d.frequency,
+    dayOfMonth: d.dayOfMonth as number | null,
+    dayOfWeek: d.dayOfWeek as number | null,
+  });
+}
+
+/**
+ * Structural validity for a stored active-toggle payload — EXACTLY
+ * `{ active: boolean }` and nothing else (STEP 16-H2-F1 §5): no schedule
+ * field is ever allowed to ride along on a toggle record.
+ */
+function isValidActiveTogglePayload(p: unknown): p is { active: boolean } {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (typeof d.active !== 'boolean') return false;
+  const keys = Object.keys(d);
+  return keys.length === 1 && keys[0] === 'active';
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
@@ -563,7 +703,8 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     r.entity !== 'category' &&
     r.entity !== 'budget' &&
     r.entity !== 'categoryBudget' &&
-    r.entity !== 'planned'
+    r.entity !== 'planned' &&
+    r.entity !== 'recurring'
   ) {
     return null;
   }
@@ -702,6 +843,50 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
     if ('payload' in r) return null; // a DELETE carries no user payload (§2)
     return { ...base, entity: 'planned', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'recurring') {
+    // STEP 16-H2-F1 — recurring-rule CREATE / FULL UPDATE / ACTIVE-toggle
+    // UPDATE / soft DELETE. FULL and ACTIVE share `op:'update'` and are
+    // distinguished by `updateKind` — an update record MISSING/mismatched
+    // `updateKind` is malformed.
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token
+      if ('updateKind' in r) return null; // a CREATE carries no updateKind
+      if (!isValidRecurringPayload(r.payload)) return null;
+      return { ...base, entity: 'recurring', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (r.updateKind === 'full') {
+        if (!isValidRecurringPayload(r.payload)) return null;
+        return {
+          ...base,
+          entity: 'recurring',
+          op: 'update',
+          updateKind: 'full',
+          payload: r.payload,
+          expectedUpdatedAt: r.expectedUpdatedAt,
+        };
+      }
+      if (r.updateKind === 'active') {
+        if (!isValidActiveTogglePayload(r.payload)) return null;
+        return {
+          ...base,
+          entity: 'recurring',
+          op: 'update',
+          updateKind: 'active',
+          payload: r.payload,
+          expectedUpdatedAt: r.expectedUpdatedAt,
+        };
+      }
+      return null; // unknown/missing updateKind
+    }
+    // recurring delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload
+    if ('updateKind' in r) return null; // a DELETE carries no updateKind
+    return { ...base, entity: 'recurring', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
   }
 
   // ---- transaction ----
@@ -1108,6 +1293,98 @@ export function makePendingPlannedDelete(args: {
   };
 }
 
+export function makePendingRecurringCreate(args: {
+  scope: PendingWriteScope;
+  /** Client-generated `rec-…` id — stable across replays of ONE form mount. */
+  entityId: string;
+  payload: NewRecurringDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingRecurringCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'recurring',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingRecurringUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewRecurringDraft;
+  /** FROZEN — the `recurringMeta.updatedAt` the edit screen opened against.
+   *  Handed to `updateRecurring` verbatim on every replay; never refreshed. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingRecurringUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'recurring',
+    op: 'update',
+    updateKind: 'full',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingRecurringActiveUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** The desired 정지/재개 state — FROZEN as `{ active }`, nothing else. */
+  active: boolean;
+  /** FROZEN — the `recurringMeta.updatedAt` captured BEFORE the toggle. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingRecurringActiveUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'recurring',
+    op: 'update',
+    updateKind: 'active',
+    entityId: args.entityId,
+    payload: { active: args.active },
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingRecurringDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingRecurringDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'recurring',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -1170,6 +1447,22 @@ function plannedEditableEqual(a: NewPlannedExpenseDraft, b: NewPlannedExpenseDra
     a.category === b.category &&
     a.date === b.date &&
     a.memo === b.memo
+  );
+}
+
+/** Equality of the SERVER-editable recurring-rule schedule fields
+ *  (`name` / `amount` / `category` / `frequency` / `dayOfMonth` /
+ *  `dayOfWeek`). `type` is create-only (`buildRecurringUpdate` drops it, and
+ *  `active` is never part of this shape at all — its own op), so neither is
+ *  compared here; the CREATE matcher adds `type`. */
+function recurringEditableEqual(a: NewRecurringDraft, b: NewRecurringDraft): boolean {
+  return (
+    a.name === b.name &&
+    Number(a.amount) === Number(b.amount) &&
+    a.category === b.category &&
+    a.frequency === b.frequency &&
+    a.dayOfMonth === b.dayOfMonth &&
+    a.dayOfWeek === b.dayOfWeek
   );
 }
 
@@ -1248,6 +1541,31 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
     }
     if (a.op === 'update' && b.op === 'update') {
       return a.expectedUpdatedAt === b.expectedUpdatedAt && plannedEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
+  }
+
+  if (a.entity === 'recurring' && b.entity === 'recurring') {
+    // CREATE: identity + same draft INCLUDING type (create-only field). A
+    // DIFFERING CREATE for the same id is `existing-pending`, never a silent
+    // overwrite, mirroring the service's isSameCreateRow.
+    if (a.op === 'create' && b.op === 'create') {
+      return a.payload.type === b.payload.type && recurringEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'update' && b.op === 'update') {
+      // STEP 16-H2-F1 §7: FULL vs ACTIVE at the SAME entityId is NEVER the
+      // same request — a differing `updateKind` refuses as `existing-pending`
+      // (never cross-op compaction/merge), even though both share
+      // `entity:'recurring', op:'update'` (the dedup identity).
+      if (a.updateKind !== b.updateKind) return false;
+      if (a.updateKind === 'full' && b.updateKind === 'full') {
+        return a.expectedUpdatedAt === b.expectedUpdatedAt && recurringEditableEqual(a.payload, b.payload);
+      }
+      if (a.updateKind === 'active' && b.updateKind === 'active') {
+        return a.expectedUpdatedAt === b.expectedUpdatedAt && a.payload.active === b.payload.active;
+      }
+      return false;
     }
     if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
     return false;
@@ -2039,6 +2357,266 @@ function composePlannedManagement(
   return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById };
 }
 
+/* ---------------- recurring-rule display model (STEP 16-H2-F1) ---------------- */
+
+/** A pending CREATE / failed-orphan FULL-UPDATE payload -> a synthetic
+ *  domain `RecurringRule`. The row is read-only (never re-edited) —
+ *  `createdAt` is a synthetic `enqueuedAt` placeholder. `active` is assumed
+ *  `true`: neither a CREATE draft nor a full-UPDATE draft ever carries the
+ *  real `active` state (it has its own action), so for a CREATE this matches
+ *  the real DB default, and for an orphaned full-UPDATE it is the best
+ *  available guess, NOT a re-derivation of a real value — a limitation
+ *  documented here rather than silently assumed. */
+function recurringDraftToDomain(op: PendingRecurringCreate | PendingRecurringUpdate): RecurringRule {
+  const d = op.payload;
+  return {
+    id: op.entityId,
+    type: d.type,
+    name: d.name,
+    amount: d.amount,
+    category: d.category,
+    frequency: d.frequency,
+    dayOfMonth: d.dayOfMonth ?? undefined,
+    dayOfWeek: d.dayOfWeek ?? undefined,
+    active: true,
+    createdAt: op.enqueuedAt,
+  };
+}
+
+/** Overlay a FULL-UPDATE draft onto an existing domain rule. `id` /
+ *  `createdAt` (server identity), `type` (product-immutable), and `active`
+ *  (its own separate action — a full edit never touches it) are preserved
+ *  from `row`. */
+function applyRecurringFullUpdate(row: RecurringRule, d: NewRecurringDraft): RecurringRule {
+  return {
+    ...row,
+    name: d.name,
+    amount: d.amount,
+    category: d.category,
+    frequency: d.frequency,
+    dayOfMonth: d.dayOfMonth ?? undefined,
+    dayOfWeek: d.dayOfWeek ?? undefined,
+  };
+}
+
+/** Overlay an ACTIVE-toggle onto an existing domain rule — ONLY `active` changes. */
+function applyRecurringActiveUpdate(row: RecurringRule, active: boolean): RecurringRule {
+  return { ...row, active };
+}
+
+/**
+ * Does an authoritative server recurring rule already reflect a queued
+ * CREATE/FULL-UPDATE's desired draft? STEP 16-H2-F1 §12/§13 — the pre-ack
+ * confirmation, reused for BOTH ops (mirrors card/category's one
+ * `serverXConfirmsUpdate` for create+update). Mirrors the write service's own
+ * `recurringFieldsMatch` / `isSameCreateRow` field set at the READ-MODEL
+ * level: `name` (trimmed) / `amount` / `category` / `frequency` /
+ * `dayOfMonth` / `dayOfWeek` compared strictly (`undefined` on the domain
+ * side normalized to `null` to match the draft's `number | null`). `type` /
+ * `active` are NOT compared (product-immutable / a separate op). Pure.
+ */
+export function serverRecurringConfirmsUpdate(
+  serverRow: RecurringRule,
+  draft: NewRecurringDraft,
+): boolean {
+  return (
+    serverRow.name === draft.name.trim() &&
+    Number(serverRow.amount) === Number(draft.amount) &&
+    serverRow.category === draft.category &&
+    serverRow.frequency === draft.frequency &&
+    (serverRow.dayOfMonth ?? null) === draft.dayOfMonth &&
+    (serverRow.dayOfWeek ?? null) === draft.dayOfWeek
+  );
+}
+
+/**
+ * Does an authoritative server recurring rule already reflect a queued
+ * ACTIVE-toggle's desired state? STEP 16-H2-F1 §14 — content match on
+ * `active` alone; `updatedAt` changing is never sufficient on its own. Pure.
+ */
+export function serverRecurringConfirmsActive(serverRow: RecurringRule, desiredActive: boolean): boolean {
+  return serverRow.active === desiredActive;
+}
+
+export interface RecurringManagementView {
+  /**
+   * The recurring rules to render on a RECURRING-MANAGEMENT surface ONLY:
+   * authoritative server `recurring`, with a NOT-failed pending FULL UPDATE
+   * or ACTIVE toggle overlaid, plus a synthetic row for a pending/failed
+   * CREATE, plus a synthetic row for a FAILED FULL UPDATE whose server row
+   * is GONE, minus a not-failed pending DELETE.
+   *
+   * STEP 16-H2-F1 §21/§22 — a TERMINAL-failed FULL UPDATE or ACTIVE toggle
+   * whose authoritative server row STILL EXISTS keeps the AUTHORITATIVE row
+   * verbatim (the other device won); the attempted local value is exposed
+   * via `attemptedDraftById` / `attemptedActiveById` as conflict metadata
+   * only — a failed toggle never "sticks" at the attempted value, it always
+   * snaps back to the authoritative `active`.
+   *
+   * DELIBERATELY separate from `data.recurring` / `data.recurringMeta`
+   * (§26) so any other consumer only ever sees authoritative server data.
+   * Equals `data.recurring` when there are no recurring ops.
+   */
+  rows: RecurringRule[];
+  /** recurring id -> the pending op that produced or marks it. */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** recurring ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server recurring ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+  /**
+   * row ids that are SYNTHETIC — present in `rows` only because of an op,
+   * with no authoritative server row behind them (pending/failed CREATE, and
+   * a failed FULL UPDATE whose server row is gone). A failed ACTIVE toggle
+   * NEVER contributes a synthetic row here — see `attemptedActiveById`.
+   */
+  syntheticIds: ReadonlySet<string>;
+  /**
+   * recurring id -> the FULL draft attempted in a TERMINAL-failed FULL
+   * UPDATE. Conflict metadata ONLY — never used to replace the displayed row
+   * when the authoritative row exists (§21). Present for both the
+   * "row exists" and the orphan case.
+   */
+  attemptedDraftById: ReadonlyMap<string, NewRecurringDraft>;
+  /**
+   * recurring id -> the desired `active` value attempted in a TERMINAL-failed
+   * ACTIVE toggle. Conflict metadata ONLY (§22). Present for BOTH:
+   *   - the row-exists case (the id is ALSO in `opById`/`rows` there), and
+   *   - the ORPHAN case (server row gone) — which, UNLIKE a full UPDATE,
+   *     gets NO synthetic row and NO `opById` entry: an `{ active }`-only
+   *     payload carries no name/amount/category/frequency, so a full
+   *     `RecurringRule` can never be honestly reconstructed from it (nothing
+   *     is ever invented here). The id is failed + traceable via this map
+   *     (and the raw `PendingWrite` queue, `discardPending`-able) even though
+   *     it has no row to display (STEP 16-H2-F1 §24).
+   */
+  attemptedActiveById: ReadonlyMap<string, boolean>;
+}
+
+function composeRecurringManagement(
+  serverRecurring: readonly RecurringRule[],
+  ops: readonly PendingWrite[],
+  failedRecurringIds?: ReadonlySet<string>,
+): RecurringManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const syntheticIds = new Set<string>();
+  const attemptedDraftById = new Map<string, NewRecurringDraft>();
+  const attemptedActiveById = new Map<string, boolean>();
+  const recOps = ops.filter(
+    (
+      o,
+    ): o is
+      | PendingRecurringCreate
+      | PendingRecurringUpdate
+      | PendingRecurringActiveUpdate
+      | PendingRecurringDelete => o.entity === 'recurring',
+  );
+  if (recOps.length === 0) {
+    return {
+      rows: serverRecurring.slice(),
+      opById,
+      failedIds,
+      hiddenIds,
+      syntheticIds,
+      attemptedDraftById,
+      attemptedActiveById,
+    };
+  }
+
+  const failed = (id: string) => !!failedRecurringIds?.has(id);
+  const rows = serverRecurring.slice(); // never mutates serverRecurring
+  const idxOf = (id: string) => rows.findIndex((r) => r.id === id);
+
+  for (const op of recOps) {
+    const idx = idxOf(op.entityId);
+
+    if (op.op === 'create') {
+      if (idx !== -1) continue; // the flush already landed — no marker
+      rows.push(recurringDraftToDomain(op));
+      opById.set(op.entityId, 'create');
+      syntheticIds.add(op.entityId); // no authoritative row behind it
+      if (failed(op.entityId)) failedIds.add(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update' && op.updateKind === 'full') {
+      if (idx !== -1) {
+        if (failed(op.entityId)) {
+          // §21: TERMINAL-failed FULL UPDATE + authoritative row still on
+          // the server (the other device won). KEEP the authoritative row
+          // verbatim — the stale local draft must NOT replace it.
+          opById.set(op.entityId, 'update');
+          failedIds.add(op.entityId);
+          attemptedDraftById.set(op.entityId, op.payload);
+          continue;
+        }
+        // still-pending (non-terminal) FULL UPDATE -> overlay the draft.
+        rows[idx] = applyRecurringFullUpdate(rows[idx], op.payload);
+        opById.set(op.entityId, 'update');
+        continue;
+      }
+      // server row GONE: only a TERMINAL-failed FULL UPDATE gets a
+      // display-only synthetic row (a not-failed one just waits).
+      if (failed(op.entityId)) {
+        rows.push(recurringDraftToDomain(op));
+        opById.set(op.entityId, 'update');
+        failedIds.add(op.entityId);
+        syntheticIds.add(op.entityId); // no authoritative row behind it
+        attemptedDraftById.set(op.entityId, op.payload);
+      }
+      continue;
+    }
+
+    if (op.op === 'update' && op.updateKind === 'active') {
+      if (idx !== -1) {
+        if (failed(op.entityId)) {
+          // §22: TERMINAL-failed ACTIVE toggle + authoritative row still on
+          // the server. The row SNAPS BACK to the authoritative `active` —
+          // it never sticks at the failed attempted value. The attempted
+          // boolean is conflict metadata only.
+          opById.set(op.entityId, 'update');
+          failedIds.add(op.entityId);
+          attemptedActiveById.set(op.entityId, op.payload.active);
+          continue;
+        }
+        // still-pending (non-terminal) toggle -> optimistic overlay.
+        rows[idx] = applyRecurringActiveUpdate(rows[idx], op.payload.active);
+        opById.set(op.entityId, 'update');
+        continue;
+      }
+      // §24 ORPHAN: server row GONE. An `{ active }`-only payload cannot
+      // honestly reconstruct a full `RecurringRule` (no name/amount/category/
+      // frequency to show) — so, UNLIKE the full-update orphan above, this
+      // NEVER gets a synthetic row / `opById` entry. Only tracked (when
+      // terminal-failed) via `failedIds` + `attemptedActiveById` for
+      // traceability / `discardPending`; a not-failed orphan toggle is
+      // simply left to wait, same as every other entity.
+      if (failed(op.entityId)) {
+        failedIds.add(op.entityId);
+        attemptedActiveById.set(op.entityId, op.payload.active);
+      }
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (idx !== -1) {
+        opById.set(op.entityId, 'delete'); // keep the server row visible, mark it failed
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+    if (idx !== -1) {
+      rows.splice(idx, 1);
+      hiddenIds.push(op.entityId);
+    }
+  }
+
+  return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById, attemptedActiveById };
+}
+
 export interface CardManagementView {
   /**
    * The cards to render on the card-management screen ONLY: authoritative
@@ -2173,6 +2751,14 @@ export interface ComposedFinance {
    * `data.planned` when there are no planned ops.
    */
   plannedManagement: PlannedManagementView;
+  /**
+   * STEP 16-H2-F1 — DISPLAY-ONLY recurring-rule rows + markers. NEVER merged
+   * into `data.recurring` / `data.recurringMeta` — materialization
+   * (lastRun / occurrence generation / BootEffects) is UNTOUCHED and reads
+   * only authoritative data, never this projection. Equals `data.recurring`
+   * when there are no recurring ops.
+   */
+  recurringManagement: RecurringManagementView;
 }
 
 /**
@@ -2216,6 +2802,10 @@ export function composeFinance(
   /** STEP 16-H2-E1 — bare planned-id set of TERMINAL-failed planned ops;
    *  drives the failed-vs-pending branch of `plannedManagement`. */
   failedPlannedIds?: ReadonlySet<string>,
+  /** STEP 16-H2-F1 — bare recurring-id set of TERMINAL-failed recurring ops
+   *  (create / full update / active toggle / delete); drives the
+   *  failed-vs-pending branch of `recurringManagement`. */
+  failedRecurringIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
   const categoryManagement = composeCategoryManagement(
@@ -2231,6 +2821,7 @@ export function composeFinance(
     failedCategoryBudgetIds,
   );
   const plannedManagement = composePlannedManagement(serverData.planned, ops, failedPlannedIds);
+  const recurringManagement = composeRecurringManagement(serverData.recurring, ops, failedRecurringIds);
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
@@ -2243,6 +2834,7 @@ export function composeFinance(
       categoryManagement,
       budgetManagement,
       plannedManagement,
+      recurringManagement,
     };
   }
 
@@ -2319,6 +2911,7 @@ export function composeFinance(
       categoryManagement,
       budgetManagement,
       plannedManagement,
+      recurringManagement,
     };
   }
 
@@ -2335,5 +2928,6 @@ export function composeFinance(
     categoryManagement,
     budgetManagement,
     plannedManagement,
+    recurringManagement,
   };
 }

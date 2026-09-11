@@ -61,10 +61,20 @@ import {
   type SoftDeletePlannedResult,
   type UpdatePlannedResult,
 } from '@/services/remotePlannedWrite';
+import {
+  createRecurring,
+  setRecurringActive,
+  softDeleteRecurring,
+  updateRecurring,
+  type CreateRecurringResult,
+  type SoftDeleteRecurringResult,
+  type UpdateRecurringResult,
+} from '@/services/remoteRecurringWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
+import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { PendingWrite } from '@/lib/offlineQueue';
 
 export type RunOpOutcome =
@@ -207,6 +217,36 @@ export interface RunOpDeps {
     expectedUserId: string;
     expectedUpdatedAt: string;
   }) => Promise<SoftDeletePlannedResult>;
+  /** STEP 16-H2-F1 — injected in tests; default to the real recurring-rule
+   *  services. CREATE / full UPDATE / DELETE are separate functions (like
+   *  card/category/planned); the active toggle is its OWN service
+   *  (`setRecurringActive`), never routed through `updateRecurring`. */
+  createRecurring?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    draft: NewRecurringDraft;
+  }) => Promise<CreateRecurringResult>;
+  updateRecurring?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: NewRecurringDraft;
+  }) => Promise<UpdateRecurringResult>;
+  setRecurringActive?: (args: {
+    householdId: string;
+    recurringId: string;
+    expectedUserId: string;
+    active: boolean;
+    expectedUpdatedAt: string;
+  }) => Promise<UpdateRecurringResult>;
+  softDeleteRecurring?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteRecurringResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -222,7 +262,8 @@ export async function runPendingWrite(
     op.entity !== 'category' &&
     op.entity !== 'budget' &&
     op.entity !== 'categoryBudget' &&
-    op.entity !== 'planned'
+    op.entity !== 'planned' &&
+    op.entity !== 'recurring'
   ) {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
@@ -245,6 +286,73 @@ export async function runPendingWrite(
       if (res.ok) return { kind: 'success' }; // both/neither tombstoned (idempotent replay = ok)
       if (res.transport) return { kind: 'transport', message: res.message };
       // identity | conflict | gone | error — all already in WriteConflictReason.
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
+    // ---- RECURRING RULE (STEP 16-H2-F1 §8) ----
+    if (op.entity === 'recurring') {
+      if (op.op === 'create') {
+        const create = deps.createRecurring ?? createRecurring;
+        const res = await create({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // RecurringWriteReason adds 'invalid' — flatten to reason-less
+        // terminal, same as card/category/planned.
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      if (op.op === 'update' && op.updateKind === 'full') {
+        const update = deps.updateRecurring ?? updateRecurring;
+        const res = await update({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      if (op.op === 'update' && op.updateKind === 'active') {
+        const setActive = deps.setRecurringActive ?? setRecurringActive;
+        const res = await setActive({
+          householdId: op.scope.householdId,
+          recurringId: op.entityId,
+          expectedUserId: op.scope.userId,
+          active: op.payload.active,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      // recurring delete
+      const del = deps.softDeleteRecurring ?? softDeleteRecurring;
+      const res = await del({
+        id: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-soft-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
       return { kind: 'terminal', reason: res.reason, message: res.message };
     }
 
