@@ -60,12 +60,29 @@ export type CreateTransactionResult =
  * STEP 16-G2-B — every non-ok end state for an edit / soft delete.
  * `'insufficient'` (STEP 16-H2-G6) is additive and ONLY ever produced by a
  * goal-movement over-withdraw discovered on a replay (see
- * `AddGoalMovementResult` / runOp.ts's goalMovement dispatch) — every other
- * entity's write service never emits it, so widening this shared union is
- * behaviourally inert for them (their `reason` checks are plain `if`/`===`
- * comparisons, never an exhaustive switch that this would break).
+ * `AddGoalMovementResult` / runOp.ts's goalMovement dispatch). `'principal_low'`
+ * (STEP 16-H2-L1) is ONLY ever produced by a loan UPDATE whose draft
+ * principal is below the current `paid` (see `UpdateLoanResult`).
+ * `'paid_off'` / `'stale'` (STEP 16-H2-L1) are ONLY ever produced by a loan
+ * PAYMENT create — `'paid_off'` when the authoritative loan has nothing left
+ * to repay, `'stale'` when the `paid <= principal` CHECK aborts the insert
+ * because `paid` moved concurrently (see `AddLoanPaymentResult`). Every other
+ * entity's write service never emits any of these four, so widening this
+ * shared union is behaviourally inert for them (their `reason` checks are
+ * plain `if`/`===` comparisons, never an exhaustive switch that this would
+ * break — verified: the ONE `switch (reason)` in the codebase,
+ * `pendingGoalLabel.ts`, carries a `default` case).
  */
-export type WriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error' | 'insufficient';
+export type WriteConflictReason =
+  | 'identity'
+  | 'conflict'
+  | 'deleted'
+  | 'gone'
+  | 'error'
+  | 'insufficient'
+  | 'principal_low'
+  | 'paid_off'
+  | 'stale';
 
 /**
  * STEP 16-H2-B1 §2/§3: `transport: true` marks a NETWORK/TRANSPORT failure

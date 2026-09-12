@@ -38,11 +38,13 @@ import {
   buildPendingBudgetOps,
   buildPendingCategoryOps,
   buildPendingGoalOps,
+  buildPendingLoanOps,
   buildPendingPlannedOps,
   buildPendingRecurringOps,
   type RecurringRowOpState,
 } from '@/lib/pendingManagementView';
 import type { GoalMovementMode, NewGoalDraft } from '@/lib/remoteGoalWriteMapping';
+import type { NewLoanDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
@@ -358,6 +360,46 @@ export interface FinanceReadResult {
     }
   >;
 
+  /**
+   * STEP 16-H2-L1 — ENGINE ONLY (no screen reads this yet). The loan list for
+   * a loan-management surface: authoritative server `loans` with a pending
+   * UPDATE overlaid, a synthetic row for a pending/failed CREATE, a synthetic
+   * row for a failed UPDATE whose server row is gone, minus a not-failed
+   * pending DELETE, PLUS a repayment create/delete overlay onto `paid`/
+   * `payments`. DELIBERATELY separate from `loans` / `loanMeta` /
+   * `loanPaymentMeta` so a loan-management screen's own read path (and
+   * backup / household-import) never sees an un-sent loan or repayment.
+   * Equals `loans` when there are no loan/loanPayment ops.
+   */
+  loanManagementRows: Loan[];
+  /**
+   * loan id -> its pending offline-op state, for a row label / read-only
+   * gate on a loan-management surface. Mirrors `pendingGoalOps`, with
+   * `attemptedDraft` typed `NewLoanDraft` and `payment` in place of
+   * `movement`. `reason` / `attemptedDraft` are only set when `failed` is
+   * true; the displayed row stays authoritative when the server row still
+   * exists.
+   *
+   * STEP 16-H2-L1: a loan's marker can ALSO be backed by a pending/failed
+   * repayment create/delete (`op:'update'` at this generic level — a payment
+   * reuses that bucket, same as a full loan edit); `payment` is then set to
+   * `{kind, date, amount}` — DELIBERATELY populated for both the pending AND
+   * the failed case (unlike `attemptedDraft`), mirroring `pendingGoalOps`'s
+   * `movement`.
+   */
+  pendingLoanOps: ReadonlyMap<
+    string,
+    {
+      op: 'create' | 'update' | 'delete';
+      failed: boolean;
+      reason?: WriteConflictReason;
+      queueId?: string;
+      synthetic: boolean;
+      attemptedDraft?: NewLoanDraft;
+      payment?: { kind: 'create' | 'delete'; date: string; amount: number };
+    }
+  >;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -398,6 +440,8 @@ const EMPTY_SLICES = {
   pendingRecurringOps: new Map() as FinanceReadResult['pendingRecurringOps'],
   goalManagementRows: [] as Goal[],
   pendingGoalOps: new Map() as FinanceReadResult['pendingGoalOps'],
+  loanManagementRows: [] as Loan[],
+  pendingLoanOps: new Map() as FinanceReadResult['pendingLoanOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -433,6 +477,12 @@ export function useFinanceRead(): FinanceReadResult {
     pendingGoalMovementOps: providerGoalMovementOps,
     goalMovementFailedReasons,
     failedGoalMovementIds: providerFailedGoalMovementIds,
+    pendingLoanOps: providerLoanOps,
+    loanFailedReasons,
+    failedLoanIds: providerFailedLoanIds,
+    pendingLoanPaymentOps: providerLoanPaymentOps,
+    loanPaymentFailedReasons,
+    failedLoanPaymentIds: providerFailedLoanPaymentIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -462,7 +512,9 @@ export function useFinanceRead(): FinanceReadResult {
         providerPlannedOps.length > 0 ||
         providerRecurringOps.length > 0 ||
         providerGoalOps.length > 0 ||
-        providerGoalMovementOps.length > 0;
+        providerGoalMovementOps.length > 0 ||
+        providerLoanOps.length > 0 ||
+        providerLoanPaymentOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
@@ -477,6 +529,8 @@ export function useFinanceRead(): FinanceReadResult {
                 ...providerRecurringOps,
                 ...providerGoalOps,
                 ...providerGoalMovementOps,
+                ...providerLoanOps,
+                ...providerLoanPaymentOps,
               ],
               providerFailedIds,
               providerFailedCardIds,
@@ -487,6 +541,8 @@ export function useFinanceRead(): FinanceReadResult {
               providerFailedRecurringIds,
               providerFailedGoalIds,
               providerFailedGoalMovementIds,
+              providerFailedLoanIds,
+              providerFailedLoanPaymentIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -597,6 +653,22 @@ export function useFinanceRead(): FinanceReadResult {
             goalMovementFailedReasons,
           )
         : new Map();
+      // STEP 16-H2-L1: loan display-only surface. `composeFinance` NEVER
+      // folded a loan row into `composed.loans` — it feeds `loanManagement`
+      // only. `loans`/`loanMeta`/`loanPaymentMeta` below stay
+      // `data.loans`/`data.loanMeta`/`data.loanPaymentMeta` untouched, so a
+      // loan-management screen's own read path keeps reading authoritative
+      // data.
+      const loanManagementRows = composedResult ? composedResult.loanManagement.rows : data.loans;
+      const pendingLoanOps: FinanceReadResult['pendingLoanOps'] = composedResult
+        ? buildPendingLoanOps(
+            composedResult.loanManagement,
+            providerLoanOps,
+            providerLoanPaymentOps,
+            loanFailedReasons,
+            loanPaymentFailedReasons,
+          )
+        : new Map();
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -650,6 +722,8 @@ export function useFinanceRead(): FinanceReadResult {
         pendingRecurringOps,
         goalManagementRows,
         pendingGoalOps,
+        loanManagementRows,
+        pendingLoanOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -729,5 +803,11 @@ export function useFinanceRead(): FinanceReadResult {
     providerGoalMovementOps,
     goalMovementFailedReasons,
     providerFailedGoalMovementIds,
+    providerLoanOps,
+    loanFailedReasons,
+    providerFailedLoanIds,
+    providerLoanPaymentOps,
+    loanPaymentFailedReasons,
+    providerFailedLoanPaymentIds,
   ]);
 }

@@ -18,11 +18,13 @@ import type {
   BudgetManagementView,
   CategoryManagementView,
   GoalManagementView,
+  LoanManagementView,
   PendingWrite,
   PlannedManagementView,
   RecurringManagementView,
 } from '@/lib/offlineQueue';
 import type { GoalMovementMode, NewGoalDraft } from '@/lib/remoteGoalWriteMapping';
+import type { NewLoanDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
@@ -267,6 +269,84 @@ export function buildPendingRecurringOps(
       ...(failed && view.attemptedActiveById.has(id)
         ? { attemptedActive: view.attemptedActiveById.get(id) }
         : {}),
+    });
+  }
+  return out;
+}
+
+export interface LoanRowOpState {
+  op: ManagementOpKind;
+  failed: boolean;
+  reason?: WriteConflictReason;
+  queueId?: string;
+  synthetic: boolean;
+  /** For a TERMINAL-failed UPDATE, the FULL draft the user tried; conflict
+   *  metadata ONLY (the displayed row is the authoritative server row when it
+   *  still exists — STEP 16-H2-L1). */
+  attemptedDraft?: NewLoanDraft;
+  /**
+   * STEP 16-H2-L1 — present whenever this marker is backed by a pending or
+   * failed repayment create/delete (`{op:'update', ...}` at the generic
+   * level — a payment reuses that bucket, same as a full loan edit).
+   * DELIBERATELY populated for BOTH the still-pending AND the failed case
+   * (mirrors `GoalRowOpState.movement`) — a future row label needs the
+   * kind/amount even while merely pending.
+   */
+  payment?: { kind: 'create' | 'delete'; date: string; amount: number };
+}
+
+/**
+ * STEP 16-H2-L1 — the screen-facing per-row op-state map for a
+ * loan-management surface. A marker is backed by EITHER a single-table
+ * `entity:'loan'` op (create/update/delete) OR a `entity:'loanPayment'` op
+ * (repayment create/delete, keyed by the TARGET `loanId` — its own
+ * `entityId` is the payment ledger row's unrelated identity). The
+ * coordinator's `enqueueLoanPaymentCreate`/`enqueueLoanDelete` lock guards
+ * mean never both for one id, so the resolution is unambiguous: a
+ * single-table op wins the `queueId` / failure-`reason` lookup; otherwise
+ * they come from the payment queue. Mirrors `buildPendingGoalOps`'s
+ * dual-source shape exactly.
+ */
+export function buildPendingLoanOps(
+  view: LoanManagementView,
+  /** current-scope `entity:'loan'` ops (create/update/delete, incl. failed). */
+  loanOps: readonly PendingWrite[],
+  /** current-scope `entity:'loanPayment'` ops (repayment create/delete, incl. failed). */
+  paymentOps: readonly PendingWrite[],
+  /** loan-id -> reason, for a terminal-failed single-table loan op. */
+  loanFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>,
+  /** PAYMENT-id (not loan id) -> reason, for a terminal-failed payment op. */
+  paymentFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>,
+): Map<string, LoanRowOpState> {
+  const out = new Map<string, LoanRowOpState>();
+  for (const [id, op] of view.opById) {
+    const failed = view.failedIds.has(id);
+    const stQueueId = queueIdOf(loanOps, id);
+    const fromSingleTable = stQueueId !== undefined;
+    // A payment's OWN `entityId` is its ledger row's id, not the loan id —
+    // it is found by `loanId`, unlike `queueIdOf`'s generic `entityId` match.
+    const paymentOp = fromSingleTable
+      ? undefined
+      : paymentOps.find(
+          (o): o is Extract<PendingWrite, { entity: 'loanPayment' }> =>
+            o.entity === 'loanPayment' && o.loanId === id,
+        );
+    const queueId = fromSingleTable ? stQueueId : paymentOp?.queueId;
+    const reason = fromSingleTable
+      ? loanFailedReasons.get(id)
+      : paymentOp
+        ? paymentFailedReasons.get(paymentOp.entityId)
+        : undefined;
+    out.set(id, {
+      op,
+      failed,
+      synthetic: view.syntheticIds.has(id),
+      ...(queueId !== undefined ? { queueId } : {}),
+      ...(failed ? { reason } : {}),
+      ...(failed && view.attemptedDraftById.has(id)
+        ? { attemptedDraft: view.attemptedDraftById.get(id) }
+        : {}),
+      ...(view.paymentById.has(id) ? { payment: view.paymentById.get(id) } : {}),
     });
   }
   return out;

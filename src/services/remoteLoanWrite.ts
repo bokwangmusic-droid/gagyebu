@@ -165,6 +165,46 @@ function isSameLoanCreate(
   );
 }
 
+/**
+ * STEP 16-H2-L1.1 — does an existing `loan_payments` row represent the SAME
+ * requested repayment, by STABLE REQUEST INTENT only: household, loan,
+ * requesting user, and the user-entered `date`/`amount` — the fields that
+ * are fixed for one repayment sheet and can never legitimately differ
+ * between the original attempt and any replay of it.
+ *
+ * Deliberately NEVER compares `principal_part`/`interest_part` — those are
+ * DERIVED at INSERT time from `splitPayment(remaining, annualRate, amount)`,
+ * where `remaining = principal - paid`. If the original INSERT actually
+ * succeeded, `paid` has already moved, so a lost-response REPLAY recomputes
+ * a *different* (but not wrong) split — comparing derived fields here used
+ * to make a genuinely-idempotent replay look like a content conflict (the
+ * H2-L1 false-negative this fixes). `amount` (the raw total the user typed)
+ * IS its own real column on `loan_payments` and is what actually identifies
+ * the request; the split is bookkeeping the server derives from it, not
+ * part of the request.
+ *
+ * A soft-deleted row is a genuine id collision, never an idempotent success
+ * — never revived.
+ */
+export function isSamePaymentRequest(
+  existing: Record<string, unknown>,
+  args: {
+    householdId: string;
+    loanId: string;
+    expectedUserId: string;
+    draft: NewLoanPaymentDraft;
+  },
+): boolean {
+  return (
+    existing.deleted_at == null &&
+    existing.household_id === args.householdId &&
+    existing.loan_id === args.loanId &&
+    existing.created_by === args.expectedUserId &&
+    existing.date === args.draft.date &&
+    existing.amount === args.draft.amount
+  );
+}
+
 /** Does the stored loan already hold exactly what this edit would write? */
 function loanFieldsMatch(
   existing: Record<string, unknown>,
@@ -430,6 +470,42 @@ export async function addLoanPayment(args: {
   const live = await assertLiveUser(args.expectedUserId);
   if (!live.ok) return { ok: false, reason: 'identity', message: live.message };
 
+  // STEP 16-H2-L1.1 — idempotency pre-check: does a payment with THIS id
+  // already exist? Checked BEFORE the loan re-SELECT / split computation
+  // below, so a lost-response replay of an ALREADY-APPLIED payment never
+  // recomputes a split at all (the split would legitimately differ once
+  // `paid` has moved — see `isSamePaymentRequest`'s doc) and never
+  // re-evaluates `remaining <= 0` against a balance THIS SAME payment
+  // already reduced to zero (which would otherwise misreport `paid_off` on
+  // a plain retry). A race with a concurrent INSERT of the same id is still
+  // safe — it falls through to the 23505 branch below, which reconciles
+  // with the SAME `isSamePaymentRequest` helper.
+  const { data: preExisting, error: preErr } = await supabase
+    .from('loan_payments')
+    .select('household_id, loan_id, created_by, date, amount, deleted_at')
+    .eq('id', args.paymentId)
+    .maybeSingle();
+
+  const preClass = classifyWriteReadError(preErr, (e) => describeWriteError(e, PAYMENT_ERROR));
+  if (preClass) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: preClass.message,
+      ...(preClass.transport ? { transport: true } : {}),
+    };
+  }
+  if (preExisting) {
+    if (isSamePaymentRequest(preExisting as Record<string, unknown>, args)) {
+      // Our earlier payment already landed and was already applied.
+      return { ok: true };
+    }
+    // Same id, but NOT our request (different loan/household/user/date/
+    // amount, or a soft-deleted collision) — never silently treated as
+    // success.
+    return { ok: false, reason: 'conflict', message: PAYMENT_ERROR };
+  }
+
   // Authoritative precheck (STEP 16-G2-D4 §8-2). `remaining` AND the
   // `annual_rate` used by splitPayment come from THIS re-SELECT, never the
   // UI/domain value.
@@ -500,7 +576,7 @@ export async function addLoanPayment(args: {
   if (error?.code === '23505') {
     const { data: existing, error: readErr } = await supabase
       .from('loan_payments')
-      .select('id,household_id,loan_id,created_by,date,amount,principal_part,interest_part,deleted_at')
+      .select('household_id,loan_id,created_by,date,amount,deleted_at')
       .eq('id', args.paymentId)
       .maybeSingle();
 
@@ -516,17 +592,12 @@ export async function addLoanPayment(args: {
       };
     }
     if (!existing) return { ok: false, reason: 'error', message: PAYMENT_ERROR };
-    const ex = existing as Record<string, unknown>;
-    if (
-      ex.deleted_at == null &&
-      ex.household_id === args.householdId &&
-      ex.loan_id === args.loanId &&
-      ex.created_by === args.expectedUserId &&
-      ex.date === row.date &&
-      ex.amount === row.amount &&
-      ex.principal_part === row.principal_part &&
-      ex.interest_part === row.interest_part
-    ) {
+    // STEP 16-H2-L1.1 — reconcile by STABLE REQUEST INTENT only (same helper
+    // as the pre-check above), NEVER by comparing `principal_part`/
+    // `interest_part` against this attempt's freshly-recomputed `row` — see
+    // `isSamePaymentRequest`'s doc for why that used to false-negative a
+    // genuinely idempotent replay.
+    if (isSamePaymentRequest(existing as Record<string, unknown>, args)) {
       // Our earlier payment already landed and was already applied.
       return { ok: true };
     }

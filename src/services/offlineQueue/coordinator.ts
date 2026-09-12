@@ -39,6 +39,11 @@ import {
   makePendingGoalDelete,
   makePendingGoalMovementCreate,
   makePendingGoalUpdate,
+  makePendingLoanCreate,
+  makePendingLoanDelete,
+  makePendingLoanPaymentCreate,
+  makePendingLoanPaymentDelete,
+  makePendingLoanUpdate,
   makePendingPlannedCreate,
   makePendingPlannedDelete,
   makePendingPlannedUpdate,
@@ -54,6 +59,7 @@ import {
   serverCardConfirmsUpdate,
   serverCategoryConfirmsUpdate,
   serverGoalConfirmsUpdate,
+  serverLoanConfirmsUpdate,
   serverPlannedConfirmsUpdate,
   serverRecurringConfirmsActive,
   serverRecurringConfirmsUpdate,
@@ -67,6 +73,7 @@ import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
+import type { NewLoanDraft, NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
@@ -79,7 +86,7 @@ import {
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
-import type { CreditCard, Goal, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type { CreditCard, Goal, Loan, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 /** STEP 16-H2-C2-A1 §21 — internal state is keyed by `${entity}:${entityId}`,
  *  NOT bare `entityId`, so a card op and a transaction op that happen to
@@ -144,6 +151,12 @@ export interface CoordinatorState {
    *  movement's natural key is its OWN `gm-…` id, NOT the goal id it
    *  targets; `goalId` lives on the raw `PendingWrite` only). */
   goalMovement: CoordinatorEntityState;
+  /** STEP 16-H2-L1 — the LOAN view (bare loan-id keys). */
+  loan: CoordinatorEntityState;
+  /** STEP 16-H2-L1 — the LOAN-PAYMENT view (bare PAYMENT-id keys — a
+   *  payment's natural key is its OWN `lp-…` id, NOT the loan id it targets;
+   *  `loanId` lives on the raw `PendingWrite` only). */
+  loanPayment: CoordinatorEntityState;
   /** Total pending ops across ALL entities in the current scope (§28 — the
    *  future household-import guard must see cards + categories + budgets
    *  + composite deletes too). */
@@ -228,6 +241,20 @@ export interface CoordinatorDeps {
    * truth of its own.
    */
   getServerGoals: () => ReadonlyMap<string, Goal>;
+  /**
+   * Live getter — the trusted server snapshot's ACTIVE loans, keyed by id.
+   * STEP 16-H2-L1: loan CREATE/UPDATE ack = row present AND its fields
+   * SEMANTICALLY match the queued draft (never `paid`/`payments`); DELETE ack
+   * = id absent (the finance snapshot already excludes soft-deleted loans).
+   * A loan-PAYMENT ack reuses this SAME getter (no separate one): unlike a
+   * goal movement, `loan_payments` rows ARE individually fetched into each
+   * `Loan.payments` array (see src/services/remoteFinance.ts), so a
+   * payment's ack is a plain ID-PRESENCE check inside the target loan's
+   * `payments` — CREATE = the payment id present, DELETE = absent — never a
+   * baseline+delta approximation. The coordinator never creates a local loan
+   * truth of its own.
+   */
+  getServerLoans: () => ReadonlyMap<string, Loan>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -256,6 +283,11 @@ export interface CoordinatorDeps {
   updateGoal?: RunOpDeps['updateGoal'];
   softDeleteGoal?: RunOpDeps['softDeleteGoal'];
   addGoalMovement?: RunOpDeps['addGoalMovement'];
+  createLoan?: RunOpDeps['createLoan'];
+  updateLoan?: RunOpDeps['updateLoan'];
+  softDeleteLoan?: RunOpDeps['softDeleteLoan'];
+  addLoanPayment?: RunOpDeps['addLoanPayment'];
+  softDeleteLoanPayment?: RunOpDeps['softDeleteLoanPayment'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -454,6 +486,55 @@ export interface PendingWriteCoordinator {
     payload: NewGoalMovementDraft;
     expectedBaselineSaved: number;
   }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2-L1 — loan ops. `entityId` is the client-stable `loan-…` id.
+   *  `expectedUpdatedAt` is FROZEN by the caller from the `loanMeta.updatedAt`
+   *  the edit screen opened against; stored verbatim, NEVER re-read. Mirrors
+   *  the goal clash-guard rule: refuses while a create/update (a different op
+   *  on this SAME loan) OR a payment targeting this loan is ACTIVELY queued
+   *  (excludes terminal-failed) — at most one offline change in flight per
+   *  loan. ENGINE ONLY — no UI call site enqueues these yet. */
+  enqueueLoanCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewLoanDraft;
+  }): Promise<EnqueueOutcome>;
+  enqueueLoanUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewLoanDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueueLoanDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  /**
+   * STEP 16-H2-L1 — a repayment against an EXISTING loan. `entityId` is the
+   * client-stable `lp-…` payment id (its OWN identity — NOT the loan id);
+   * `loanId` names the target. Refused with `existing-pending` when ANY
+   * other op (loan create/update/delete, or another payment) is already
+   * ACTIVELY queued for the SAME loanId — a loan accepts at most ONE
+   * in-flight offline change at a time, mirroring the goal-movement rule.
+   */
+  enqueueLoanPaymentCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    loanId: string;
+    payload: NewLoanPaymentDraft;
+  }): Promise<EnqueueOutcome>;
+  /**
+   * STEP 16-H2-L1 — delete an EXISTING repayment. `entityId` is the
+   * payment's OWN `lp-…` id; `expectedUpdatedAt` is FROZEN from the
+   * payment row's own token (never the loan's) at delete-confirm time.
+   * Same clash guard as `enqueueLoanPaymentCreate`.
+   */
+  enqueueLoanPaymentDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    loanId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
   /**
    * STEP 16-H2-C2-B2 conflict-UX — permanently DROP one queued record by its
    * `queueId` ("변경 버리기" for a terminal-failed UPDATE). This is NOT a
@@ -553,6 +634,11 @@ export function createPendingWriteCoordinator(
         ...(deps.updateGoal ? { updateGoal: deps.updateGoal } : {}),
         ...(deps.softDeleteGoal ? { softDeleteGoal: deps.softDeleteGoal } : {}),
         ...(deps.addGoalMovement ? { addGoalMovement: deps.addGoalMovement } : {}),
+        ...(deps.createLoan ? { createLoan: deps.createLoan } : {}),
+        ...(deps.updateLoan ? { updateLoan: deps.updateLoan } : {}),
+        ...(deps.softDeleteLoan ? { softDeleteLoan: deps.softDeleteLoan } : {}),
+        ...(deps.addLoanPayment ? { addLoanPayment: deps.addLoanPayment } : {}),
+        ...(deps.softDeleteLoanPayment ? { softDeleteLoanPayment: deps.softDeleteLoanPayment } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -679,6 +765,7 @@ export function createPendingWriteCoordinator(
         const serverPlanned = deps.getServerPlanned();
         const serverRecurring = deps.getServerRecurring();
         const serverGoals = deps.getServerGoals();
+        const serverLoans = deps.getServerLoans();
         const knownCards = deps.getKnownCardIds();
         const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
@@ -829,6 +916,40 @@ export function createPendingWriteCoordinator(
             } else {
               ok = false;
             }
+          } else if (entity === 'loan') {
+            // STEP 16-H2-L1: DELETE = id absent (the finance snapshot's
+            // `loans` already excludes soft-deleted rows). CREATE + UPDATE:
+            // row present AND its fields SEMANTICALLY match the queued
+            // draft — `paid`/`payments` are never part of this comparison,
+            // and `updated_at` changing alone (e.g. a repayment bumping it)
+            // is never sufficient on its own. A same-id-different-payload row
+            // (someone else's concurrent create/edit) is NOT an ack — it
+            // drops back to the queue and replays, whose reconcile inside
+            // `createLoan`/`updateLoan` classifies it as `conflict`.
+            if (op === 'delete') {
+              ok = !serverLoans.has(entityId);
+            } else {
+              const row = serverLoans.get(entityId);
+              ok =
+                !!row &&
+                (rec?.op === 'create' || rec?.op === 'update') &&
+                rec.entity === 'loan' &&
+                serverLoanConfirmsUpdate(row, rec.payload);
+            }
+          } else if (entity === 'loanPayment') {
+            // STEP 16-H2-L1: unlike a goal movement, `loan_payments` rows ARE
+            // individually fetched into each `Loan.payments` array (see
+            // `getServerLoans` above), so a payment's ack is a plain
+            // ID-PRESENCE check inside the TARGET loan's `payments` — never a
+            // baseline+delta approximation. CREATE acks when the payment id
+            // is present; DELETE acks when it is absent. If the parent loan
+            // itself is no longer in the snapshot (deleted/gone), neither can
+            // ever be confirmed this way — it drops back to the queue and
+            // replays, whose reconcile inside `addLoanPayment`/
+            // `softDeleteLoanPayment` classifies it terminal (`gone`/`deleted`).
+            const loanRow = rec?.entity === 'loanPayment' ? serverLoans.get(rec.loanId) : undefined;
+            const present = !!loanRow?.payments.some((p) => p.id === entityId);
+            ok = op === 'delete' ? !present && !!loanRow : present;
           } else if (op === 'create') {
             ok = serverRows.has(entityId);
           } else if (op === 'delete') {
@@ -1357,6 +1478,130 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueueLoanCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewLoanDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingLoanCreate({ scope: args.scope, entityId: args.entityId, payload: args.payload }),
+    );
+  }
+
+  function enqueueLoanUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewLoanDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingLoanUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueLoanDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    // STEP 16-H2-L1 — "the row is locked": mirrors `enqueueGoalDelete`.
+    // Refuse while a create/update (a different op on this SAME loan) OR a
+    // payment targeting this loan is ACTIVELY queued (excludes terminal-
+    // failed — a TERMINAL-failed op is retained forever with no discard UI
+    // on a loan screen yet, so treating it as a lock would make this loan's
+    // delete PERMANENTLY impossible). An existing DELETE for the SAME
+    // entityId (a genuine retry) is intentionally NOT caught here — it falls
+    // through to `enqueuePendingWrite`'s own dedup.
+    const clash = controller
+      .read()
+      .some(
+        (r) =>
+          r.scope.userId === args.scope.userId &&
+          r.scope.householdId === args.scope.householdId &&
+          !r.lastError &&
+          ((r.entity === 'loan' && r.entityId === args.entityId && r.op !== 'delete') ||
+            (r.entity === 'loanPayment' && r.loanId === args.entityId)),
+      );
+    if (clash) return Promise.resolve({ ok: false, reason: 'existing-pending' });
+    return enqueue(
+      makePendingLoanDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueLoanPaymentCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    loanId: string;
+    payload: NewLoanPaymentDraft;
+  }): Promise<EnqueueOutcome> {
+    // STEP 16-H2-L1 — "the row is locked": mirrors `enqueueGoalMovementCreate`.
+    // Refuse while ANY other op (loan create/update/delete, or another
+    // payment) is ACTIVELY queued for this SAME loanId (excludes terminal-
+    // failed, same reasoning as the goal-movement guard). An existing
+    // payment for the SAME `entityId` (a genuine retry of this exact sheet)
+    // is intentionally NOT caught here — it falls through to
+    // `enqueuePendingWrite`'s own dedup.
+    const clash = controller
+      .read()
+      .some(
+        (r) =>
+          r.scope.userId === args.scope.userId &&
+          r.scope.householdId === args.scope.householdId &&
+          r.entityId !== args.entityId &&
+          !r.lastError &&
+          ((r.entity === 'loan' && r.entityId === args.loanId) ||
+            (r.entity === 'loanPayment' && r.loanId === args.loanId)),
+      );
+    if (clash) return Promise.resolve({ ok: false, reason: 'existing-pending' });
+    return enqueue(
+      makePendingLoanPaymentCreate({
+        scope: args.scope,
+        entityId: args.entityId,
+        loanId: args.loanId,
+        payload: args.payload,
+      }),
+    );
+  }
+
+  function enqueueLoanPaymentDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    loanId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    // Same clash guard as `enqueueLoanPaymentCreate` — a payment DELETE is
+    // just as much "a change against this loan" as a CREATE.
+    const clash = controller
+      .read()
+      .some(
+        (r) =>
+          r.scope.userId === args.scope.userId &&
+          r.scope.householdId === args.scope.householdId &&
+          r.entityId !== args.entityId &&
+          !r.lastError &&
+          ((r.entity === 'loan' && r.entityId === args.loanId) ||
+            (r.entity === 'loanPayment' && r.loanId === args.loanId)),
+      );
+    if (clash) return Promise.resolve({ ok: false, reason: 'existing-pending' });
+    return enqueue(
+      makePendingLoanPaymentDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        loanId: args.loanId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -1448,6 +1693,8 @@ export function createPendingWriteCoordinator(
     const recurring = entityStateOf('recurring', allScopeOps);
     const goal = entityStateOf('goal', allScopeOps);
     const goalMovement = entityStateOf('goalMovement', allScopeOps);
+    const loan = entityStateOf('loan', allScopeOps);
+    const loanPayment = entityStateOf('loanPayment', allScopeOps);
     return {
       hydration,
       scopeOps: txn.scopeOps,
@@ -1463,6 +1710,8 @@ export function createPendingWriteCoordinator(
       recurring,
       goal,
       goalMovement,
+      loan,
+      loanPayment,
       pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -1496,6 +1745,11 @@ export function createPendingWriteCoordinator(
     enqueueGoalUpdate,
     enqueueGoalDelete,
     enqueueGoalMovementCreate,
+    enqueueLoanCreate,
+    enqueueLoanUpdate,
+    enqueueLoanDelete,
+    enqueueLoanPaymentCreate,
+    enqueueLoanPaymentDelete,
     discardPending,
     requestFlush,
     dispose,

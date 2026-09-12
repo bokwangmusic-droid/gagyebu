@@ -70,6 +70,13 @@ import {
   type NewGoalDraft,
   type NewGoalMovementDraft,
 } from '@/lib/remoteGoalWriteMapping';
+import { splitPayment } from '@/lib/loan';
+import {
+  isValidLoanDraft,
+  isValidLoanPaymentDraft,
+  type NewLoanDraft,
+  type NewLoanPaymentDraft,
+} from '@/lib/remoteLoanWriteMapping';
 import {
   isValidPlannedDraft,
   type NewPlannedExpenseDraft,
@@ -80,7 +87,15 @@ import {
 } from '@/lib/remoteRecurringWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { BudgetMap, CreditCard, Goal, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type {
+  BudgetMap,
+  CreditCard,
+  Goal,
+  Loan,
+  PlannedExpense,
+  RecurringRule,
+  Transaction,
+} from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
@@ -116,7 +131,9 @@ export type PendingEntity =
   | 'planned'
   | 'recurring'
   | 'goal'
-  | 'goalMovement';
+  | 'goalMovement'
+  | 'loan'
+  | 'loanPayment';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -513,6 +530,102 @@ export interface PendingGoalMovementCreate extends PendingWriteBase {
   expectedBaselineSaved: number;
 }
 
+/* ---------------- loan records (STEP 16-H2-L1) ---------------- */
+
+/**
+ * `payload` is exactly what `createLoan({ draft })` is re-handed — the
+ * UI-editable `NewLoanDraft` (`name`/`lender`/`principal`/`annualRate`/
+ * `termMonths`/`startDate`/`paymentDay`/`repayType`). `entityId` is the SAME
+ * client `loan-…` id the direct `createLoan` used, so a lost-response retry
+ * hits the service's `unique(household_id, id)` 23505 idempotency path. No
+ * `expectedUpdatedAt` — a CREATE has no token. `paid` is NEVER part of this
+ * payload — it is a server-maintained cache only a `loan_payments`
+ * INSERT/soft-delete can change (mirrors `PendingGoalCreate`'s `saved` rule).
+ */
+export interface PendingLoanCreate extends PendingWriteBase {
+  entity: 'loan';
+  op: 'create';
+  payload: NewLoanDraft;
+}
+
+/**
+ * `payload` is what `updateLoan({ draft })` is re-handed — `paid` is never
+ * written by this op. `expectedUpdatedAt` is FROZEN from the
+ * `loanMeta.updatedAt` the edit screen opened against and is NEVER
+ * refreshed — a stale token turns a concurrent change (INCLUDING a
+ * repayment landing elsewhere, which also bumps `loans.updated_at` via the
+ * `trg_apply_loan_payment` -> `trg_loans_touch` chain) into a `conflict`,
+ * never a blind overwrite. `updateLoan`'s OWN precheck additionally refuses
+ * `principal < current paid` with `reason:'principal_low'` — a genuinely
+ * reachable-on-replay verdict (another device's repayment could raise `paid`
+ * while this update sits queued), preserved verbatim rather than flattened
+ * (mirrors STEP 16-H2-G6's `'insufficient'` precedent).
+ */
+export interface PendingLoanUpdate extends PendingWriteBase {
+  entity: 'loan';
+  op: 'update';
+  payload: NewLoanDraft;
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeleteLoan` guarded on the FROZEN `expectedUpdatedAt`.
+ *  NO `payload`. Never a hard DELETE (no DELETE grant on `public.loans`).
+ *  Never touches `loan_payments` — those rows are left as history. */
+export interface PendingLoanDelete extends PendingWriteBase {
+  entity: 'loan';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
+/* ---------------- loan-payment records (STEP 16-H2-L1) ---------------- */
+
+/**
+ * A repayment against an EXISTING loan — `entityId` is the payment's OWN
+ * client-generated `lp-…` id (STABLE across every replay — mirrors
+ * `remoteLoanWrite.ts`'s own contract: a fresh id on retry would let
+ * `trg_apply_loan_payment` move `loans.paid` twice; the SAME id makes a
+ * lost-response retry hit `addLoanPayment`'s 23505-by-content reconcile).
+ * `loanId` names the TARGET loan — a separate field from `entityId`, which
+ * is the payment ledger row's own identity. `op` is ALWAYS 'create': a
+ * payment is an append-only ledger insert (mirrors `PendingGoalMovementCreate`
+ * — there is no "update a payment" concept anywhere in this app).
+ *
+ * UNLIKE `PendingGoalMovementCreate`, this carries NO frozen baseline —
+ * `public.loan_payments` rows ARE individually fetched into the read model
+ * (`RemoteFinanceData.loans[].payments`, unlike `goal_movements`, which is
+ * only ever fetched as a row COUNT), so this queue's ack check can use
+ * simple, robust ID-PRESENCE ("does a payment with this id now appear in
+ * the target loan's `payments`") instead of a numeric baseline+delta
+ * approximation — see `composeLoanManagement` / the coordinator's ack logic.
+ * The CLIENT-SIDE estimated `principal_part`/`interest_part` used for the
+ * OPTIMISTIC `paid` overlay is deliberately NOT stored here either — it is
+ * recomputed on the fly from the CURRENT composed loan row (`splitPayment`,
+ * the exact same pure function `app/loan-payment.tsx`'s own "예상 원금/이자"
+ * preview already calls), so there is nothing frozen to go stale.
+ */
+export interface PendingLoanPaymentCreate extends PendingWriteBase {
+  entity: 'loanPayment';
+  op: 'create';
+  loanId: string;
+  payload: NewLoanPaymentDraft;
+}
+
+/**
+ * A soft delete of one repayment — `softDeleteLoanPayment` guarded on the
+ * FROZEN `expectedUpdatedAt` (the PAYMENT row's own `updated_at` — a token
+ * `goal_movements` has no equivalent of, since a goal movement can never be
+ * deleted at all). `loanId` names the parent loan (for the "one active op
+ * per loan" lock and the `paid` overlay lookup); `entityId` is the
+ * payment's own id. NO `payload` — nothing user-editable to carry. Never a
+ * hard DELETE.
+ */
+export interface PendingLoanPaymentDelete extends PendingWriteBase {
+  entity: 'loanPayment';
+  op: 'delete';
+  loanId: string;
+  expectedUpdatedAt: string;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
@@ -537,7 +650,12 @@ export type PendingWrite =
   | PendingGoalCreate
   | PendingGoalUpdate
   | PendingGoalDelete
-  | PendingGoalMovementCreate;
+  | PendingGoalMovementCreate
+  | PendingLoanCreate
+  | PendingLoanUpdate
+  | PendingLoanDelete
+  | PendingLoanPaymentCreate
+  | PendingLoanPaymentDelete;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -859,6 +977,84 @@ function isValidGoalMovementPayload(p: unknown): p is NewGoalMovementDraft {
   return isValidGoalMovementDraft({ mode: d.mode, amount: d.amount });
 }
 
+/**
+ * Structural validity for a stored `NewLoanDraft` (STEP 16-H2-L1 — reuse
+ * `isValidLoanDraft` from remoteLoanWriteMapping.ts rather than re-deriving
+ * the principal/rate/term/day rules). Only the UI-editable shape. `paid`
+ * must NEVER be present — a server-maintained cache no client payload may
+ * carry (mirrors `isValidGoalPayload`'s `saved` rule).
+ */
+function isValidLoanPayload(p: unknown): p is NewLoanDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (typeof d.name !== 'string') return false;
+  if (typeof d.lender !== 'string') return false;
+  if (typeof d.principal !== 'number') return false;
+  if (typeof d.annualRate !== 'number') return false;
+  if (typeof d.termMonths !== 'number') return false;
+  if (typeof d.startDate !== 'string') return false;
+  if (typeof d.paymentDay !== 'number') return false;
+  if (d.repayType !== 'amortizing' && d.repayType !== 'equal_principal' && d.repayType !== 'bullet') {
+    return false;
+  }
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d ||
+    'deleted_at' in d ||
+    'paid' in d ||
+    'payments' in d
+  ) {
+    return false;
+  }
+  return isValidLoanDraft({
+    name: d.name,
+    lender: d.lender,
+    principal: d.principal,
+    annualRate: d.annualRate,
+    termMonths: d.termMonths,
+    startDate: d.startDate,
+    paymentDay: d.paymentDay,
+    repayType: d.repayType,
+  });
+}
+
+/**
+ * Structural validity for a stored `NewLoanPaymentDraft` (STEP 16-H2-L1 —
+ * reuse `isValidLoanPaymentDraft`). Only `date` / `amount` — no
+ * server-computed `principal_part`/`interest_part` is ever valid here (those
+ * are recomputed fresh at write/replay time, never stored in the queue —
+ * see `PendingLoanPaymentCreate`'s own comment).
+ */
+function isValidLoanPaymentPayload(p: unknown): p is NewLoanPaymentDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (typeof d.date !== 'string') return false;
+  if (typeof d.amount !== 'number') return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'loan_id' in d ||
+    'loanId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'principal_part' in d ||
+    'principalPart' in d ||
+    'interest_part' in d ||
+    'interestPart' in d
+  ) {
+    return false;
+  }
+  return isValidLoanPaymentDraft({ date: d.date, amount: d.amount });
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
@@ -874,7 +1070,9 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     r.entity !== 'planned' &&
     r.entity !== 'recurring' &&
     r.entity !== 'goal' &&
-    r.entity !== 'goalMovement'
+    r.entity !== 'goalMovement' &&
+    r.entity !== 'loan' &&
+    r.entity !== 'loanPayment'
   ) {
     return null;
   }
@@ -1105,6 +1303,58 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
       goalId: r.goalId,
       payload: r.payload,
       expectedBaselineSaved: r.expectedBaselineSaved,
+    };
+  }
+
+  if (r.entity === 'loan') {
+    // STEP 16-H2-L1 — loan CREATE / UPDATE / soft DELETE. Mirrors the `goal`
+    // branch exactly: CREATE carries no token, UPDATE/DELETE carry a FROZEN
+    // `expectedUpdatedAt`, DELETE carries no user payload.
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token
+      if (!isValidLoanPayload(r.payload)) return null;
+      return { ...base, entity: 'loan', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (!isValidLoanPayload(r.payload)) return null;
+      return {
+        ...base,
+        entity: 'loan',
+        op: 'update',
+        payload: r.payload,
+        expectedUpdatedAt: r.expectedUpdatedAt,
+      };
+    }
+    // loan delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload
+    return { ...base, entity: 'loan', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'loanPayment') {
+    // STEP 16-H2-L1 — a repayment ledger row: EITHER a create (append-only
+    // insert) OR a delete (soft-delete) — never an 'update' (mirrors
+    // `PendingGoalMovementCreate`'s "never updated" note; unlike a goal
+    // movement, a payment CAN be deleted, so 'update' is the only op this
+    // entity never takes).
+    if (r.op === 'update') return null;
+    if (r.op === 'create') {
+      // `loanId` is required and separate from `entityId` (the payment's own id).
+      if (!isNonEmptyString(r.loanId)) return null;
+      if (!isValidLoanPaymentPayload(r.payload)) return null;
+      return { ...base, entity: 'loanPayment', op: 'create', loanId: r.loanId, payload: r.payload };
+    }
+    // loanPayment delete
+    if (!isNonEmptyString(r.loanId)) return null;
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload
+    return {
+      ...base,
+      entity: 'loanPayment',
+      op: 'delete',
+      loanId: r.loanId,
+      expectedUpdatedAt: r.expectedUpdatedAt,
     };
   }
 
@@ -1700,6 +1950,117 @@ export function makePendingGoalMovementCreate(args: {
   };
 }
 
+export function makePendingLoanCreate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewLoanDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingLoanCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'loan',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingLoanUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewLoanDraft;
+  /** FROZEN — the `loanMeta.updatedAt` the edit screen opened against. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingLoanUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'loan',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingLoanDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingLoanDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'loan',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingLoanPaymentCreate(args: {
+  scope: PendingWriteScope;
+  /** Client-generated `lp-…` payment id — STABLE across every replay. */
+  entityId: string;
+  loanId: string;
+  payload: NewLoanPaymentDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingLoanPaymentCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'loanPayment',
+    op: 'create',
+    entityId: args.entityId,
+    loanId: args.loanId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingLoanPaymentDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  loanId: string;
+  /** FROZEN — the payment row's own `updated_at` the user was viewing when
+   *  they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingLoanPaymentDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'loanPayment',
+    op: 'delete',
+    entityId: args.entityId,
+    loanId: args.loanId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -1792,6 +2153,28 @@ function goalEditableEqual(a: NewGoalDraft, b: NewGoalDraft): boolean {
     a.deadline === b.deadline &&
     a.icon === b.icon
   );
+}
+
+/** Equality of the SERVER-editable loan fields — `paid`/`payments` are never
+ *  part of the draft at all, so no exclusion is needed the way `type`/`saved`
+ *  needed one for planned/goal (STEP 16-H2-L1). */
+function loanEditableEqual(a: NewLoanDraft, b: NewLoanDraft): boolean {
+  return (
+    a.name === b.name &&
+    a.lender === b.lender &&
+    Number(a.principal) === Number(b.principal) &&
+    Number(a.annualRate) === Number(b.annualRate) &&
+    Number(a.termMonths) === Number(b.termMonths) &&
+    a.startDate === b.startDate &&
+    Number(a.paymentDay) === Number(b.paymentDay) &&
+    a.repayType === b.repayType
+  );
+}
+
+/** Equality of a repayment draft — `date`/`amount` only (the split is never
+ *  part of the draft — see `PendingLoanPaymentCreate`'s own comment). */
+function loanPaymentDraftEqual(a: NewLoanPaymentDraft, b: NewLoanPaymentDraft): boolean {
+  return a.date === b.date && Number(a.amount) === Number(b.amount);
 }
 
 /**
@@ -1922,6 +2305,30 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
       Number(a.payload.amount) === Number(b.payload.amount) &&
       a.expectedBaselineSaved === b.expectedBaselineSaved
     );
+  }
+
+  if (a.entity === 'loan' && b.entity === 'loan') {
+    // CREATE: identity + same draft — no create-only field to add (mirrors
+    // `goal`'s shape, unlike planned/recurring/category's `type`).
+    if (a.op === 'create' && b.op === 'create') return loanEditableEqual(a.payload, b.payload);
+    if (a.op === 'update' && b.op === 'update') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt && loanEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
+  }
+
+  if (a.entity === 'loanPayment' && b.entity === 'loanPayment') {
+    // entityId equality (the payment id) is already established by
+    // dedupKey. CREATE: same target loan + same draft. DELETE: same target
+    // loan + same frozen token.
+    if (a.op === 'create' && b.op === 'create') {
+      return a.loanId === b.loanId && loanPaymentDraftEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') {
+      return a.loanId === b.loanId && a.expectedUpdatedAt === b.expectedUpdatedAt;
+    }
+    return false;
   }
 
   if (a.entity === 'transaction' && b.entity === 'transaction') {
@@ -3282,6 +3689,272 @@ function composeGoalManagement(
   return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById, movementById };
 }
 
+/* ---------------- loan display model (STEP 16-H2-L1) ---------------- */
+
+/** A pending CREATE / failed-orphan UPDATE payload -> a synthetic domain
+ *  `Loan`. The row is read-only (never re-edited) — `createdAt` is a
+ *  synthetic `enqueuedAt` placeholder. `paid` is ALWAYS `0` and `payments`
+ *  ALWAYS `[]` — a CREATE never sets `paid` (the DB default applies) and an
+ *  UPDATE never touches it (deposits are their own op, out of scope for the
+ *  goal analog and handled by the SEPARATE `loanPayment` overlay here). */
+function loanDraftToDomain(op: PendingLoanCreate | PendingLoanUpdate): Loan {
+  const d = op.payload;
+  return {
+    id: op.entityId,
+    name: d.name,
+    lender: d.lender,
+    principal: d.principal,
+    annualRate: d.annualRate,
+    termMonths: d.termMonths,
+    startDate: d.startDate,
+    paymentDay: d.paymentDay,
+    repayType: d.repayType,
+    paid: 0,
+    payments: [],
+    createdAt: op.enqueuedAt,
+  };
+}
+
+/** Overlay an UPDATE draft onto an existing domain loan. `id` / `paid` /
+ *  `payments` / `createdAt` (server identity + the server-maintained
+ *  repayment cache/ledger) are preserved from `row` — an UPDATE op never
+ *  touches them. */
+function applyLoanUpdate(row: Loan, d: NewLoanDraft): Loan {
+  return {
+    ...row,
+    name: d.name,
+    lender: d.lender,
+    principal: d.principal,
+    annualRate: d.annualRate,
+    termMonths: d.termMonths,
+    startDate: d.startDate,
+    paymentDay: d.paymentDay,
+    repayType: d.repayType,
+  };
+}
+
+/**
+ * Does an authoritative server loan already reflect a queued CREATE/UPDATE's
+ * desired draft? STEP 16-H2-L1 — the pre-ack confirmation, mirroring
+ * `remoteLoanWrite.ts`'s own `isSameLoanCreate` / `loanFieldsMatch` field set
+ * at the READ-MODEL level. `paid`/`payments` are NEVER compared (not part of
+ * the draft — a repayment, not this op, changes them); `updatedAt` changing
+ * alone is never sufficient on its own. Pure — no `JSON.stringify`.
+ */
+export function serverLoanConfirmsUpdate(serverRow: Loan, draft: NewLoanDraft): boolean {
+  return (
+    serverRow.name === draft.name.trim() &&
+    serverRow.lender === draft.lender.trim() &&
+    Number(serverRow.principal) === Number(draft.principal) &&
+    Number(serverRow.annualRate) === Number(draft.annualRate) &&
+    Number(serverRow.termMonths) === Number(draft.termMonths) &&
+    serverRow.startDate === draft.startDate &&
+    Number(serverRow.paymentDay) === Number(draft.paymentDay) &&
+    serverRow.repayType === draft.repayType
+  );
+}
+
+export interface LoanManagementView {
+  /**
+   * The loans to render on a LOAN-MANAGEMENT surface ONLY: authoritative
+   * server `loans`, with a NOT-failed pending UPDATE overlaid, plus a
+   * synthetic row for a pending/failed CREATE, plus a synthetic row for a
+   * FAILED UPDATE whose server row is GONE, minus a not-failed pending
+   * DELETE. Mirrors `GoalManagementView` exactly. DELIBERATELY separate
+   * from `data.loans` / `data.loanMeta` so any other consumer only ever
+   * sees authoritative server data. Equals `data.loans` when there are no
+   * loan ops. ENGINE ONLY this step — no screen reads it yet.
+   */
+  rows: Loan[];
+  /** loan id -> the pending op that produced or marks it. */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** loan ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server loan ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+  /**
+   * row ids that are SYNTHETIC — present in `rows` only because of an op,
+   * with no authoritative server loan behind them (pending/failed CREATE,
+   * and a failed UPDATE whose server row is gone).
+   */
+  syntheticIds: ReadonlySet<string>;
+  /** loan id -> the full draft the user attempted in a TERMINAL-failed UPDATE.
+   *  Conflict metadata ONLY — never used to replace the displayed row when
+   *  the authoritative row exists. */
+  attemptedDraftById: ReadonlyMap<string, NewLoanDraft>;
+  /**
+   * STEP 16-H2-L1 — loan id -> the `{kind, date, amount}` of the loan's
+   * pending or TERMINAL-failed repayment create/delete, when one is queued.
+   * DELIBERATELY populated for BOTH the still-pending AND the failed case
+   * (mirrors `GoalManagementView.movementById`) — a future row label needs
+   * the kind/amount even while merely pending.
+   */
+  paymentById: ReadonlyMap<string, { kind: 'create' | 'delete'; date: string; amount: number }>;
+}
+
+function composeLoanManagement(
+  serverLoans: readonly Loan[],
+  ops: readonly PendingWrite[],
+  failedLoanIds?: ReadonlySet<string>,
+  /** STEP 16-H2-L1 — bare PAYMENT-id set (the ledger row's OWN id, NOT the
+   *  loan id) of TERMINAL-failed pending repayment create/delete ops. */
+  failedLoanPaymentIds?: ReadonlySet<string>,
+): LoanManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const syntheticIds = new Set<string>();
+  const attemptedDraftById = new Map<string, NewLoanDraft>();
+  const paymentById = new Map<string, { kind: 'create' | 'delete'; date: string; amount: number }>();
+  const loanOps = ops.filter(
+    (o): o is PendingLoanCreate | PendingLoanUpdate | PendingLoanDelete => o.entity === 'loan',
+  );
+  const paymentOps = ops.filter(
+    (o): o is PendingLoanPaymentCreate | PendingLoanPaymentDelete => o.entity === 'loanPayment',
+  );
+  if (loanOps.length === 0 && paymentOps.length === 0) {
+    return {
+      rows: serverLoans.slice(),
+      opById,
+      failedIds,
+      hiddenIds,
+      syntheticIds,
+      attemptedDraftById,
+      paymentById,
+    };
+  }
+
+  const failed = (id: string) => !!failedLoanIds?.has(id);
+  const rows = serverLoans.slice(); // never mutates serverLoans
+  const idxOf = (id: string) => rows.findIndex((l) => l.id === id);
+
+  for (const op of loanOps) {
+    const idx = idxOf(op.entityId);
+
+    if (op.op === 'create') {
+      if (idx !== -1) continue; // the flush already landed — no marker
+      rows.push(loanDraftToDomain(op));
+      opById.set(op.entityId, 'create');
+      syntheticIds.add(op.entityId); // no authoritative row behind it
+      if (failed(op.entityId)) failedIds.add(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (idx !== -1) {
+        if (failed(op.entityId)) {
+          // TERMINAL-failed UPDATE + authoritative row still on the server
+          // (the other device won, or a repayment bumped it). KEEP the
+          // authoritative row verbatim — the stale local draft must NOT
+          // replace it.
+          opById.set(op.entityId, 'update');
+          failedIds.add(op.entityId);
+          attemptedDraftById.set(op.entityId, op.payload);
+          continue;
+        }
+        // still-pending (non-terminal) UPDATE -> overlay the draft.
+        rows[idx] = applyLoanUpdate(rows[idx], op.payload);
+        opById.set(op.entityId, 'update');
+        continue;
+      }
+      // server row GONE: only a TERMINAL-failed UPDATE gets a display-only
+      // synthetic row (a not-failed one just waits — like every other entity).
+      if (failed(op.entityId)) {
+        rows.push(loanDraftToDomain(op));
+        opById.set(op.entityId, 'update');
+        failedIds.add(op.entityId);
+        syntheticIds.add(op.entityId);
+        attemptedDraftById.set(op.entityId, op.payload);
+      }
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (idx !== -1) {
+        opById.set(op.entityId, 'delete'); // keep the server row visible, mark it failed
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+    if (idx !== -1) {
+      rows.splice(idx, 1);
+      hiddenIds.push(op.entityId);
+    }
+  }
+
+  // STEP 16-H2-L1 — overlay pending repayment create/delete. A payment's OWN
+  // `entityId` is the ledger row's id, not the loan id, so it never
+  // participates in the create/update/delete dedup above; the target is
+  // named by `loanId`. `enqueueLoanPaymentCreate`/`enqueueLoanPaymentDelete`
+  // (coordinator) refuse to queue while ANY other ACTIVE op already targets
+  // this SAME loan (§7 "the row is locked"), so at most one payment op
+  // should ever target a given loan here; this loop stays defensive (a
+  // loan create/update/delete already claiming the row wins) rather than
+  // assuming that invariant holds.
+  const failedPayment = (paymentEntityId: string) => !!failedLoanPaymentIds?.has(paymentEntityId);
+  for (const op of paymentOps) {
+    if (opById.has(op.loanId)) continue; // a loan create/update/delete already claims this row
+    const idx = idxOf(op.loanId);
+    if (idx === -1) continue; // no authoritative loan to overlay onto — nothing invented
+    const loan = rows[idx];
+
+    if (op.op === 'create') {
+      if (failedPayment(op.entityId)) {
+        // TERMINAL-failed repayment + authoritative loan still present: KEEP
+        // the authoritative `paid` verbatim — the stale optimistic estimate
+        // must NOT overwrite it.
+        opById.set(op.loanId, 'update');
+        failedIds.add(op.loanId);
+        paymentById.set(op.loanId, { kind: 'create', date: op.payload.date, amount: op.payload.amount });
+        continue;
+      }
+      // still-pending (non-terminal) -> optimistic overlay: estimate the
+      // principal/interest split with the SAME pure `splitPayment()` the
+      // repayment sheet itself already shows as "예상 원금/이자" (STEP
+      // 16-H2-L1 — reused verbatim, not re-derived), fed by the CURRENT
+      // composed `remaining` (mirrors app/loan-payment.tsx's own
+      // `Math.max(0, principal - paid)` guard). `principalPart` is
+      // mathematically guaranteed `<= remaining` by `splitPayment()` itself,
+      // so `paid + principalPart` can never exceed `principal` — no upper
+      // clamp needed. The estimate is NEVER sent anywhere; the server always
+      // recomputes its own authoritative split at actual write/replay time.
+      const remaining = Math.max(0, loan.principal - loan.paid);
+      const { principalPart } = splitPayment(remaining, loan.annualRate, op.payload.amount);
+      rows[idx] = { ...loan, paid: loan.paid + principalPart };
+      opById.set(op.loanId, 'update');
+      paymentById.set(op.loanId, { kind: 'create', date: op.payload.date, amount: op.payload.amount });
+      continue;
+    }
+
+    // delete
+    const target = loan.payments.find((p) => p.id === op.entityId);
+    if (failedPayment(op.entityId)) {
+      opById.set(op.loanId, 'update');
+      failedIds.add(op.loanId);
+      if (target) paymentById.set(op.loanId, { kind: 'delete', date: target.date, amount: target.amount });
+      continue;
+    }
+    if (target) {
+      // Reverse by the SAME `principalPart` the trigger itself reverses by
+      // (never the raw `amount` — interest never touched `paid`). Clamped
+      // at 0 defensively, mirroring the SAME `Math.max(0, …)` guard already
+      // used for `remaining` above; a well-formed ledger should never need
+      // it, but a momentarily-inconsistent optimistic view must never show
+      // a negative `paid`.
+      rows[idx] = {
+        ...loan,
+        paid: Math.max(0, loan.paid - target.principalPart),
+        payments: loan.payments.filter((p) => p.id !== op.entityId),
+      };
+      opById.set(op.loanId, 'update');
+      paymentById.set(op.loanId, { kind: 'delete', date: target.date, amount: target.amount });
+    }
+  }
+
+  return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById, paymentById };
+}
+
 export interface ComposedFinance {
   /** `serverData` with pending overlays applied. A NEW object when anything
    *  changed; the SAME reference when nothing applied. `serverData` and its
@@ -3347,6 +4020,13 @@ export interface ComposedFinance {
    * no goal ops. ENGINE ONLY — no screen reads it yet.
    */
   goalManagement: GoalManagementView;
+  /**
+   * STEP 16-H2-L1 — DISPLAY-ONLY loan rows + markers (loan CRUD + repayment
+   * create/delete overlay). NEVER merged into `data.loans` / `data.loanMeta`
+   * / `data.loanPaymentMeta`. Equals `data.loans` when there are no loan ops.
+   * ENGINE ONLY — no screen reads it yet.
+   */
+  loanManagement: LoanManagementView;
 }
 
 /**
@@ -3401,6 +4081,13 @@ export function composeFinance(
    *  pending deposit/withdraw ops; drives the failed-vs-pending branch of the
    *  movement overlay inside `goalManagement`. */
   failedGoalMovementIds?: ReadonlySet<string>,
+  /** STEP 16-H2-L1 — bare loan-id set of TERMINAL-failed loan create/update/
+   *  delete ops; drives the failed-vs-pending branch of `loanManagement`. */
+  failedLoanIds?: ReadonlySet<string>,
+  /** STEP 16-H2-L1 — bare PAYMENT-id set (not loan id) of TERMINAL-failed
+   *  pending repayment create/delete ops; drives the failed-vs-pending
+   *  branch of the payment overlay inside `loanManagement`. */
+  failedLoanPaymentIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
   const categoryManagement = composeCategoryManagement(
@@ -3423,6 +4110,12 @@ export function composeFinance(
     failedGoalIds,
     failedGoalMovementIds,
   );
+  const loanManagement = composeLoanManagement(
+    serverData.loans,
+    ops,
+    failedLoanIds,
+    failedLoanPaymentIds,
+  );
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
@@ -3437,6 +4130,7 @@ export function composeFinance(
       plannedManagement,
       recurringManagement,
       goalManagement,
+      loanManagement,
     };
   }
 
@@ -3515,6 +4209,7 @@ export function composeFinance(
       plannedManagement,
       recurringManagement,
       goalManagement,
+      loanManagement,
     };
   }
 
@@ -3533,5 +4228,6 @@ export function composeFinance(
     plannedManagement,
     recurringManagement,
     goalManagement,
+    loanManagement,
   };
 }

@@ -80,10 +80,23 @@ import {
   type SoftDeleteGoalResult,
   type UpdateGoalResult,
 } from '@/services/remoteGoalWrite';
+import {
+  addLoanPayment,
+  createLoan,
+  softDeleteLoan,
+  softDeleteLoanPayment,
+  updateLoan,
+  type AddLoanPaymentResult,
+  type CreateLoanResult,
+  type SoftDeleteLoanPaymentResult,
+  type SoftDeleteLoanResult,
+  type UpdateLoanResult,
+} from '@/services/remoteLoanWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
+import type { NewLoanDraft, NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { PendingWrite } from '@/lib/offlineQueue';
@@ -292,6 +305,46 @@ export interface RunOpDeps {
     expectedUserId: string;
     draft: NewGoalMovementDraft;
   }) => Promise<AddGoalMovementResult>;
+  /** STEP 16-H2-L1 — injected in tests; default to the real loan services.
+   *  CREATE / UPDATE / DELETE are separate functions (like card/category/
+   *  planned/recurring/goal). */
+  createLoan?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    draft: NewLoanDraft;
+  }) => Promise<CreateLoanResult>;
+  updateLoan?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: NewLoanDraft;
+  }) => Promise<UpdateLoanResult>;
+  softDeleteLoan?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteLoanResult>;
+  /** STEP 16-H2-L1 — injected in tests; default to the real `addLoanPayment`.
+   *  `paymentId` is `op.entityId`, forwarded VERBATIM on every replay, NEVER
+   *  a fresh id — mirrors `addGoalMovement`'s own idempotent-by-content
+   *  23505 reconcile. See runOp's own comment on this branch for a
+   *  documented (pre-existing, out-of-scope-to-fix) reconcile subtlety. */
+  addLoanPayment?: (args: {
+    paymentId: string;
+    householdId: string;
+    loanId: string;
+    expectedUserId: string;
+    draft: NewLoanPaymentDraft;
+  }) => Promise<AddLoanPaymentResult>;
+  softDeleteLoanPayment?: (args: {
+    paymentId: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteLoanPaymentResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -310,7 +363,9 @@ export async function runPendingWrite(
     op.entity !== 'planned' &&
     op.entity !== 'recurring' &&
     op.entity !== 'goal' &&
-    op.entity !== 'goalMovement'
+    op.entity !== 'goalMovement' &&
+    op.entity !== 'loan' &&
+    op.entity !== 'loanPayment'
   ) {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
@@ -492,6 +547,121 @@ export async function runPendingWrite(
         ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
         message: res.message,
       };
+    }
+
+    // ---- LOAN (STEP 16-H2-L1) ----
+    if (op.entity === 'loan') {
+      if (op.op === 'create') {
+        const create = deps.createLoan ?? createLoan;
+        const res = await create({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        // A 23505 on a lost-response replay where the server row is the SAME
+        // create is the service's own idempotent `ok: true` — honoured here.
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // LoanWriteReason adds 'invalid' (structural) on top of the shared
+        // WriteConflictReason — flatten it to a reason-less terminal, same as
+        // card/category/planned/recurring/goal; a same-id-different-payload
+        // race is `conflict`.
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      if (op.op === 'update') {
+        const update = deps.updateLoan ?? updateLoan;
+        const res = await update({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // UpdateLoanReason additionally has 'principal_low' (the draft's
+        // principal is below the CURRENT `paid`, re-checked authoritatively
+        // on every replay) — already part of the widened WriteConflictReason,
+        // preserved verbatim (not retryable: a stale draft won't become
+        // valid by resending it unchanged).
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      // loan delete
+      const del = deps.softDeleteLoan ?? softDeleteLoan;
+      const res = await del({
+        id: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-soft-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // SoftDeleteLoanResult's reason is already Exclude<…, 'invalid'|'deleted'>
+      // — every value is in WriteConflictReason.
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
+    // ---- LOAN PAYMENT — repayment create/delete (STEP 16-H2-L1) ----
+    if (op.entity === 'loanPayment') {
+      if (op.op === 'create') {
+        // `paymentId` is `op.entityId` — forwarded VERBATIM on every replay,
+        // NEVER a fresh id: a fresh id would let `trg_apply_loan_payment`
+        // move `loans.paid` twice. A lost-response retry with the SAME id
+        // hits `addLoanPayment`'s idempotency pre-check (STEP 16-H2-L1.1) —
+        // an existing `loan_payments` row for this id is recognized as the
+        // SAME request by STABLE REQUEST INTENT (household/loan/user/date/
+        // amount), NEVER by re-deriving `principal_part`/`interest_part`
+        // from the CURRENT `paid` (which legitimately differs once the
+        // original insert already moved it — the false-negative an earlier
+        // version of this comment used to document as an unfixed gap). A
+        // race with a concurrent insert of the same id falls through to the
+        // service's own 23505 branch, which reconciles with the identical
+        // stable-intent check.
+        const create = deps.addLoanPayment ?? addLoanPayment;
+        const res = await create({
+          paymentId: op.entityId,
+          householdId: op.scope.householdId,
+          loanId: op.loanId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // AddLoanPaymentReason adds 'invalid' (structural — never reachable
+        // for a QUEUED replay, since the client validates the draft before
+        // it is ever enqueued) on top of the shared WriteConflictReason —
+        // flattened to a reason-less terminal, same as goalMovement's
+        // 'invalid'. 'paid_off' / 'stale' are neither retryable nor generic
+        // — preserved verbatim (already part of the widened
+        // WriteConflictReason) so the UI can show dedicated wording later.
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      // loan payment delete
+      const del = deps.softDeleteLoanPayment ?? softDeleteLoanPayment;
+      const res = await del({
+        paymentId: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-soft-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // SoftDeleteLoanPaymentResult's reason is already Exclude<…,
+      // 'invalid'|'deleted'> — every value is in WriteConflictReason.
+      return { kind: 'terminal', reason: res.reason, message: res.message };
     }
 
     // ---- PLANNED EXPENSE (STEP 16-H2-E1 §6/§7) ----

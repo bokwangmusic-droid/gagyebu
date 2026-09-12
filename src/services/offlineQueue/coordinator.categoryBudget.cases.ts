@@ -129,6 +129,7 @@ function makeHarness(opts?: { seed?: string }) {
     getServerPlanned: () => new Map(),
     getServerRecurring: () => new Map(),
     getServerGoals: () => new Map(),
+    getServerLoans: () => new Map(),
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();

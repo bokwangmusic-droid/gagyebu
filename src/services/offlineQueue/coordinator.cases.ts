@@ -308,6 +308,7 @@ function makeHarness(opts?: { seed?: string; remoteReady?: boolean; scope?: Coor
     getServerPlanned: () => new Map(),
     getServerRecurring: () => new Map(),
     getServerGoals: () => new Map(),
+    getServerLoans: () => new Map(),
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();

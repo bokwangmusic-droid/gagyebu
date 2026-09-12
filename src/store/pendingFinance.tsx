@@ -32,6 +32,7 @@ import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
+import type { NewLoanDraft, NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import {
@@ -46,7 +47,7 @@ import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { useRemoteFinance } from '@/store/remoteFinance';
-import type { CreditCard, Goal, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type { CreditCard, Goal, Loan, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_OPS: PendingWrite[] = [];
@@ -269,6 +270,51 @@ interface PendingFinanceValue {
     payload: NewGoalMovementDraft;
     expectedBaselineSaved: number;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-L1 — current-scope LOAN ops (create/update/delete, incl.
+   *  terminal-failed), bare loan-id keys. ENGINE ONLY — no UI call site
+   *  enqueues these yet. */
+  pendingLoanOps: PendingWrite[];
+  loanOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  loanFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingLoanIds: ReadonlySet<string>;
+  failedLoanIds: ReadonlySet<string>;
+  enqueueLoanCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewLoanDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueLoanUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewLoanDraft;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueLoanDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-L1 — current-scope LOAN-PAYMENT ops (repayment create/delete,
+   *  incl. terminal-failed), bare PAYMENT-id keys (the ledger row's OWN id —
+   *  NOT the loan id; that lives on the raw `PendingWrite.loanId`). ENGINE
+   *  ONLY — no UI call site enqueues these yet. */
+  pendingLoanPaymentOps: PendingWrite[];
+  loanPaymentOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  loanPaymentFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingLoanPaymentIds: ReadonlySet<string>;
+  failedLoanPaymentIds: ReadonlySet<string>;
+  enqueueLoanPaymentCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    loanId: string;
+    payload: NewLoanPaymentDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueLoanPaymentDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    loanId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
   /** STEP 16-H2-C2-B2 conflict-UX — drop ONE queued record by `queueId`
    *  ("변경 버리기"). NOT a server delete; scope-guarded; awaits persistence. */
   discardPending: (queueId: string) => Promise<DiscardOutcome>;
@@ -366,6 +412,13 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const serverGoalsRef = useRef<ReadonlyMap<string, Goal>>(serverGoals);
   serverGoalsRef.current = serverGoals;
 
+  const serverLoans = useMemo<ReadonlyMap<string, Loan>>(
+    () => new Map((rf.data?.loans ?? []).map((l) => [l.id, l])),
+    [rf.data?.loans],
+  );
+  const serverLoansRef = useRef<ReadonlyMap<string, Loan>>(serverLoans);
+  serverLoansRef.current = serverLoans;
+
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
   const coordRef = useRef<ReturnType<typeof createPendingWriteCoordinator> | null>(null);
@@ -381,6 +434,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getServerPlanned: () => serverPlannedRef.current,
       getServerRecurring: () => serverRecurringRef.current,
       getServerGoals: () => serverGoalsRef.current,
+      getServerLoans: () => serverLoansRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -494,6 +548,22 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
         state.goalMovement.pendingIds.size > 0 ? state.goalMovement.pendingIds : EMPTY_SET,
       failedGoalMovementIds:
         state.goalMovement.failedIds.size > 0 ? state.goalMovement.failedIds : EMPTY_SET,
+      pendingLoanOps: state.loan.scopeOps.length > 0 ? state.loan.scopeOps : EMPTY_OPS,
+      loanOpByEntity: state.loan.opByEntity.size > 0 ? state.loan.opByEntity : EMPTY_KIND_MAP,
+      loanFailedReasons:
+        state.loan.failedReasons.size > 0 ? state.loan.failedReasons : EMPTY_REASON_MAP,
+      pendingLoanIds: state.loan.pendingIds.size > 0 ? state.loan.pendingIds : EMPTY_SET,
+      failedLoanIds: state.loan.failedIds.size > 0 ? state.loan.failedIds : EMPTY_SET,
+      pendingLoanPaymentOps:
+        state.loanPayment.scopeOps.length > 0 ? state.loanPayment.scopeOps : EMPTY_OPS,
+      loanPaymentOpByEntity:
+        state.loanPayment.opByEntity.size > 0 ? state.loanPayment.opByEntity : EMPTY_KIND_MAP,
+      loanPaymentFailedReasons:
+        state.loanPayment.failedReasons.size > 0 ? state.loanPayment.failedReasons : EMPTY_REASON_MAP,
+      pendingLoanPaymentIds:
+        state.loanPayment.pendingIds.size > 0 ? state.loanPayment.pendingIds : EMPTY_SET,
+      failedLoanPaymentIds:
+        state.loanPayment.failedIds.size > 0 ? state.loanPayment.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
@@ -520,6 +590,11 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueGoalUpdate: coord.enqueueGoalUpdate,
       enqueueGoalDelete: coord.enqueueGoalDelete,
       enqueueGoalMovementCreate: coord.enqueueGoalMovementCreate,
+      enqueueLoanCreate: coord.enqueueLoanCreate,
+      enqueueLoanUpdate: coord.enqueueLoanUpdate,
+      enqueueLoanDelete: coord.enqueueLoanDelete,
+      enqueueLoanPaymentCreate: coord.enqueueLoanPaymentCreate,
+      enqueueLoanPaymentDelete: coord.enqueueLoanPaymentDelete,
       discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
     }),
