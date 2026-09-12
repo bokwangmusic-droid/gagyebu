@@ -56,8 +56,16 @@ export type CreateTransactionResult =
    */
   | { ok: false; message: string; transport?: boolean };
 
-/** STEP 16-G2-B — every non-ok end state for an edit / soft delete. */
-export type WriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error';
+/**
+ * STEP 16-G2-B — every non-ok end state for an edit / soft delete.
+ * `'insufficient'` (STEP 16-H2-G6) is additive and ONLY ever produced by a
+ * goal-movement over-withdraw discovered on a replay (see
+ * `AddGoalMovementResult` / runOp.ts's goalMovement dispatch) — every other
+ * entity's write service never emits it, so widening this shared union is
+ * behaviourally inert for them (their `reason` checks are plain `if`/`===`
+ * comparisons, never an exhaustive switch that this would break).
+ */
+export type WriteConflictReason = 'identity' | 'conflict' | 'deleted' | 'gone' | 'error' | 'insufficient';
 
 /**
  * STEP 16-H2-B1 §2/§3: `transport: true` marks a NETWORK/TRANSPORT failure

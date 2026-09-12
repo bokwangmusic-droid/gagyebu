@@ -477,14 +477,19 @@ export async function runPendingWrite(
       });
       if (res.ok) return { kind: 'success' };
       if (res.transport) return { kind: 'transport', message: res.message };
-      // AddGoalMovementResult's reason adds 'invalid' (structural) and
-      // 'insufficient' (over-withdraw, discovered on a REPLAY when the
-      // CURRENT saved no longer covers it) on top of the shared
-      // WriteConflictReason — neither is retryable, so both flatten to a
-      // reason-less terminal (mirrors 'invalid' everywhere else in this file).
+      // AddGoalMovementResult's reason adds 'invalid' (structural — never
+      // reachable for a QUEUED replay, since the client validates the draft
+      // before it is ever enqueued) on top of the shared WriteConflictReason
+      // — flattened to a reason-less terminal, same as everywhere else in
+      // this file. STEP 16-H2-G6: 'insufficient' (over-withdraw, discovered
+      // on a REPLAY when the CURRENT saved no longer covers it) is NEITHER
+      // retryable NOR generic — it is now part of `WriteConflictReason`
+      // itself and preserved verbatim so the UI can show its own specific
+      // "인출 가능한 금액이 부족해요" wording instead of a misleading
+      // retry-suggesting one (src/lib/pendingGoalLabel.ts).
       return {
         kind: 'terminal',
-        ...(res.reason !== 'invalid' && res.reason !== 'insufficient' ? { reason: res.reason } : {}),
+        ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
         message: res.message,
       };
     }
