@@ -1279,6 +1279,31 @@ export function createPendingWriteCoordinator(
     entityId: string;
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome> {
+    // STEP 16-H2-G4 §6 — "the row is locked": refuse while a create/update
+    // (a different op on this SAME goal) OR a movement targeting this goal
+    // is ACTIVELY queued, so at most one offline change is ever in flight
+    // per goal (the SAME goal-wide rule `enqueueGoalMovementCreate` already
+    // enforces, viewed from the delete side). "Actively queued" excludes a
+    // record already carrying `lastError` — a TERMINAL-failed op (§10) is
+    // retained forever with no discard UI on this screen, so treating it as
+    // a lock would make that goal's delete PERMANENTLY impossible; only a
+    // not-yet-terminal op (pending, transport-halted, or awaiting-ack) may
+    // block. An existing DELETE for the SAME entityId (a genuine retry) is
+    // intentionally NOT caught here — it falls through to
+    // `enqueuePendingWrite`, whose dedup preserves the idempotent-duplicate
+    // (identical frozen token) and differing-token (`existing-pending`)
+    // semantics.
+    const clash = controller
+      .read()
+      .some(
+        (r) =>
+          r.scope.userId === args.scope.userId &&
+          r.scope.householdId === args.scope.householdId &&
+          !r.lastError &&
+          ((r.entity === 'goal' && r.entityId === args.entityId && r.op !== 'delete') ||
+            (r.entity === 'goalMovement' && r.goalId === args.entityId)),
+      );
+    if (clash) return Promise.resolve({ ok: false, reason: 'existing-pending' });
     return enqueue(
       makePendingGoalDelete({
         scope: args.scope,
@@ -1296,11 +1321,16 @@ export function createPendingWriteCoordinator(
     expectedBaselineSaved: number;
   }): Promise<EnqueueOutcome> {
     // STEP 16-H2-G3 §7 — "the row is locked": refuse while ANY other op
-    // (create / update / delete / another movement) already targets this
-    // SAME goalId, so at most one offline change is ever in flight per goal.
-    // Mirrors `enqueueCategoryBudgetDelete`'s clash guard. An existing
-    // movement for the SAME `entityId` (a genuine retry of this exact sheet)
-    // is intentionally NOT caught here — it falls through to
+    // (create / update / delete / another movement) is ACTIVELY queued for
+    // this SAME goalId, so at most one offline change is ever in flight per
+    // goal. Mirrors `enqueueCategoryBudgetDelete`'s clash guard. "Actively
+    // queued" excludes a record already carrying `lastError` — a
+    // TERMINAL-failed op (§10, STEP 16-H2-G4 fix) is retained forever with
+    // no discard UI on this screen, so treating it as a lock would make
+    // every OTHER op on that goal (including this movement) PERMANENTLY
+    // impossible; only a not-yet-terminal op may block. An existing movement
+    // for the SAME `entityId` (a genuine retry of this exact sheet) is
+    // intentionally NOT caught here — it falls through to
     // `enqueuePendingWrite`, whose dedup preserves the idempotent-duplicate
     // (identical goalId/payload/baseline) and differing-request
     // (`existing-pending`) semantics.
@@ -1311,6 +1341,7 @@ export function createPendingWriteCoordinator(
           r.scope.userId === args.scope.userId &&
           r.scope.householdId === args.scope.householdId &&
           r.entityId !== args.entityId &&
+          !r.lastError &&
           ((r.entity === 'goal' && r.entityId === args.goalId) ||
             (r.entity === 'goalMovement' && r.goalId === args.goalId)),
       );

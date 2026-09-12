@@ -22,8 +22,8 @@
  * preset tooling).
  */
 import { QUEUE_SCHEMA_VERSION, type PendingGoalMovementCreate } from '@/lib/offlineQueue';
-import type { NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
-import type { AddGoalMovementResult } from '@/services/remoteGoalWrite';
+import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
+import type { AddGoalMovementResult, UpdateGoalResult } from '@/services/remoteGoalWrite';
 import {
   createPendingWriteCoordinator,
   type CoordinatorScope,
@@ -47,6 +47,13 @@ const settle = async (n = 6) => {
 const md = (over: Partial<NewGoalMovementDraft> = {}): NewGoalMovementDraft => ({
   mode: 'deposit',
   amount: 30000,
+  ...over,
+});
+const gd = (over: Partial<NewGoalDraft> = {}): NewGoalDraft => ({
+  name: '내 집 마련',
+  target: 5000000,
+  deadline: '2027-01-01',
+  icon: '🏠',
   ...over,
 });
 
@@ -88,6 +95,13 @@ type MoveArgs = {
   expectedUserId: string;
   draft: NewGoalMovementDraft;
 };
+type UpdateArgs = {
+  id: string;
+  householdId: string;
+  expectedUserId: string;
+  expectedUpdatedAt: string;
+  draft: NewGoalDraft;
+};
 
 interface Harness {
   coord: ReturnType<typeof createPendingWriteCoordinator>;
@@ -97,6 +111,7 @@ interface Harness {
   timers: { id: number; fn: () => void; ms: number; cancelled: boolean }[];
   setScope: (s: CoordinatorScope | null) => void;
   setMove: (f: (a: MoveArgs) => Promise<AddGoalMovementResult>) => void;
+  setUpdate: (f: (a: UpdateArgs) => Promise<UpdateGoalResult>) => void;
   goalPut: (row: Goal) => void;
   goalDelete: (id: string) => void;
   runTimers: () => void;
@@ -126,6 +141,14 @@ function makeHarness(opts?: { seed?: string }): Harness {
     }
     return { ok: true };
   };
+  // default: unused unless a test opts in via setUpdate (only case 25 needs
+  // a real goal-UPDATE dispatch, to reproduce the STEP 16-H2-G4 regression:
+  // a terminal-failed update must never permanently lock the goal).
+  let updateImpl = async (_a: UpdateArgs): Promise<UpdateGoalResult> => ({
+    ok: false,
+    reason: 'error',
+    message: 'not stubbed',
+  });
 
   const coord = createPendingWriteCoordinator({
     storage: storage as unknown as QueueStorage,
@@ -145,6 +168,7 @@ function makeHarness(opts?: { seed?: string }): Harness {
     },
     onChange: () => {},
     addGoalMovement: (a) => moveImpl(a as MoveArgs),
+    updateGoal: (a) => updateImpl(a as UpdateArgs),
     schedule: (fn, ms) => {
       const id = ++timerSeq;
       timers.push({ id, fn, ms, cancelled: false });
@@ -169,6 +193,9 @@ function makeHarness(opts?: { seed?: string }): Harness {
     },
     setMove: (f) => {
       moveImpl = f;
+    },
+    setUpdate: (f) => {
+      updateImpl = f;
     },
     goalPut: (row) => {
       goals.set(row.id, row);
@@ -624,6 +651,39 @@ export async function runCoordinatorGoalMovementCases(): Promise<{
         !h.coord.getState().goalMovement.failedIds.has('gm-1') &&
         enqAfter.ok === true,
       JSON.stringify({ outB, outA, enqAfter }),
+    );
+  }
+
+  // 25 — REGRESSION (the STEP 16-H2-G4 on-device bug, symmetric side): a
+  // TERMINAL-FAILED update for the SAME goal (retained forever — no discard
+  // UI) must NEVER permanently block a later movement. Only an ACTIVELY
+  // pending op (no `lastError` yet) may lock the row.
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setUpdate(() =>
+      Promise.resolve({ ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' } as UpdateGoalResult),
+    );
+    await h.coord.enqueueGoalUpdate({
+      scope: A,
+      entityId: 'goal-1',
+      payload: gd({ target: 1 }),
+      expectedUpdatedAt: 'V1',
+    });
+    await settle(); // let the update actually terminal-fail (lastError persisted)
+    const preState = h.coord.getState().goal;
+    const enq = await h.coord.enqueueGoalMovementCreate({
+      scope: A,
+      entityId: 'gm-1',
+      goalId: 'goal-1',
+      payload: md(),
+      expectedBaselineSaved: 100000,
+    });
+    check(
+      '25 movement is NOT refused by a terminal-failed (not merely pending) update on the SAME goal',
+      preState.failedIds.has('goal-1') && // sanity: the update really did terminal-fail first
+        enq.ok === true,
+      JSON.stringify({ preFailed: [...preState.failedIds], enq }),
     );
   }
 

@@ -702,6 +702,112 @@ export async function runCoordinatorGoalCases(): Promise<{
     );
   }
 
+  /* ======================== DELETE LOCK (STEP 16-H2-G4 §6) ======================== */
+
+  // 41 — DELETE refused while an UPDATE is already pending for the SAME goal
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setUpdate(() => Promise.resolve(TRANSPORT_U));
+    await h.coord.enqueueGoalUpdate({
+      scope: A,
+      entityId: 'goal-1',
+      payload: gd({ target: 1 }),
+      expectedUpdatedAt: 'V1',
+    });
+    const enq = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
+    check(
+      '41 DELETE refused (existing-pending) while an UPDATE is queued for the same goal',
+      enq.ok === false && enq.reason === 'existing-pending' && h.coord.getState().goal.scopeOps.length === 1,
+      JSON.stringify(enq),
+    );
+  }
+
+  // 42 — DELETE refused while a MOVEMENT is already pending for the SAME goal
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    const enqMove = await h.coord.enqueueGoalMovementCreate({
+      scope: A,
+      entityId: 'gm-1',
+      goalId: 'goal-1',
+      payload: { mode: 'deposit', amount: 10000 },
+      expectedBaselineSaved: 0,
+    });
+    const enqDel = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
+    check(
+      '42 DELETE refused (existing-pending) while a MOVEMENT targets the same goal',
+      enqMove.ok === true && enqDel.ok === false && enqDel.reason === 'existing-pending',
+      JSON.stringify({ enqMove, enqDel }),
+    );
+  }
+
+  // 43 — a genuine retry of the SAME delete (same entityId) is NOT caught by
+  // its own lock — idempotent dedup / existing-pending-on-differing-token
+  // still applies normally.
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setDelete(() => Promise.resolve(TRANSPORT_D));
+    const enq1 = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
+    const enq2 = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' }); // same token -> idempotent
+    const enq3 = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V2' }); // different token -> existing-pending
+    check(
+      '43 delete retry (same token) is NOT blocked by its own lock; a differing token still refuses normally',
+      enq1.ok === true &&
+        enq2.ok === true &&
+        enq3.ok === false &&
+        enq3.reason === 'existing-pending' &&
+        h.coord.getState().goal.scopeOps.length === 1,
+      JSON.stringify({ enq1, enq2, enq3 }),
+    );
+  }
+
+  // 44 — DELETE for a DIFFERENT goal is unaffected by another goal's lock
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setUpdate(() => Promise.resolve(TRANSPORT_U));
+    await h.coord.enqueueGoalUpdate({
+      scope: A,
+      entityId: 'goal-1',
+      payload: gd({ target: 1 }),
+      expectedUpdatedAt: 'V1',
+    });
+    const enq = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-2', expectedUpdatedAt: 'V1' });
+    check(
+      "44 DELETE for a different goal is NOT blocked by goal-1's update lock",
+      enq.ok === true,
+      JSON.stringify(enq),
+    );
+  }
+
+  // 45 — REGRESSION (the actual on-device bug): a TERMINAL-FAILED update for
+  // the SAME goal (retained forever — no discard UI) must NEVER permanently
+  // block a later delete. Only an ACTIVELY pending op (no `lastError` yet)
+  // may lock the row.
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setUpdate(() => Promise.resolve(CONFLICT_U)); // terminal, not transport
+    await h.coord.enqueueGoalUpdate({
+      scope: A,
+      entityId: 'goal-1',
+      payload: gd({ target: 1 }),
+      expectedUpdatedAt: 'V1',
+    });
+    await settle(); // let the update actually terminal-fail (lastError persisted)
+    const preState = h.coord.getState().goal;
+    const enq = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
+    check(
+      '45 DELETE is NOT refused by a terminal-failed (not merely pending) update on the SAME goal',
+      preState.failedIds.has('goal-1') && // sanity: the update really did terminal-fail first
+        enq.ok === true &&
+        h.coord.getState().goal.scopeOps.some((o) => o.op === 'delete' && o.entityId === 'goal-1'),
+      JSON.stringify({ preFailed: [...preState.failedIds], enq }),
+    );
+  }
+
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };
 }

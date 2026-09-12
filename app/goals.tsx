@@ -15,10 +15,12 @@ import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, formatShortDate } from '@/lib/format';
 import { goalStats, type GoalPace } from '@/lib/goal';
 import { pendingGoalRowLabel } from '@/lib/pendingGoalLabel';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { softDeleteGoal } from '@/services/remoteGoalWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { Goal } from '@/store/types';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -53,6 +55,10 @@ export default function GoalsList() {
     pendingGoalOps,
     refresh,
   } = useFinanceRead();
+  // STEP 16-H2-G4: durable offline fallback for a goal DELETE whose direct
+  // write hit a TRANSPORT failure (offline). Never used for a
+  // server/terminal verdict.
+  const pending = usePendingWrites();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
   const pendingRef = useRef(false);
@@ -71,6 +77,24 @@ export default function GoalsList() {
   const openMovement = (id: string, mode: 'deposit' | 'withdraw') =>
     router.push({ pathname: '/goal-movement', params: { id, mode } });
 
+  /**
+   * STEP 16-H2-G4: a durable-enqueue that itself failed — the change is NOT
+   * queued, so the delete did not happen and the row stays visible/active.
+   * Raw coordinator reasons are never surfaced. Mirrors goal-add / goal-movement.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '삭제 요청을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
   const doDelete = async (id: string, token: string) => {
     if (pendingRef.current) return;
     if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
@@ -85,15 +109,40 @@ export default function GoalsList() {
       expectedUpdatedAt: token,
     });
 
-    await refresh();
-    pendingRef.current = false;
-    setPendingId(null);
-
     if (res.ok) {
+      await refresh();
+      pendingRef.current = false;
+      setPendingId(null);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('저축 목표를 삭제했어요');
       return;
     }
+
+    // STEP 16-H2-G4: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue with the FROZEN token captured at delete-initiation time (never
+    // re-read). `composeGoalManagement` hides the row from the list right
+    // away (optimistic); `data.goals` stays server-authoritative until the
+    // flush lands and a refresh confirms it.
+    if (res.transport === true) {
+      const enq = await pending.enqueueGoalDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: id,
+        expectedUpdatedAt: token,
+      });
+      pendingRef.current = false;
+      setPendingId(null);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('저축 목표를 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
+      return;
+    }
+
+    await refresh();
+    pendingRef.current = false;
+    setPendingId(null);
     if (res.reason === 'identity' || res.reason === 'error') {
       toast.show(res.message);
       return;
