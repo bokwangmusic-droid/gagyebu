@@ -95,6 +95,32 @@ export default function GoalsList() {
     }
   };
 
+  /**
+   * STEP 16-H2-G5: permanently drop ONE terminal-failed goal op (create /
+   * update / movement / delete) by its durable `queueId`. NOT a server
+   * mutation — never touches `data.goals` / the server row; it only removes
+   * the local un-sent record so `composeGoalManagement` falls back to
+   * showing the authoritative server value again (or, for a failed CREATE
+   * with no server row at all, the synthetic row simply disappears). Mirrors
+   * `app/(tabs)/planned.tsx`'s `discardFailed` — same API, same confirm-Alert
+   * shape, same toast wording style.
+   */
+  const discardFailed = (queueId: string) => {
+    Alert.alert('변경을 버릴까요?', '서버에 반영되지 않은 변경 내용이 삭제되고, 서버에 저장된 내용으로 돌아가요.', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '변경 버리기',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            const r = await pending.discardPending(queueId);
+            toast.show(r.ok ? '변경을 버렸어요' : '변경을 정리하지 못했어요. 다시 시도해주세요.');
+          })();
+        },
+      },
+    ]);
+  };
+
   const doDelete = async (id: string, token: string) => {
     if (pendingRef.current) return;
     if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
@@ -352,17 +378,32 @@ export default function GoalsList() {
               )}
 
               {pendingOp && (
-                <Text
-                  style={{
-                    fontFamily: fontFamily.medium,
-                    fontSize: 11,
-                    lineHeight: 14,
-                    color: pendingOp.failed ? colors.textSub : colors.textMuted,
-                    marginTop: spacing.sm,
-                  }}
-                >
-                  {pendingGoalRowLabel(pendingOp)}
-                </Text>
+                <View style={{ marginTop: spacing.sm }}>
+                  <Text
+                    style={{
+                      fontFamily: fontFamily.medium,
+                      fontSize: 11,
+                      lineHeight: 14,
+                      color: pendingOp.failed ? colors.textSub : colors.textMuted,
+                    }}
+                  >
+                    {pendingGoalRowLabel(pendingOp)}
+                  </Text>
+                  {/* STEP 16-H2-G5: ONLY a TERMINAL-failed op offers this —
+                      never a still-pending/awaiting-ack create/update/
+                      movement/delete. */}
+                  {pendingOp.failed && pendingOp.queueId && (
+                    <Pressable
+                      onPress={() => discardFailed(pendingOp.queueId!)}
+                      hitSlop={8}
+                      style={{ alignSelf: 'flex-start', marginTop: 4 }}
+                    >
+                      <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.primaryStrong }}>
+                        변경 버리기
+                      </Text>
+                    </Pressable>
+                  )}
+                </View>
               )}
 
               {(canMove || canDelete) && !pendingOp && (
