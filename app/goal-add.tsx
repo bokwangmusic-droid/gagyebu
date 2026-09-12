@@ -18,10 +18,12 @@ import { uid } from '@/lib/id';
 import type { RemoteGoalMeta } from '@/lib/remoteFinanceMapping';
 import { isValidDateKey } from '@/lib/remotePlannedWriteMapping';
 import type { NewGoalDraft } from '@/lib/remoteGoalWriteMapping';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { createGoal, softDeleteGoal, updateGoal } from '@/services/remoteGoalWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { Goal } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
@@ -76,13 +78,34 @@ type FormMode =
  */
 function GoalFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
-  const { status, error, goals, goalMeta, refresh } = useFinanceRead();
+  const { status, error, goals, goalMeta, pendingGoalOps, refresh } = useFinanceRead();
 
   // STEP 16-G3-B2 §17-21: freeze the first resolved goal + token for the
   // edit session so a later Realtime / foreground refresh that drops the
   // row can't unmount the open form and lose the draft — the save's
   // optimistic-concurrency check decides deleted / gone / conflict.
   const frozenRef = useRef<{ goal: Goal; meta: RemoteGoalMeta } | null>(null);
+
+  // STEP 16-H2-G3-B: a row with an in-flight / terminal-failed offline op is
+  // read-only — never open the edit form on top of a queued write (a second
+  // concurrent UPDATE for the same id would just be refused as
+  // `existing-pending` by the queue's dedup, but the user shouldn't reach
+  // that dead end at all). Checked BEFORE the freeze below so a first entry
+  // is blocked; a form already frozen for this session stays open. Mirrors
+  // PlannedFormRoute (app/planned-add.tsx) — same guard, same wording shape.
+  if (!frozenRef.current && pendingGoalOps.has(editId)) {
+    return (
+      <EditUnavailable
+        body={
+          pendingGoalOps.get(editId)?.failed
+            ? '전송에 실패한 변경이 있어요. 저축 목표 화면에서 다시 시도해 주세요.'
+            : '전송 대기 중인 변경이 있어요. 반영된 뒤에 수정할 수 있어요.'
+        }
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+
   const liveTarget = goals.find((g) => g.id === editId) ?? null;
   const liveMeta = goalMeta[editId] ?? null;
   if (!frozenRef.current && liveTarget && liveMeta) {
@@ -168,6 +191,11 @@ function GoalForm({ mode }: { mode: FormMode }) {
   // Household finance READ values come ONLY from the remote read-only
   // source — never useStore(). No local addGoal/updateGoal is ever called.
   const { status, error, refresh } = useFinanceRead();
+  // STEP 16-H2-G2/G3: durable offline fallback for a goal CREATE / UPDATE
+  // whose direct write hit a TRANSPORT failure (offline). Never used for a
+  // server/terminal verdict, and never for delete — that stays direct-only
+  // this step.
+  const pending = usePendingWrites();
 
   const editing = mode.kind === 'edit' ? mode.goal : null;
   const isEdit = mode.kind === 'edit';
@@ -197,6 +225,24 @@ function GoalForm({ mode }: { mode: FormMode }) {
 
   const canSave = name.trim().length > 0 && parseNum(target) > 0;
   const busy = submitting || deleting;
+
+  /**
+   * STEP 16-H2-G2: a durable-enqueue that itself failed — the change is NOT
+   * queued, so the form stays open and the user is told why. Raw coordinator
+   * reasons are never surfaced. Mirrors planned-add / card-add.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '저축 목표를 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
 
   const onKey = (k: string) => setTarget((a) => applyDigit(a, k));
   const openPad = () => {
@@ -236,6 +282,31 @@ function GoalForm({ mode }: { mode: FormMode }) {
         draft,
       });
       if (!res.ok) {
+        // STEP 16-H2-G2: a TRANSPORT failure (offline) -> durable CREATE
+        // queue. The SAME stable client id (goalIdRef, never regenerated) and
+        // the SAME draft go into the PendingWrite, so a later flush replays
+        // the exact request and its 23505 reconcile stays idempotent — no
+        // duplicate-goal accident on a lost response. `draft` never carries
+        // `saved` — the queue payload is identical to the direct-write draft.
+        if (res.transport === true) {
+          const enq = await pending.enqueueGoalCreate({
+            scope: { userId: session.user.id, householdId: activeHousehold.id },
+            entityId: goalIdRef.current,
+            payload: draft,
+          });
+          submittingRef.current = false;
+          setSubmitting(false);
+          if (enq.ok) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+            toast.show('목표를 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+            router.back();
+            return;
+          }
+          toast.show(enqueueFailMessage(enq.reason));
+          return;
+        }
+        // A non-transport terminal failure — existing behaviour: message +
+        // stay. goalIdRef is unchanged so a manual retry reuses the same id.
         submittingRef.current = false;
         setSubmitting(false);
         toast.show(res.message);
@@ -264,6 +335,30 @@ function GoalForm({ mode }: { mode: FormMode }) {
       draft,
     });
     if (!res.ok) {
+      // STEP 16-H2-G3: a TRANSPORT failure (offline) -> durable UPDATE queue
+      // with the FROZEN mount token (`token`, captured once at mount — NEVER
+      // re-read here or on a later retry) verbatim, so the optimistic-
+      // concurrency check still fires as a conflict when the flush runs if
+      // someone else changed the goal meanwhile. `draft` never carries
+      // `saved` — identical to the direct-write payload.
+      if (res.transport === true) {
+        const enq = await pending.enqueueGoalUpdate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: mode.goal.id,
+          payload: draft,
+          expectedUpdatedAt: token,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('목표를 수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        toast.show(enqueueFailMessage(enq.reason));
+        return;
+      }
       submittingRef.current = false;
       setSubmitting(false);
       if (res.reason === 'identity' || res.reason === 'error' || res.reason === 'invalid') {

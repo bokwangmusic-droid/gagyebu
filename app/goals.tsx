@@ -14,6 +14,7 @@ import { useToast } from '@/components/ui/Toast';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, formatShortDate } from '@/lib/format';
 import { goalStats, type GoalPace } from '@/lib/goal';
+import { pendingGoalRowLabel } from '@/lib/pendingGoalLabel';
 import { softDeleteGoal } from '@/services/remoteGoalWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
@@ -38,7 +39,20 @@ export default function GoalsList() {
   const toast = useToast();
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
-  const { status, error, goals, goalMeta, refresh } = useFinanceRead();
+  const {
+    status,
+    error,
+    goals,
+    goalMeta,
+    // STEP 16-H2-G3: the LIST renders `goalManagementRows` (authoritative
+    // server goals + a pending/failed CREATE synthetic row overlaid).
+    // DELIBERATELY separate from `goals` — the "총 모은 금액" total below
+    // stays on the AUTHORITATIVE `goals` (planned-tab precedent: money never
+    // counts a pending synthetic row, which always has `saved: 0` anyway).
+    goalManagementRows,
+    pendingGoalOps,
+    refresh,
+  } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
   const pendingRef = useRef(false);
@@ -161,11 +175,11 @@ export default function GoalsList() {
           <Text style={{ fontFamily: fontFamily.medium, fontSize: 15, color: '#9F1239' }}>원</Text>
         </View>
         <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: '#9F1239', marginTop: 8 }}>
-          {goals.length}개 목표 진행 중
+          {goalManagementRows.length}개 목표 진행 중
         </Text>
       </LinearGradient>
 
-      {goals.length === 0 ? (
+      {goalManagementRows.length === 0 ? (
         <EmptyState
           icon={canCreate ? undefined : 'target'}
           onPress={canCreate ? openAdd : undefined}
@@ -178,10 +192,17 @@ export default function GoalsList() {
           }
         />
       ) : (
-        goals.map((g) => {
+        goalManagementRows.map((g) => {
           const st = goalStats(g, now);
           const dl = st.deadline;
           const rowPending = pendingId === g.id;
+          // STEP 16-H2-G3: a row backed by an un-sent offline goal op (right
+          // now, only a pending/failed CREATE synthetic row — update/delete
+          // are not offline-connected from any screen yet) is read-only: no
+          // tap-to-edit, no deposit/withdraw/delete. The displayed row is
+          // ALWAYS `goalManagementRows`' resolved value (server-authoritative
+          // when one exists) — never a locally-invented one.
+          const pendingOp = pendingGoalOps.get(g.id);
 
           const body = (
             <>
@@ -260,13 +281,16 @@ export default function GoalsList() {
                 borderWidth: 1,
                 borderColor: colors.border,
                 borderRadius: radii.xxl,
-                opacity: rowPending ? 0.5 : 1,
+                // STEP 16-H2-G3 §11/§20 (mirrors card-management): a pending /
+                // failed offline row reads as muted — subtle, not a red
+                // alert. Reuses the SAME app opacity value cards.tsx uses.
+                opacity: rowPending ? 0.5 : pendingOp ? 0.6 : 1,
               }}
             >
               {/* The card body (tap -> edit) and the deposit / withdraw /
                   delete controls are SIBLINGS, not nested — a tap lands on
                   exactly one, so an action never also opens the edit screen. */}
-              {canEdit ? (
+              {canEdit && !pendingOp ? (
                 <Pressable
                   onPress={() => openEdit(g.id)}
                   disabled={rowPending}
@@ -278,7 +302,21 @@ export default function GoalsList() {
                 body
               )}
 
-              {(canMove || canDelete) && (
+              {pendingOp && (
+                <Text
+                  style={{
+                    fontFamily: fontFamily.medium,
+                    fontSize: 11,
+                    lineHeight: 14,
+                    color: pendingOp.failed ? colors.textSub : colors.textMuted,
+                    marginTop: spacing.sm,
+                  }}
+                >
+                  {pendingGoalRowLabel(pendingOp)}
+                </Text>
+              )}
+
+              {(canMove || canDelete) && !pendingOp && (
                 <View
                   style={{
                     flexDirection: 'row',

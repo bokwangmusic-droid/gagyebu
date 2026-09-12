@@ -14,10 +14,12 @@ import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum } from '@/lib/format';
 import { uid } from '@/lib/id';
 import type { GoalMovementMode } from '@/lib/remoteGoalWriteMapping';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { addGoalMovement } from '@/services/remoteGoalWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { Goal } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
@@ -58,7 +60,7 @@ export default function GoalMovementRoute() {
 
 function GoalMovementFormRoute({ goalId, mode }: { goalId: string; mode: GoalMovementMode }) {
   const router = useRouter();
-  const { status, error, goals, refresh } = useFinanceRead();
+  const { status, error, goals, pendingGoalOps, refresh } = useFinanceRead();
   const title = mode === 'deposit' ? '저축하기' : '인출하기';
 
   // STEP 16-G3-B2 §17-21: once the parent goal has resolved, FREEZE it for
@@ -67,6 +69,54 @@ function GoalMovementFormRoute({ goalId, mode }: { goalId: string; mode: GoalMov
   // lose the typed amount — addGoalMovement()'s INSERT then fails its
   // composite FK / reconcile and the user sees that outcome.
   const frozenGoalRef = useRef<Goal | null>(null);
+
+  // STEP 16-H2-G3 §7/§11: a goal with an in-flight / terminal-failed offline
+  // op (create/update/delete OR another queued movement) is read-only — a
+  // goal accepts at most ONE offline change at a time, so never open a
+  // SECOND movement sheet on top of one already queued (the coordinator's
+  // `enqueueGoalMovementCreate` lock guard would refuse it as
+  // `existing-pending` anyway; this just avoids the user reaching that dead
+  // end). Checked BEFORE the freeze below so a first entry is blocked; a
+  // form already frozen for this session stays open. Mirrors
+  // `GoalFormRoute` (app/goal-add.tsx) / `PlannedFormRoute`.
+  if (!frozenGoalRef.current && pendingGoalOps.has(goalId)) {
+    return (
+      <ModalScreen title={title} onClose={() => router.back()} scroll={false}>
+        <View
+          style={{
+            flex: 1,
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingHorizontal: spacing.xl,
+            gap: spacing.md,
+          }}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+            지금은 저축/인출할 수 없어요
+          </Text>
+          <Text
+            style={{
+              fontFamily: fontFamily.regular,
+              fontSize: 13,
+              color: colors.textSub,
+              textAlign: 'center',
+              lineHeight: 19,
+            }}
+          >
+            {pendingGoalOps.get(goalId)?.failed
+              ? '전송에 실패한 변경이 있어요. 저축 목표 화면에서 다시 시도해 주세요.'
+              : '전송 대기 중인 변경이 있어요. 반영된 뒤에 다시 시도할 수 있어요.'}
+          </Text>
+          <Pressable onPress={() => router.back()} hitSlop={8}>
+            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+              목록으로 돌아가기
+            </Text>
+          </Pressable>
+        </View>
+      </ModalScreen>
+    );
+  }
+
   const liveGoal = goals.find((g) => g.id === goalId) ?? null;
   if (!frozenGoalRef.current && liveGoal) frozenGoalRef.current = liveGoal;
   if (frozenGoalRef.current) {
@@ -125,14 +175,28 @@ function GoalMovementForm({ goal, mode }: { goal: Goal; mode: GoalMovementMode }
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, refresh } = useFinanceRead();
+  // STEP 16-H2-G3: durable offline fallback for a deposit/withdraw whose
+  // direct write hit a TRANSPORT failure (offline). Never used for a
+  // server/terminal verdict.
+  const pending = usePendingWrites();
 
   const isWithdraw = mode === 'withdraw';
   const title = isWithdraw ? '인출하기' : '저축하기';
 
   // Client-generated movement id, minted ONCE per sheet mount and reused on
-  // EVERY save retry (STEP 16-G2-D3 §9). A fresh id on retry would let
-  // trg_apply_goal_movement apply the delta twice.
+  // EVERY save retry (STEP 16-G2-D3 §9) — including a durable-queue replay
+  // (the coordinator forwards this SAME id verbatim). A fresh id on retry
+  // would let trg_apply_goal_movement apply the delta twice; the SAME id
+  // makes a lost-response retry hit addGoalMovement's own 23505-by-content
+  // reconcile and stay an idempotent no-op.
   const movementIdRef = useRef(uid('gm'));
+  // FROZEN — the goal's `saved` this sheet opened against (`goal` is itself
+  // already a frozen prop for the life of this mount — see
+  // `GoalMovementFormRoute`). Used ONLY as this queue's own ack-check input
+  // (never sent to the server, which has no optimistic-concurrency
+  // parameter on a movement at all) — STEP 16-H2-G3 §2's "freeze at open,
+  // never re-read on retry" discipline, generalized to movements.
+  const baselineSavedRef = useRef(goal.saved);
 
   const [amount, setAmount] = useState('');
   const [padVisible, setPadVisible] = useState(true);
@@ -147,6 +211,24 @@ function GoalMovementForm({ goal, mode }: { goal: Goal; mode: GoalMovementMode }
     Number.isInteger(magnitude) && magnitude > 0 && !withdrawBlocked && !submitting;
 
   const onKey = (k: string) => setAmount((a) => applyDigit(a, k));
+
+  /**
+   * STEP 16-H2-G3: a durable-enqueue that itself failed — the change is NOT
+   * queued, so the sheet stays open and the user is told why. Raw
+   * coordinator reasons are never surfaced. Mirrors goal-add / planned-add.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '저축 내역을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
 
   const save = async () => {
     if (submittingRef.current || !canSave) return;
@@ -168,6 +250,34 @@ function GoalMovementForm({ goal, mode }: { goal: Goal; mode: GoalMovementMode }
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show(isWithdraw ? '인출했어요' : '저축했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-G3: a TRANSPORT failure (offline) -> durable movement queue.
+    // The SAME stable movement id (movementIdRef, never regenerated) and the
+    // SAME frozen baseline go into the PendingWrite, so a later flush
+    // replays the exact request and its 23505-by-content reconcile stays
+    // idempotent — no duplicate deposit/withdrawal accident on a lost
+    // response.
+    if (res.transport === true) {
+      const enq = await pending.enqueueGoalMovementCreate({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: movementIdRef.current,
+        goalId: goal.id,
+        payload: { mode, amount: magnitude },
+        expectedBaselineSaved: baselineSavedRef.current,
+      });
+      submittingRef.current = false;
+      setSubmitting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show(
+          (isWithdraw ? '인출했어요' : '저축했어요') + ' · 인터넷에 연결되면 자동으로 반영할게요',
+        );
+        router.back();
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
       return;
     }
 

@@ -37,10 +37,12 @@ import { composeFinance } from '@/lib/offlineQueue';
 import {
   buildPendingBudgetOps,
   buildPendingCategoryOps,
+  buildPendingGoalOps,
   buildPendingPlannedOps,
   buildPendingRecurringOps,
   type RecurringRowOpState,
 } from '@/lib/pendingManagementView';
+import type { GoalMovementMode, NewGoalDraft } from '@/lib/remoteGoalWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
@@ -317,6 +319,45 @@ export interface FinanceReadResult {
    */
   pendingRecurringOps: ReadonlyMap<string, RecurringRowOpState>;
 
+  /**
+   * STEP 16-H2-G1 — ENGINE ONLY (no screen reads this yet). The savings-goal
+   * list for a goal-management surface: authoritative server `goals` with a
+   * pending UPDATE overlaid, a synthetic row for a pending/failed CREATE, a
+   * synthetic row for a failed UPDATE whose server row is gone, minus a
+   * not-failed pending DELETE. DELIBERATELY separate from `goals` / `goalMeta`
+   * (§ above) so the goals screen's own read path (and backup /
+   * household-import) never sees an un-sent goal. Equals `goals` when there
+   * are no goal ops.
+   */
+  goalManagementRows: Goal[];
+  /**
+   * goal id -> its pending offline-op state, for a row label / read-only
+   * gate on a goal-management surface. Mirrors `pendingPlannedOps`, with
+   * `attemptedDraft` (the full attempted `NewGoalDraft`) in place of
+   * `attemptedAmount`. `reason` / `attemptedDraft` are only set when `failed`
+   * is true; the displayed row stays authoritative when the server row still
+   * exists.
+   *
+   * STEP 16-H2-G3: a goal's marker can ALSO be backed by a pending/failed
+   * deposit/withdraw movement (`op:'update'` at this generic level — a
+   * movement reuses that bucket, same as a full edit); `movement` is then
+   * set to `{mode, amount}` — DELIBERATELY populated for both the pending
+   * AND the failed case (unlike `attemptedDraft`), so the row label can say
+   * "저축 전송 대기" / "인출 전송 대기" while merely pending, not only on failure.
+   */
+  pendingGoalOps: ReadonlyMap<
+    string,
+    {
+      op: 'create' | 'update' | 'delete';
+      failed: boolean;
+      reason?: WriteConflictReason;
+      queueId?: string;
+      synthetic: boolean;
+      attemptedDraft?: NewGoalDraft;
+      movement?: { mode: GoalMovementMode; amount: number };
+    }
+  >;
+
   /** Manual reload only — no polling, no realtime (STEP 16-G1B §16/§23). */
   refresh: () => Promise<void>;
 }
@@ -355,6 +396,8 @@ const EMPTY_SLICES = {
   pendingPlannedOps: new Map() as FinanceReadResult['pendingPlannedOps'],
   recurringManagementRows: [] as RecurringRule[],
   pendingRecurringOps: new Map() as FinanceReadResult['pendingRecurringOps'],
+  goalManagementRows: [] as Goal[],
+  pendingGoalOps: new Map() as FinanceReadResult['pendingGoalOps'],
 };
 
 export function useFinanceRead(): FinanceReadResult {
@@ -384,6 +427,12 @@ export function useFinanceRead(): FinanceReadResult {
     pendingRecurringOps: providerRecurringOps,
     recurringFailedReasons,
     failedRecurringIds: providerFailedRecurringIds,
+    pendingGoalOps: providerGoalOps,
+    goalFailedReasons,
+    failedGoalIds: providerFailedGoalIds,
+    pendingGoalMovementOps: providerGoalMovementOps,
+    goalMovementFailedReasons,
+    failedGoalMovementIds: providerFailedGoalMovementIds,
     hydrationReady,
   } = usePendingWrites();
 
@@ -411,7 +460,9 @@ export function useFinanceRead(): FinanceReadResult {
         providerBudgetOps.length > 0 ||
         providerCategoryBudgetOps.length > 0 ||
         providerPlannedOps.length > 0 ||
-        providerRecurringOps.length > 0;
+        providerRecurringOps.length > 0 ||
+        providerGoalOps.length > 0 ||
+        providerGoalMovementOps.length > 0;
       const composedResult =
         hydrationReady && anyOps
           ? composeFinance(
@@ -424,6 +475,8 @@ export function useFinanceRead(): FinanceReadResult {
                 ...providerCategoryBudgetOps,
                 ...providerPlannedOps,
                 ...providerRecurringOps,
+                ...providerGoalOps,
+                ...providerGoalMovementOps,
               ],
               providerFailedIds,
               providerFailedCardIds,
@@ -432,6 +485,8 @@ export function useFinanceRead(): FinanceReadResult {
               providerFailedCategoryBudgetIds,
               providerFailedPlannedIds,
               providerFailedRecurringIds,
+              providerFailedGoalIds,
+              providerFailedGoalMovementIds,
             )
           : null;
       const { data: composed, pendingIds, orphanedFailedUpdates } = composedResult ?? {
@@ -527,6 +582,21 @@ export function useFinanceRead(): FinanceReadResult {
             recurringFailedReasons,
           )
         : new Map();
+      // STEP 16-H2-G1: savings-goal display-only surface. `composeFinance`
+      // NEVER folded a goal row into `composed.goals` — it feeds
+      // `goalManagement` only. `goals`/`goalMeta` below stay
+      // `data.goals`/`data.goalMeta` untouched, so the goals screen's own
+      // read path keeps reading authoritative data.
+      const goalManagementRows = composedResult ? composedResult.goalManagement.rows : data.goals;
+      const pendingGoalOps: FinanceReadResult['pendingGoalOps'] = composedResult
+        ? buildPendingGoalOps(
+            composedResult.goalManagement,
+            providerGoalOps,
+            providerGoalMovementOps,
+            goalFailedReasons,
+            goalMovementFailedReasons,
+          )
+        : new Map();
       // Per-visible-transaction offline-op state (STEP 16-H2-B2 §6/§13).
       // `pendingIds` = rows composeFinance kept visible: a CREATE's synthetic
       // row, an UPDATE's overlaid row, and a *failed* DELETE's server row. A
@@ -578,6 +648,8 @@ export function useFinanceRead(): FinanceReadResult {
         pendingPlannedOps,
         recurringManagementRows,
         pendingRecurringOps,
+        goalManagementRows,
+        pendingGoalOps,
         cards: data.cards,
         cardMeta: data.cardMeta,
         budgets: data.budgets,
@@ -651,5 +723,11 @@ export function useFinanceRead(): FinanceReadResult {
     providerRecurringOps,
     recurringFailedReasons,
     providerFailedRecurringIds,
+    providerGoalOps,
+    goalFailedReasons,
+    providerFailedGoalIds,
+    providerGoalMovementOps,
+    goalMovementFailedReasons,
+    providerFailedGoalMovementIds,
   ]);
 }

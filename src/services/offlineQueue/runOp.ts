@@ -70,9 +70,20 @@ import {
   type SoftDeleteRecurringResult,
   type UpdateRecurringResult,
 } from '@/services/remoteRecurringWrite';
+import {
+  addGoalMovement,
+  createGoal,
+  softDeleteGoal,
+  updateGoal,
+  type AddGoalMovementResult,
+  type CreateGoalResult,
+  type SoftDeleteGoalResult,
+  type UpdateGoalResult,
+} from '@/services/remoteGoalWrite';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { PendingWrite } from '@/lib/offlineQueue';
@@ -247,6 +258,40 @@ export interface RunOpDeps {
     expectedUserId: string;
     expectedUpdatedAt: string;
   }) => Promise<SoftDeleteRecurringResult>;
+  /** STEP 16-H2-G1 — injected in tests; default to the real savings-goal
+   *  services. CREATE / UPDATE / DELETE are separate functions (like
+   *  card/category/planned/recurring). `addGoalMovement` is OUT OF SCOPE —
+   *  never injected or called here. */
+  createGoal?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    draft: NewGoalDraft;
+  }) => Promise<CreateGoalResult>;
+  updateGoal?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+    draft: NewGoalDraft;
+  }) => Promise<UpdateGoalResult>;
+  softDeleteGoal?: (args: {
+    id: string;
+    householdId: string;
+    expectedUserId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<SoftDeleteGoalResult>;
+  /** STEP 16-H2-G3 — injected in tests; default to the real
+   *  `addGoalMovement`. Idempotent BY `movementId` (the service's own
+   *  23505-by-content reconcile) — this adapter forwards `movementId`
+   *  verbatim from `op.entityId` on every replay, NEVER a fresh id. */
+  addGoalMovement?: (args: {
+    movementId: string;
+    householdId: string;
+    goalId: string;
+    expectedUserId: string;
+    draft: NewGoalMovementDraft;
+  }) => Promise<AddGoalMovementResult>;
 }
 
 const isSetLike = (v: unknown): boolean =>
@@ -263,7 +308,9 @@ export async function runPendingWrite(
     op.entity !== 'budget' &&
     op.entity !== 'categoryBudget' &&
     op.entity !== 'planned' &&
-    op.entity !== 'recurring'
+    op.entity !== 'recurring' &&
+    op.entity !== 'goal' &&
+    op.entity !== 'goalMovement'
   ) {
     return { kind: 'terminal', message: `unsupported entity: ${(op as { entity: string }).entity}` };
   }
@@ -354,6 +401,92 @@ export async function runPendingWrite(
       if (res.ok) return { kind: 'success' }; // already-soft-deleted is ok:true (idempotent)
       if (res.transport) return { kind: 'transport', message: res.message };
       return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
+    // ---- SAVINGS GOAL (STEP 16-H2-G1) ----
+    if (op.entity === 'goal') {
+      if (op.op === 'create') {
+        const create = deps.createGoal ?? createGoal;
+        const res = await create({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          draft: op.payload,
+        });
+        // A 23505 on a lost-response replay where the server row is the SAME
+        // create is the service's own idempotent `ok: true` — honoured here.
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        // GoalWriteReason adds 'invalid' (structural) on top of the shared
+        // WriteConflictReason — flatten it to a reason-less terminal, same as
+        // card/category/planned/recurring; a same-id-different-payload race
+        // is `conflict`.
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      if (op.op === 'update') {
+        const update = deps.updateGoal ?? updateGoal;
+        const res = await update({
+          id: op.entityId,
+          householdId: op.scope.householdId,
+          expectedUserId: op.scope.userId,
+          expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+          draft: op.payload,
+        });
+        if (res.ok) return { kind: 'success' };
+        if (res.transport) return { kind: 'transport', message: res.message };
+        return {
+          kind: 'terminal',
+          ...(res.reason !== 'invalid' ? { reason: res.reason } : {}),
+          message: res.message,
+        };
+      }
+      // goal delete
+      const del = deps.softDeleteGoal ?? softDeleteGoal;
+      const res = await del({
+        id: op.entityId,
+        householdId: op.scope.householdId,
+        expectedUserId: op.scope.userId,
+        expectedUpdatedAt: op.expectedUpdatedAt, // FROZEN — never refreshed
+      });
+      if (res.ok) return { kind: 'success' }; // already-soft-deleted is ok:true (idempotent)
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // SoftDeleteGoalResult's reason is already Exclude<…, 'invalid'|'deleted'>
+      // — every value is in WriteConflictReason.
+      return { kind: 'terminal', reason: res.reason, message: res.message };
+    }
+
+    // ---- GOAL MOVEMENT — deposit/withdraw (STEP 16-H2-G3) ----
+    if (op.entity === 'goalMovement') {
+      // ALWAYS op 'create' (type + validator). `movementId` is `op.entityId`
+      // — forwarded VERBATIM on every replay, NEVER a fresh id: a fresh id
+      // would let the DB trigger apply the delta twice. A lost-response
+      // retry with the SAME id hits `addGoalMovement`'s own 23505-by-content
+      // reconcile and returns `ok:true` WITHOUT re-inserting / re-triggering
+      // — that is what actually makes this replay safe, not anything here.
+      const add = deps.addGoalMovement ?? addGoalMovement;
+      const res = await add({
+        movementId: op.entityId,
+        householdId: op.scope.householdId,
+        goalId: op.goalId,
+        expectedUserId: op.scope.userId,
+        draft: op.payload,
+      });
+      if (res.ok) return { kind: 'success' };
+      if (res.transport) return { kind: 'transport', message: res.message };
+      // AddGoalMovementResult's reason adds 'invalid' (structural) and
+      // 'insufficient' (over-withdraw, discovered on a REPLAY when the
+      // CURRENT saved no longer covers it) on top of the shared
+      // WriteConflictReason — neither is retryable, so both flatten to a
+      // reason-less terminal (mirrors 'invalid' everywhere else in this file).
+      return {
+        kind: 'terminal',
+        ...(res.reason !== 'invalid' && res.reason !== 'insufficient' ? { reason: res.reason } : {}),
+        message: res.message,
+      };
     }
 
     // ---- PLANNED EXPENSE (STEP 16-H2-E1 §6/§7) ----

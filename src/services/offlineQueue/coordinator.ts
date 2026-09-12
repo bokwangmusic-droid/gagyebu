@@ -35,6 +35,10 @@ import {
   makePendingCategoryCreate,
   makePendingCategoryDelete,
   makePendingCategoryUpdate,
+  makePendingGoalCreate,
+  makePendingGoalDelete,
+  makePendingGoalMovementCreate,
+  makePendingGoalUpdate,
   makePendingPlannedCreate,
   makePendingPlannedDelete,
   makePendingPlannedUpdate,
@@ -49,6 +53,7 @@ import {
   serverBudgetConfirmsUpdate,
   serverCardConfirmsUpdate,
   serverCategoryConfirmsUpdate,
+  serverGoalConfirmsUpdate,
   serverPlannedConfirmsUpdate,
   serverRecurringConfirmsActive,
   serverRecurringConfirmsUpdate,
@@ -61,6 +66,7 @@ import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
@@ -73,7 +79,7 @@ import {
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
-import type { CreditCard, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type { CreditCard, Goal, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 /** STEP 16-H2-C2-A1 §21 — internal state is keyed by `${entity}:${entityId}`,
  *  NOT bare `entityId`, so a card op and a transaction op that happen to
@@ -132,6 +138,12 @@ export interface CoordinatorState {
    *  (`opByEntity` reports the bare `'update'` op kind; the discriminating
    *  `updateKind` lives on the raw `PendingWrite` in `scopeOps`). */
   recurring: CoordinatorEntityState;
+  /** STEP 16-H2-G1 — the SAVINGS-GOAL view (bare goal-id keys). */
+  goal: CoordinatorEntityState;
+  /** STEP 16-H2-G3 — the GOAL-MOVEMENT view (bare MOVEMENT-id keys — a
+   *  movement's natural key is its OWN `gm-…` id, NOT the goal id it
+   *  targets; `goalId` lives on the raw `PendingWrite` only). */
+  goalMovement: CoordinatorEntityState;
   /** Total pending ops across ALL entities in the current scope (§28 — the
    *  future household-import guard must see cards + categories + budgets
    *  + composite deletes too). */
@@ -203,6 +215,19 @@ export interface CoordinatorDeps {
    * written by this coordinator.
    */
   getServerRecurring: () => ReadonlyMap<string, RecurringRule>;
+  /**
+   * Live getter — the trusted server snapshot's ACTIVE savings goals, keyed
+   * by id. STEP 16-H2-G1: goal CREATE/UPDATE ack = row present AND its
+   * fields SEMANTICALLY match the queued draft; DELETE ack = id absent (the
+   * finance snapshot already excludes soft-deleted goals). STEP 16-H2-G3
+   * reuses this SAME getter (no separate one) for a goal-MOVEMENT ack: since
+   * individual `goal_movements` rows are never fetched into the finance
+   * snapshot (only a row count — see src/services/remoteFinance.ts), a
+   * movement's ack instead checks this row's `saved` against the movement's
+   * frozen baseline + delta. The coordinator never creates a local goal
+   * truth of its own.
+   */
+  getServerGoals: () => ReadonlyMap<string, Goal>;
   /** Trigger one authoritative refresh (B1). Resolves when it has committed. */
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
@@ -227,6 +252,10 @@ export interface CoordinatorDeps {
   updateRecurring?: RunOpDeps['updateRecurring'];
   setRecurringActive?: RunOpDeps['setRecurringActive'];
   softDeleteRecurring?: RunOpDeps['softDeleteRecurring'];
+  createGoal?: RunOpDeps['createGoal'];
+  updateGoal?: RunOpDeps['updateGoal'];
+  softDeleteGoal?: RunOpDeps['softDeleteGoal'];
+  addGoalMovement?: RunOpDeps['addGoalMovement'];
   /** Test injection — defaults to `setTimeout` / `clearTimeout`. */
   schedule?: (fn: () => void, ms: number) => Timer;
   cancel?: (t: Timer) => void;
@@ -385,6 +414,46 @@ export interface PendingWriteCoordinator {
     entityId: string;
     expectedUpdatedAt: string;
   }): Promise<EnqueueOutcome>;
+  /** STEP 16-H2-G1 — savings-goal ops. `entityId` is the client-stable
+   *  `goal-…` id. `expectedUpdatedAt` is FROZEN by the caller from the
+   *  `goalMeta.updatedAt` the edit screen opened against; stored verbatim,
+   *  NEVER re-read. `saved` / deposit-withdraw movements are OUT OF SCOPE —
+   *  no enqueue method exists for them. ENGINE ONLY — no UI call site
+   *  enqueues these yet. */
+  enqueueGoalCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewGoalDraft;
+  }): Promise<EnqueueOutcome>;
+  enqueueGoalUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewGoalDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  enqueueGoalDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome>;
+  /**
+   * STEP 16-H2-G3 — a deposit/withdraw against an EXISTING goal. `entityId`
+   * is the client-stable `gm-…` movement id (its OWN identity — NOT the
+   * goal id); `goalId` names the target. `expectedBaselineSaved` is FROZEN
+   * by the caller (the goal's `saved` when the movement sheet resolved it)
+   * and stored verbatim — this queue's own ack-check input, never a server
+   * token. Refused with `existing-pending` when ANY other op (create /
+   * update / delete / another movement) is already queued for the SAME
+   * goalId — a goal accepts at most ONE in-flight offline change at a time
+   * (§7 "the row is locked"); no cross-op compaction, no stacked movements.
+   */
+  enqueueGoalMovementCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    goalId: string;
+    payload: NewGoalMovementDraft;
+    expectedBaselineSaved: number;
+  }): Promise<EnqueueOutcome>;
   /**
    * STEP 16-H2-C2-B2 conflict-UX — permanently DROP one queued record by its
    * `queueId` ("변경 버리기" for a terminal-failed UPDATE). This is NOT a
@@ -480,6 +549,10 @@ export function createPendingWriteCoordinator(
         ...(deps.updateRecurring ? { updateRecurring: deps.updateRecurring } : {}),
         ...(deps.setRecurringActive ? { setRecurringActive: deps.setRecurringActive } : {}),
         ...(deps.softDeleteRecurring ? { softDeleteRecurring: deps.softDeleteRecurring } : {}),
+        ...(deps.createGoal ? { createGoal: deps.createGoal } : {}),
+        ...(deps.updateGoal ? { updateGoal: deps.updateGoal } : {}),
+        ...(deps.softDeleteGoal ? { softDeleteGoal: deps.softDeleteGoal } : {}),
+        ...(deps.addGoalMovement ? { addGoalMovement: deps.addGoalMovement } : {}),
       }),
     onPass: async (result) => {
       if (disposed) return;
@@ -605,6 +678,7 @@ export function createPendingWriteCoordinator(
         const serverBudgets = deps.getServerBudgets();
         const serverPlanned = deps.getServerPlanned();
         const serverRecurring = deps.getServerRecurring();
+        const serverGoals = deps.getServerGoals();
         const knownCards = deps.getKnownCardIds();
         const confirmed: string[] = []; // queueIds the server has actually applied
         let unconfirmed = 0;
@@ -710,6 +784,50 @@ export function createPendingWriteCoordinator(
               } else {
                 ok = false;
               }
+            }
+          } else if (entity === 'goal') {
+            // STEP 16-H2-G1: DELETE = id absent (the finance snapshot's
+            // `goals` already excludes soft-deleted rows). CREATE + UPDATE:
+            // row present AND its fields SEMANTICALLY match the queued
+            // draft — `saved`/movements are never part of this comparison, and
+            // `updated_at` changing alone (e.g. a deposit/withdrawal bumping
+            // it) is never sufficient on its own. A same-id-different-payload
+            // row (someone else's concurrent create/edit) is NOT an ack — it
+            // drops back to the queue and replays, whose reconcile inside
+            // `createGoal`/`updateGoal` classifies it as `conflict`.
+            if (op === 'delete') {
+              ok = !serverGoals.has(entityId);
+            } else {
+              const row = serverGoals.get(entityId);
+              ok =
+                !!row &&
+                (rec?.op === 'create' || rec?.op === 'update') &&
+                rec.entity === 'goal' &&
+                serverGoalConfirmsUpdate(row, rec.payload);
+            }
+          } else if (entity === 'goalMovement') {
+            // STEP 16-H2-G3: there is no per-movement server read available
+            // (only the goal's aggregate `saved` is fetched — see
+            // `getServerGoals` above), so a movement's ack is a STRICT
+            // content check on that aggregate: the target goal is present
+            // AND its CURRENT `saved` equals the movement's FROZEN
+            // `expectedBaselineSaved` plus its signed delta exactly — never
+            // "changed since enqueue" alone, so a coincidental UNRELATED
+            // change (or someone else's DIFFERENT-amount movement) can never
+            // be mistaken for this one having landed, which would durably
+            // drop the record before it ever actually applied. A false
+            // NEGATIVE (another device's movement lands first, or the goal
+            // is briefly unconfirmed) is always SAFE here — it just causes
+            // one more replay, and a replay of the SAME `entityId`
+            // (movementId) is idempotent by construction (addGoalMovement's
+            // own 23505-by-content reconcile) — so it is never "not-yet-safe"
+            // to keep retrying, only "not yet confirmed".
+            const row = serverGoals.get(rec?.entity === 'goalMovement' ? rec.goalId : '');
+            if (row && rec && rec.entity === 'goalMovement') {
+              const delta = rec.payload.mode === 'deposit' ? rec.payload.amount : -rec.payload.amount;
+              ok = row.saved === rec.expectedBaselineSaved + delta;
+            } else {
+              ok = false;
             }
           } else if (op === 'create') {
             ok = serverRows.has(entityId);
@@ -1130,6 +1248,84 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  function enqueueGoalCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewGoalDraft;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingGoalCreate({ scope: args.scope, entityId: args.entityId, payload: args.payload }),
+    );
+  }
+
+  function enqueueGoalUpdate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewGoalDraft;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingGoalUpdate({
+        scope: args.scope,
+        entityId: args.entityId,
+        payload: args.payload,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueGoalDelete(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }): Promise<EnqueueOutcome> {
+    return enqueue(
+      makePendingGoalDelete({
+        scope: args.scope,
+        entityId: args.entityId,
+        expectedUpdatedAt: args.expectedUpdatedAt, // FROZEN — never refreshed
+      }),
+    );
+  }
+
+  function enqueueGoalMovementCreate(args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    goalId: string;
+    payload: NewGoalMovementDraft;
+    expectedBaselineSaved: number;
+  }): Promise<EnqueueOutcome> {
+    // STEP 16-H2-G3 §7 — "the row is locked": refuse while ANY other op
+    // (create / update / delete / another movement) already targets this
+    // SAME goalId, so at most one offline change is ever in flight per goal.
+    // Mirrors `enqueueCategoryBudgetDelete`'s clash guard. An existing
+    // movement for the SAME `entityId` (a genuine retry of this exact sheet)
+    // is intentionally NOT caught here — it falls through to
+    // `enqueuePendingWrite`, whose dedup preserves the idempotent-duplicate
+    // (identical goalId/payload/baseline) and differing-request
+    // (`existing-pending`) semantics.
+    const clash = controller
+      .read()
+      .some(
+        (r) =>
+          r.scope.userId === args.scope.userId &&
+          r.scope.householdId === args.scope.householdId &&
+          r.entityId !== args.entityId &&
+          ((r.entity === 'goal' && r.entityId === args.goalId) ||
+            (r.entity === 'goalMovement' && r.goalId === args.goalId)),
+      );
+    if (clash) return Promise.resolve({ ok: false, reason: 'existing-pending' });
+    return enqueue(
+      makePendingGoalMovementCreate({
+        scope: args.scope,
+        entityId: args.entityId,
+        goalId: args.goalId,
+        payload: args.payload,
+        expectedBaselineSaved: args.expectedBaselineSaved, // FROZEN — never refreshed
+      }),
+    );
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -1219,6 +1415,8 @@ export function createPendingWriteCoordinator(
     const categoryBudget = entityStateOf('categoryBudget', allScopeOps);
     const planned = entityStateOf('planned', allScopeOps);
     const recurring = entityStateOf('recurring', allScopeOps);
+    const goal = entityStateOf('goal', allScopeOps);
+    const goalMovement = entityStateOf('goalMovement', allScopeOps);
     return {
       hydration,
       scopeOps: txn.scopeOps,
@@ -1232,6 +1430,8 @@ export function createPendingWriteCoordinator(
       categoryBudget,
       planned,
       recurring,
+      goal,
+      goalMovement,
       pendingCount: allScopeOps.length,
       lastError,
       flushing: flusher._debug().flushing,
@@ -1261,6 +1461,10 @@ export function createPendingWriteCoordinator(
     enqueueRecurringUpdate,
     enqueueRecurringActiveUpdate,
     enqueueRecurringDelete,
+    enqueueGoalCreate,
+    enqueueGoalUpdate,
+    enqueueGoalDelete,
+    enqueueGoalMovementCreate,
     discardPending,
     requestFlush,
     dispose,

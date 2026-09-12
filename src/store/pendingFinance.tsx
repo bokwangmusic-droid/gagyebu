@@ -31,6 +31,7 @@ import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
+import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import {
@@ -45,7 +46,7 @@ import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
 import { useRemoteFinance } from '@/store/remoteFinance';
-import type { CreditCard, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type { CreditCard, Goal, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_OPS: PendingWrite[] = [];
@@ -228,6 +229,46 @@ interface PendingFinanceValue {
     entityId: string;
     expectedUpdatedAt: string;
   }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-G1 — current-scope SAVINGS-GOAL ops (create/update/delete,
+   *  incl. terminal-failed), bare goal-id keys. `saved` / deposit-withdraw
+   *  movements are OUT OF SCOPE — no enqueue method exists for them. ENGINE
+   *  ONLY — no UI call site enqueues these yet. */
+  pendingGoalOps: PendingWrite[];
+  goalOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  goalFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingGoalIds: ReadonlySet<string>;
+  failedGoalIds: ReadonlySet<string>;
+  enqueueGoalCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewGoalDraft;
+  }) => Promise<EnqueueOutcome>;
+  enqueueGoalUpdate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    payload: NewGoalDraft;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  enqueueGoalDelete: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    expectedUpdatedAt: string;
+  }) => Promise<EnqueueOutcome>;
+  /** STEP 16-H2-G3 — current-scope GOAL-MOVEMENT ops (deposit/withdraw,
+   *  incl. terminal-failed), bare MOVEMENT-id keys (the ledger row's OWN
+   *  id — NOT the goal id; that lives on the raw `PendingWrite.goalId`). */
+  pendingGoalMovementOps: PendingWrite[];
+  goalMovementOpByEntity: ReadonlyMap<string, PendingOpKind>;
+  goalMovementFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>;
+  pendingGoalMovementIds: ReadonlySet<string>;
+  failedGoalMovementIds: ReadonlySet<string>;
+  enqueueGoalMovementCreate: (args: {
+    scope: CoordinatorScope;
+    entityId: string;
+    goalId: string;
+    payload: NewGoalMovementDraft;
+    expectedBaselineSaved: number;
+  }) => Promise<EnqueueOutcome>;
   /** STEP 16-H2-C2-B2 conflict-UX — drop ONE queued record by `queueId`
    *  ("변경 버리기"). NOT a server delete; scope-guarded; awaits persistence. */
   discardPending: (queueId: string) => Promise<DiscardOutcome>;
@@ -318,6 +359,13 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
   const serverRecurringRef = useRef<ReadonlyMap<string, RecurringRule>>(serverRecurring);
   serverRecurringRef.current = serverRecurring;
 
+  const serverGoals = useMemo<ReadonlyMap<string, Goal>>(
+    () => new Map((rf.data?.goals ?? []).map((g) => [g.id, g])),
+    [rf.data?.goals],
+  );
+  const serverGoalsRef = useRef<ReadonlyMap<string, Goal>>(serverGoals);
+  serverGoalsRef.current = serverGoals;
+
   const [, forceRender] = useReducer((x: number) => x + 1, 0);
 
   const coordRef = useRef<ReturnType<typeof createPendingWriteCoordinator> | null>(null);
@@ -332,6 +380,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getServerBudgets: () => serverBudgetsRef.current,
       getServerPlanned: () => serverPlannedRef.current,
       getServerRecurring: () => serverRecurringRef.current,
+      getServerGoals: () => serverGoalsRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
     });
@@ -429,6 +478,22 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       pendingRecurringIds:
         state.recurring.pendingIds.size > 0 ? state.recurring.pendingIds : EMPTY_SET,
       failedRecurringIds: state.recurring.failedIds.size > 0 ? state.recurring.failedIds : EMPTY_SET,
+      pendingGoalOps: state.goal.scopeOps.length > 0 ? state.goal.scopeOps : EMPTY_OPS,
+      goalOpByEntity: state.goal.opByEntity.size > 0 ? state.goal.opByEntity : EMPTY_KIND_MAP,
+      goalFailedReasons:
+        state.goal.failedReasons.size > 0 ? state.goal.failedReasons : EMPTY_REASON_MAP,
+      pendingGoalIds: state.goal.pendingIds.size > 0 ? state.goal.pendingIds : EMPTY_SET,
+      failedGoalIds: state.goal.failedIds.size > 0 ? state.goal.failedIds : EMPTY_SET,
+      pendingGoalMovementOps:
+        state.goalMovement.scopeOps.length > 0 ? state.goalMovement.scopeOps : EMPTY_OPS,
+      goalMovementOpByEntity:
+        state.goalMovement.opByEntity.size > 0 ? state.goalMovement.opByEntity : EMPTY_KIND_MAP,
+      goalMovementFailedReasons:
+        state.goalMovement.failedReasons.size > 0 ? state.goalMovement.failedReasons : EMPTY_REASON_MAP,
+      pendingGoalMovementIds:
+        state.goalMovement.pendingIds.size > 0 ? state.goalMovement.pendingIds : EMPTY_SET,
+      failedGoalMovementIds:
+        state.goalMovement.failedIds.size > 0 ? state.goalMovement.failedIds : EMPTY_SET,
       pendingCount: state.pendingCount,
       lastError: state.lastError,
       enqueueTransactionCreate: coord.enqueueTransactionCreate,
@@ -451,6 +516,10 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueRecurringUpdate: coord.enqueueRecurringUpdate,
       enqueueRecurringActiveUpdate: coord.enqueueRecurringActiveUpdate,
       enqueueRecurringDelete: coord.enqueueRecurringDelete,
+      enqueueGoalCreate: coord.enqueueGoalCreate,
+      enqueueGoalUpdate: coord.enqueueGoalUpdate,
+      enqueueGoalDelete: coord.enqueueGoalDelete,
+      enqueueGoalMovementCreate: coord.enqueueGoalMovementCreate,
       discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
     }),

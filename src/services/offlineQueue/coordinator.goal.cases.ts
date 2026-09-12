@@ -1,26 +1,28 @@
 /**
- * Static verification for the Offline Write Queue coordinator's PLANNED-EXPENSE
- * wiring — STEP 16-H2-E1. A small, self-contained harness (separate from
- * coordinator.cases.ts) exercising `createPlanned`/`updatePlanned`/
- * `softDeletePlanned` dispatch, FROZEN `expectedUpdatedAt` forwarding, the
- * CREATE/UPDATE/DELETE ack reconcile against `getServerPlanned()`, the
- * "authoritative server row is never overwritten by a stale local draft"
- * rule, transport-vs-terminal normalization, discard, and scope safety. No
- * React, no Supabase. ENGINE ONLY — no UI call site is exercised.
+ * Static verification for the Offline Write Queue coordinator's
+ * SAVINGS-GOAL wiring — STEP 16-H2-G1. A small, self-contained harness
+ * (separate from coordinator.cases.ts) exercising `createGoal`/`updateGoal`/
+ * `softDeleteGoal` dispatch, FROZEN `expectedUpdatedAt` forwarding, the
+ * CREATE/UPDATE/DELETE ack reconcile against `getServerGoals()`, the
+ * "authoritative server row (incl. `saved`) is never overwritten by a stale
+ * local draft" rule, transport-vs-terminal normalization, discard, and scope
+ * safety. `addGoalMovement` (deposit/withdraw) is OUT OF SCOPE and is never
+ * exercised here. No React, no Supabase. ENGINE ONLY — no UI call site is
+ * exercised.
  */
-import { QUEUE_SCHEMA_VERSION, type PendingPlannedCreate } from '@/lib/offlineQueue';
-import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
+import { QUEUE_SCHEMA_VERSION, type PendingGoalCreate } from '@/lib/offlineQueue';
+import type { NewGoalDraft } from '@/lib/remoteGoalWriteMapping';
 import type {
-  CreatePlannedResult,
-  SoftDeletePlannedResult,
-  UpdatePlannedResult,
-} from '@/services/remotePlannedWrite';
+  CreateGoalResult,
+  SoftDeleteGoalResult,
+  UpdateGoalResult,
+} from '@/services/remoteGoalWrite';
 import {
   createPendingWriteCoordinator,
   type CoordinatorScope,
 } from '@/services/offlineQueue/coordinator';
 import type { QueueStorage } from '@/services/offlineQueue/persistence';
-import type { PlannedExpense } from '@/store/types';
+import type { Goal } from '@/store/types';
 
 export interface CaseResult {
   name: string;
@@ -35,24 +37,21 @@ const settle = async (n = 6) => {
   for (let i = 0; i < n; i++) await new Promise<void>((r) => setTimeout(r, 0));
 };
 
-const pd = (over: Partial<NewPlannedExpenseDraft> = {}): NewPlannedExpenseDraft => ({
-  name: '월세',
-  amount: 100000,
-  category: 'housing',
-  date: '2026-10-01',
-  memo: '',
-  type: 'expense',
+const gd = (over: Partial<NewGoalDraft> = {}): NewGoalDraft => ({
+  name: '내 집 마련',
+  target: 5000000,
+  deadline: '2027-01-01',
+  icon: '🏠',
   ...over,
 });
 
-const srvRow = (id: string, over: Partial<PlannedExpense> = {}): PlannedExpense => ({
+const srvRow = (id: string, over: Partial<Goal> = {}): Goal => ({
   id,
-  name: '월세',
-  amount: 100000,
-  category: 'housing',
-  date: '2026-10-01',
-  memo: '',
-  type: 'expense',
+  name: '내 집 마련',
+  target: 5000000,
+  saved: 0,
+  deadline: '2027-01-01',
+  icon: '🏠',
   createdAt: '2026-09-10T09:00:00.000Z',
   ...over,
 });
@@ -77,30 +76,30 @@ function memStorage(seed?: string) {
   };
 }
 
-type CreateArgs = { id: string; householdId: string; expectedUserId: string; draft: NewPlannedExpenseDraft };
+type CreateArgs = { id: string; householdId: string; expectedUserId: string; draft: NewGoalDraft };
 type UpdateArgs = CreateArgs & { expectedUpdatedAt: string };
 type DeleteArgs = { id: string; householdId: string; expectedUserId: string; expectedUpdatedAt: string };
 
 interface Harness {
   coord: ReturnType<typeof createPendingWriteCoordinator>;
-  server: Map<string, PlannedExpense>;
+  server: Map<string, Goal>;
   storage: ReturnType<typeof memStorage>;
   createLog: CreateArgs[];
   updateLog: UpdateArgs[];
   deleteLog: DeleteArgs[];
   timers: { id: number; fn: () => void; ms: number; cancelled: boolean }[];
   setScope: (s: CoordinatorScope | null) => void;
-  setCreate: (f: (a: CreateArgs) => Promise<CreatePlannedResult>) => void;
-  setUpdate: (f: (a: UpdateArgs) => Promise<UpdatePlannedResult>) => void;
-  setDelete: (f: (a: DeleteArgs) => Promise<SoftDeletePlannedResult>) => void;
-  serverPut: (row: PlannedExpense) => void;
+  setCreate: (f: (a: CreateArgs) => Promise<CreateGoalResult>) => void;
+  setUpdate: (f: (a: UpdateArgs) => Promise<UpdateGoalResult>) => void;
+  setDelete: (f: (a: DeleteArgs) => Promise<SoftDeleteGoalResult>) => void;
+  serverPut: (row: Goal) => void;
   serverDelete: (id: string) => void;
   runTimers: () => void;
   refreshes: () => number;
 }
 
 function makeHarness(opts?: { seed?: string }): Harness {
-  const server = new Map<string, PlannedExpense>();
+  const server = new Map<string, Goal>();
   const storage = memStorage(opts?.seed);
   let scope: CoordinatorScope | null = A;
   let refreshCount = 0;
@@ -110,23 +109,26 @@ function makeHarness(opts?: { seed?: string }): Harness {
   const updateLog: UpdateArgs[] = [];
   const deleteLog: DeleteArgs[] = [];
 
-  // default create: server accepts + snapshot reflects it
-  let createImpl = async (a: CreateArgs): Promise<CreatePlannedResult> => {
+  // default create: server accepts + snapshot reflects it. `saved` is NEVER
+  // set by a CREATE — the DB default (0) applies, mirroring the real
+  // `createGoal()` (`saved` is never in the insert row).
+  let createImpl = async (a: CreateArgs): Promise<CreateGoalResult> => {
     createLog.push(a);
     await new Promise<void>((r) => setTimeout(r, 0));
     server.set(a.id, {
       id: a.id,
       name: a.draft.name.trim(),
-      amount: a.draft.amount,
-      category: a.draft.category,
-      date: a.draft.date,
-      memo: a.draft.memo.trim(),
-      type: a.draft.type,
+      target: a.draft.target,
+      saved: 0,
+      deadline: a.draft.deadline,
+      icon: a.draft.icon,
       createdAt: '2026-09-11T00:00:00.000Z',
     });
     return { ok: true, id: a.id };
   };
-  let updateImpl = async (a: UpdateArgs): Promise<UpdatePlannedResult> => {
+  // default update: `saved` is NEVER touched — mirrors the real `updateGoal()`
+  // (the UPDATE grant on `goals` doesn't even include `saved`).
+  let updateImpl = async (a: UpdateArgs): Promise<UpdateGoalResult> => {
     updateLog.push(a);
     await new Promise<void>((r) => setTimeout(r, 0));
     const prev = server.get(a.id);
@@ -134,15 +136,14 @@ function makeHarness(opts?: { seed?: string }): Harness {
       server.set(a.id, {
         ...prev,
         name: a.draft.name.trim(),
-        amount: a.draft.amount,
-        category: a.draft.category,
-        date: a.draft.date,
-        memo: a.draft.memo.trim(),
+        target: a.draft.target,
+        deadline: a.draft.deadline,
+        icon: a.draft.icon,
       });
     }
     return { ok: true, updatedAt: '2026-09-11T00:00:00.000Z' };
   };
-  let deleteImpl = async (a: DeleteArgs): Promise<SoftDeletePlannedResult> => {
+  let deleteImpl = async (a: DeleteArgs): Promise<SoftDeleteGoalResult> => {
     deleteLog.push(a);
     await new Promise<void>((r) => setTimeout(r, 0));
     server.delete(a.id);
@@ -158,17 +159,17 @@ function makeHarness(opts?: { seed?: string }): Harness {
     getServerCards: () => new Map(),
     getServerCategories: () => new Map(),
     getServerBudgets: () => new Map(),
-    getServerPlanned: () => server,
+    getServerPlanned: () => new Map(),
     getServerRecurring: () => new Map(),
-    getServerGoals: () => new Map(),
+    getServerGoals: () => server,
     requestRefresh: () => {
       refreshCount += 1;
       return Promise.resolve();
     },
     onChange: () => {},
-    createPlanned: (a) => createImpl(a as CreateArgs),
-    updatePlanned: (a) => updateImpl(a as UpdateArgs),
-    softDeletePlanned: (a) => deleteImpl(a as DeleteArgs),
+    createGoal: (a) => createImpl(a as CreateArgs),
+    updateGoal: (a) => updateImpl(a as UpdateArgs),
+    softDeleteGoal: (a) => deleteImpl(a as DeleteArgs),
     schedule: (fn, ms) => {
       const id = ++timerSeq;
       timers.push({ id, fn, ms, cancelled: false });
@@ -217,30 +218,30 @@ function makeHarness(opts?: { seed?: string }): Harness {
   };
 }
 
-const TRANSPORT_C: CreatePlannedResult = { ok: false, reason: 'error', message: 'net', transport: true };
-const TRANSPORT_U: UpdatePlannedResult = { ok: false, reason: 'error', message: 'net', transport: true };
-const TRANSPORT_D: SoftDeletePlannedResult = { ok: false, reason: 'error', message: 'net', transport: true };
-const CONFLICT_C: CreatePlannedResult = { ok: false, reason: 'conflict', message: '충돌' };
-const INVALID_C: CreatePlannedResult = { ok: false, reason: 'invalid', message: '확인해 주세요' };
-const CONFLICT_U: UpdatePlannedResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' };
-const GONE_U: UpdatePlannedResult = { ok: false, reason: 'gone', message: '삭제된 항목' };
-const CONFLICT_D: SoftDeletePlannedResult = { ok: false, reason: 'conflict', message: '이미 변경됨' };
+const TRANSPORT_C: CreateGoalResult = { ok: false, reason: 'error', message: 'net', transport: true };
+const TRANSPORT_U: UpdateGoalResult = { ok: false, reason: 'error', message: 'net', transport: true };
+const TRANSPORT_D: SoftDeleteGoalResult = { ok: false, reason: 'error', message: 'net', transport: true };
+const CONFLICT_C: CreateGoalResult = { ok: false, reason: 'conflict', message: '충돌' };
+const INVALID_C: CreateGoalResult = { ok: false, reason: 'invalid', message: '확인해 주세요' };
+const CONFLICT_U: UpdateGoalResult = { ok: false, reason: 'conflict', message: '다른 곳에서 변경됨' };
+const GONE_U: UpdateGoalResult = { ok: false, reason: 'gone', message: '삭제된 항목' };
+const CONFLICT_D: SoftDeleteGoalResult = { ok: false, reason: 'conflict', message: '이미 변경됨' };
 
-const seedWith = (recs: PendingPlannedCreate[]) => JSON.stringify(recs);
-const rec = (over: Partial<PendingPlannedCreate> = {}): PendingPlannedCreate => ({
+const seedWith = (recs: PendingGoalCreate[]) => JSON.stringify(recs);
+const rec = (over: Partial<PendingGoalCreate> = {}): PendingGoalCreate => ({
   queueId: 'q-1',
   schemaVersion: QUEUE_SCHEMA_VERSION,
   scope: A,
-  entity: 'planned',
+  entity: 'goal',
   op: 'create',
-  entityId: 'p-1',
-  payload: pd(),
+  entityId: 'goal-1',
+  payload: gd(),
   enqueuedAt: '2026-09-10T09:00:00.000Z',
   attemptCount: 0,
   ...over,
 });
 
-export async function runCoordinatorPlannedCases(): Promise<{
+export async function runCoordinatorGoalCases(): Promise<{
   results: CaseResult[];
   passed: number;
   failed: number;
@@ -250,19 +251,20 @@ export async function runCoordinatorPlannedCases(): Promise<{
 
   /* ============================ RUNOP ============================ */
 
-  // 10 — CREATE dispatch: createPlanned called with id === entityId, no token
+  // 10 — CREATE dispatch: createGoal called with id === entityId, no token, `saved` defaults to 0
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    const enq = await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd({ amount: 30000 }) });
+    const enq = await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd({ target: 3000000 }) });
     await settle(8);
     check(
-      '10 CREATE dispatch -> createPlanned(id=entityId, draft), lands on server, queue empties',
+      '10 CREATE dispatch -> createGoal(id=entityId, draft), lands on server with saved=0, queue empties',
       enq.ok === true &&
         h.createLog.length === 1 &&
-        h.createLog[0].id === 'p-1' &&
-        h.server.get('p-1')?.amount === 30000 &&
-        h.coord.getState().planned.scopeOps.length === 0,
+        h.createLog[0].id === 'goal-1' &&
+        h.server.get('goal-1')?.target === 3000000 &&
+        h.server.get('goal-1')?.saved === 0 &&
+        h.coord.getState().goal.scopeOps.length === 0,
       JSON.stringify({ log: h.createLog, server: [...h.server] }),
     );
   }
@@ -271,15 +273,15 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1', { amount: 999 }));
+    h.serverPut(srvRow('goal-1', { target: 999 }));
     h.setUpdate((a) => {
       h.updateLog.push(a);
       return Promise.resolve(TRANSPORT_U); // stay "offline" across retries
     });
-    await h.coord.enqueuePlannedUpdate({
+    await h.coord.enqueueGoalUpdate({
       scope: A,
-      entityId: 'p-1',
-      payload: pd({ amount: 1 }),
+      entityId: 'goal-1',
+      payload: gd({ target: 1 }),
       expectedUpdatedAt: 'FROZEN-V1',
     });
     await settle();
@@ -296,12 +298,12 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1'));
+    h.serverPut(srvRow('goal-1'));
     h.setDelete((a) => {
       h.deleteLog.push(a);
       return Promise.resolve(TRANSPORT_D);
     });
-    await h.coord.enqueuePlannedDelete({ scope: A, entityId: 'p-1', expectedUpdatedAt: 'FROZEN-DEL' });
+    await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'FROZEN-DEL' });
     await settle();
     h.runTimers();
     await settle(6);
@@ -317,14 +319,14 @@ export async function runCoordinatorPlannedCases(): Promise<{
     const h = makeHarness();
     await h.coord.hydrate();
     h.setCreate(() => Promise.resolve(TRANSPORT_C));
-    const enq = await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    const enq = await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await settle();
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
       '13 transport:true -> retained pending (not failed), a backoff timer is scheduled',
       enq.ok === true &&
-        st.pendingIds.has('p-1') &&
-        !st.failedIds.has('p-1') &&
+        st.pendingIds.has('goal-1') &&
+        !st.failedIds.has('goal-1') &&
         h.timers.some((t) => !t.cancelled),
       JSON.stringify({ enq, pending: [...st.pendingIds], failed: [...st.failedIds] }),
     );
@@ -339,61 +341,57 @@ export async function runCoordinatorPlannedCases(): Promise<{
       calls += 1;
       return Promise.resolve(CONFLICT_C);
     });
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await settle();
     h.coord.requestFlush(); // non-includeFailed must NOT re-run it
     await settle();
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
       '14 CREATE conflict -> terminal-failed, reason retained, exactly one attempt',
-      st.failedIds.has('p-1') && st.failedReasons.get('p-1') === 'conflict' && calls === 1,
-      JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('p-1'), calls }),
+      st.failedIds.has('goal-1') && st.failedReasons.get('goal-1') === 'conflict' && calls === 1,
+      JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('goal-1'), calls }),
     );
   }
 
-  // 15 — gone/deleted UPDATE is TERMINAL (reason preserved, not collapsed)
+  // 15 — gone UPDATE is TERMINAL (reason preserved, not collapsed)
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1'));
+    h.serverPut(srvRow('goal-1'));
     h.setUpdate(() => Promise.resolve(GONE_U));
-    await h.coord.enqueuePlannedUpdate({
+    await h.coord.enqueueGoalUpdate({
       scope: A,
-      entityId: 'p-1',
-      payload: pd({ amount: 5 }),
+      entityId: 'goal-1',
+      payload: gd({ target: 5 }),
       expectedUpdatedAt: 'V0',
     });
     await settle();
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
       '15 UPDATE gone -> terminal-failed with reason "gone"',
-      st.failedIds.has('p-1') && st.failedReasons.get('p-1') === 'gone',
-      JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('p-1') }),
+      st.failedIds.has('goal-1') && st.failedReasons.get('goal-1') === 'gone',
+      JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('goal-1') }),
     );
   }
 
-  // 15b — CREATE `invalid` -> reason-less generic terminal (mirrors card/category)
+  // 15b — CREATE `invalid` -> reason-less generic terminal (mirrors card/category/planned/recurring)
   {
     const h = makeHarness();
     await h.coord.hydrate();
     h.setCreate(() => Promise.resolve(INVALID_C));
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await settle();
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
       '15b CREATE invalid -> terminal-failed with NO stored reason',
-      st.failedIds.has('p-1') && st.failedReasons.get('p-1') === undefined,
-      JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('p-1') }),
+      st.failedIds.has('goal-1') && st.failedReasons.get('goal-1') === undefined,
+      JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('goal-1') }),
     );
   }
 
   /* ========================= CREATE ACK ========================= */
 
-  // 16 — server absent after replay -> NOT acked, op RETAINED (never durably
-  // removed). First replay "succeeds" (lost response) but the authoritative
-  // snapshot never shows the row -> the ack is withheld and the op drops
-  // back onto the queue; the next replay goes transport so it just halts on
-  // backoff (no hot spin) and the op is still there.
+  // 16 — server absent after replay -> NOT acked, op RETAINED (never durably removed)
   {
     const h = makeHarness();
     await h.coord.hydrate();
@@ -403,23 +401,25 @@ export async function runCoordinatorPlannedCases(): Promise<{
       h.createLog.push(a);
       return Promise.resolve(calls === 1 ? { ok: true, id: a.id } : TRANSPORT_C);
     });
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await settle(8);
     check(
       '16 CREATE: server row never appears in snapshot -> not acked, op still queued (not durably removed)',
-      h.coord.getState().planned.scopeOps.length === 1 &&
+      h.coord.getState().goal.scopeOps.length === 1 &&
         calls >= 1 &&
-        !h.server.has('p-1') &&
-        !h.coord.getState().planned.failedIds.has('p-1'),
-      JSON.stringify({ ops: h.coord.getState().planned.scopeOps.length, calls }),
+        !h.server.has('goal-1') &&
+        !h.coord.getState().goal.failedIds.has('goal-1'),
+      JSON.stringify({ ops: h.coord.getState().goal.scopeOps.length, calls }),
     );
   }
 
   // 17 — same id + same payload on server -> ack (idempotent lost-response)
   {
-    const h = makeHarness({ seed: seedWith([rec({ queueId: 'q-17', entityId: 'p-1', payload: pd({ amount: 77000 }) })]) });
+    const h = makeHarness({
+      seed: seedWith([rec({ queueId: 'q-17', entityId: 'goal-1', payload: gd({ target: 7700000 }) })]),
+    });
     // server already holds the exact same create (response was lost)
-    h.serverPut(srvRow('p-1', { amount: 77000 }));
+    h.serverPut(srvRow('goal-1', { target: 7700000 }));
     let calls = 0;
     h.setCreate((a) => {
       calls += 1;
@@ -429,8 +429,8 @@ export async function runCoordinatorPlannedCases(): Promise<{
     await settle(8);
     check(
       '17 CREATE lost-response: server row matches draft -> ack removes it durably',
-      h.coord.getState().planned.scopeOps.length === 0 && h.server.get('p-1')?.amount === 77000,
-      JSON.stringify({ ops: h.coord.getState().planned.scopeOps, calls }),
+      h.coord.getState().goal.scopeOps.length === 0 && h.server.get('goal-1')?.target === 7700000,
+      JSON.stringify({ ops: h.coord.getState().goal.scopeOps, calls }),
     );
   }
 
@@ -438,24 +438,24 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1', { amount: 200000 })); // someone else's row on the same id
+    h.serverPut(srvRow('goal-1', { target: 2000000 })); // someone else's row on the same id
     let calls = 0;
     h.setCreate(() => {
       calls += 1;
       return Promise.resolve(CONFLICT_C); // real service: 23505 reconcile says "different create"
     });
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd({ amount: 100000 }) });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd({ target: 1000000 }) });
     await settle();
     h.coord.requestFlush();
     await settle();
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
       '18 CREATE same id / different payload -> terminal conflict retained, server row untouched, no auto-retry',
-      st.failedIds.has('p-1') &&
-        st.failedReasons.get('p-1') === 'conflict' &&
-        h.server.get('p-1')?.amount === 200000 &&
+      st.failedIds.has('goal-1') &&
+        st.failedReasons.get('goal-1') === 'conflict' &&
+        h.server.get('goal-1')?.target === 2000000 &&
         calls === 1,
-      JSON.stringify({ failed: [...st.failedIds], server: h.server.get('p-1')?.amount, calls }),
+      JSON.stringify({ failed: [...st.failedIds], server: h.server.get('goal-1')?.target, calls }),
     );
   }
 
@@ -465,11 +465,11 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1', { amount: 100000 }));
-    const enq = await h.coord.enqueuePlannedUpdate({
+    h.serverPut(srvRow('goal-1', { target: 1000000 }));
+    const enq = await h.coord.enqueueGoalUpdate({
       scope: A,
-      entityId: 'p-1',
-      payload: pd({ amount: 250000 }),
+      entityId: 'goal-1',
+      payload: gd({ target: 2500000 }),
       expectedUpdatedAt: 'V1',
     });
     await settle(8);
@@ -477,40 +477,41 @@ export async function runCoordinatorPlannedCases(): Promise<{
       '19 UPDATE online -> applied, content-matched, queue empty, refresh requested',
       enq.ok === true &&
         h.updateLog.length === 1 &&
-        h.server.get('p-1')?.amount === 250000 &&
+        h.server.get('goal-1')?.target === 2500000 &&
         h.refreshes() >= 1 &&
-        h.coord.getState().planned.scopeOps.length === 0,
-      JSON.stringify({ server: h.server.get('p-1')?.amount, refreshes: h.refreshes() }),
+        h.coord.getState().goal.scopeOps.length === 0,
+      JSON.stringify({ server: h.server.get('goal-1')?.target, refreshes: h.refreshes() }),
     );
   }
 
-  // 20 — server shows a DIFFERENT draft than attempted -> NOT acked (content
-  // mismatch); the op is retained, not durably removed. First replay
-  // "succeeds" but the snapshot keeps showing 100000; the next replay goes
-  // transport so it halts on backoff.
+  // 20 — server shows a DIFFERENT draft than attempted -> NOT acked (content mismatch)
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1', { amount: 100000 }));
+    h.serverPut(srvRow('goal-1', { target: 1000000 }));
     let calls = 0;
     h.setUpdate((a) => {
       calls += 1;
       h.updateLog.push(a);
       return Promise.resolve(calls === 1 ? { ok: true, updatedAt: 'V2' } : TRANSPORT_U);
     });
-    await h.coord.enqueuePlannedUpdate({
+    await h.coord.enqueueGoalUpdate({
       scope: A,
-      entityId: 'p-1',
-      payload: pd({ amount: 250000 }),
+      entityId: 'goal-1',
+      payload: gd({ target: 2500000 }),
       expectedUpdatedAt: 'V1',
     });
     await settle(8);
     check(
-      '20 UPDATE: snapshot content != attempted draft -> not acked, op still queued, server never overwritten to 250000',
-      h.coord.getState().planned.scopeOps.length === 1 &&
+      '20 UPDATE: snapshot content != attempted draft -> not acked, op still queued, server never overwritten to 2500000',
+      h.coord.getState().goal.scopeOps.length === 1 &&
         calls >= 1 &&
-        h.server.get('p-1')?.amount === 100000,
-      JSON.stringify({ ops: h.coord.getState().planned.scopeOps.length, calls, server: h.server.get('p-1')?.amount }),
+        h.server.get('goal-1')?.target === 1000000,
+      JSON.stringify({
+        ops: h.coord.getState().goal.scopeOps.length,
+        calls,
+        server: h.server.get('goal-1')?.target,
+      }),
     );
   }
 
@@ -518,52 +519,50 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1', { amount: 150000 })); // device B already won with 150k
+    h.serverPut(srvRow('goal-1', { target: 1500000 })); // device B already won with 1.5M
     let calls = 0;
     h.setUpdate(() => {
       calls += 1;
       return Promise.resolve(CONFLICT_U); // frozen token no longer matches
     });
-    await h.coord.enqueuePlannedUpdate({
+    await h.coord.enqueueGoalUpdate({
       scope: A,
-      entityId: 'p-1',
-      payload: pd({ amount: 120000 }), // A's stale draft
+      entityId: 'goal-1',
+      payload: gd({ target: 1200000 }), // A's stale draft
       expectedUpdatedAt: 'STALE-V0',
     });
     await settle(8);
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
-      '21 UPDATE stale token -> server stays 150000, one attempt, retained failed (no blind LWW)',
-      h.server.get('p-1')?.amount === 150000 &&
+      '21 UPDATE stale token -> server stays 1500000, one attempt, retained failed (no blind LWW)',
+      h.server.get('goal-1')?.target === 1500000 &&
         calls === 1 &&
-        st.failedIds.has('p-1') &&
-        st.failedReasons.get('p-1') === 'conflict' &&
-        (h.storage.dump() ?? '').includes('p-1'),
-      JSON.stringify({ server: h.server.get('p-1')?.amount, calls, failed: [...st.failedIds] }),
+        st.failedIds.has('goal-1') &&
+        st.failedReasons.get('goal-1') === 'conflict' &&
+        (h.storage.dump() ?? '').includes('goal-1'),
+      JSON.stringify({ server: h.server.get('goal-1')?.target, calls, failed: [...st.failedIds] }),
     );
   }
 
   /* ========================= DELETE ACK ========================= */
 
-  // 22 — active server row still present after replay -> NOT acked; op
-  // retained. First replay "succeeds" but the row stays in the snapshot;
-  // the next replay goes transport so it halts on backoff.
+  // 22 — active server row still present after replay -> NOT acked; op retained
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1'));
+    h.serverPut(srvRow('goal-1'));
     let calls = 0;
     h.setDelete((a) => {
       calls += 1;
       h.deleteLog.push(a);
       return Promise.resolve(calls === 1 ? { ok: true } : TRANSPORT_D);
     });
-    await h.coord.enqueuePlannedDelete({ scope: A, entityId: 'p-1', expectedUpdatedAt: 'V1' });
+    await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
     await settle(8);
     check(
       '22 DELETE: active server row still present -> not acked, op still queued',
-      h.coord.getState().planned.scopeOps.length === 1 && calls >= 1 && h.server.has('p-1'),
-      JSON.stringify({ ops: h.coord.getState().planned.scopeOps.length, calls }),
+      h.coord.getState().goal.scopeOps.length === 1 && calls >= 1 && h.server.has('goal-1'),
+      JSON.stringify({ ops: h.coord.getState().goal.scopeOps.length, calls }),
     );
   }
 
@@ -571,16 +570,16 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1'));
-    const enq = await h.coord.enqueuePlannedDelete({ scope: A, entityId: 'p-1', expectedUpdatedAt: 'V1' });
+    h.serverPut(srvRow('goal-1'));
+    const enq = await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
     await settle(8);
     check(
       '23 DELETE online -> server row gone, queue empty, refresh requested',
       enq.ok === true &&
-        !h.server.has('p-1') &&
+        !h.server.has('goal-1') &&
         h.refreshes() >= 1 &&
-        h.coord.getState().planned.scopeOps.length === 0,
-      JSON.stringify({ hasRow: h.server.has('p-1'), ops: h.coord.getState().planned.scopeOps.length }),
+        h.coord.getState().goal.scopeOps.length === 0,
+      JSON.stringify({ hasRow: h.server.has('goal-1'), ops: h.coord.getState().goal.scopeOps.length }),
     );
   }
 
@@ -588,34 +587,34 @@ export async function runCoordinatorPlannedCases(): Promise<{
   {
     const h = makeHarness();
     await h.coord.hydrate();
-    h.serverPut(srvRow('p-1', { amount: 100000 }));
+    h.serverPut(srvRow('goal-1', { target: 1000000 }));
     h.setDelete(() => Promise.resolve(CONFLICT_D));
-    await h.coord.enqueuePlannedDelete({ scope: A, entityId: 'p-1', expectedUpdatedAt: 'V1' });
+    await h.coord.enqueueGoalDelete({ scope: A, entityId: 'goal-1', expectedUpdatedAt: 'V1' });
     await settle();
-    const st = h.coord.getState().planned;
+    const st = h.coord.getState().goal;
     check(
       '30 failed DELETE -> retained + failedIds, authoritative server row still present',
-      st.failedIds.has('p-1') && h.server.get('p-1')?.amount === 100000 && st.scopeOps.length === 1,
-      JSON.stringify({ failed: [...st.failedIds], server: h.server.get('p-1')?.amount }),
+      st.failedIds.has('goal-1') && h.server.get('goal-1')?.target === 1000000 && st.scopeOps.length === 1,
+      JSON.stringify({ failed: [...st.failedIds], server: h.server.get('goal-1')?.target }),
     );
   }
 
   /* ======================== QUEUE SAFETY ======================== */
 
-  // 36 — scope isolation: household B never sees household A's planned op
+  // 36 — scope isolation: household B never sees household A's goal op
   {
     const h = makeHarness();
     await h.coord.hydrate();
     h.setCreate(() => Promise.resolve(TRANSPORT_C));
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await settle();
     h.setScope(B);
-    const underB = h.coord.getState().planned;
+    const underB = h.coord.getState().goal;
     h.setScope(A);
-    const underA = h.coord.getState().planned;
+    const underA = h.coord.getState().goal;
     check(
-      '36 scope isolation: planned op hidden under B, visible again under A',
-      underB.scopeOps.length === 0 && underA.pendingIds.has('p-1'),
+      '36 scope isolation: goal op hidden under B, visible again under A',
+      underB.scopeOps.length === 0 && underA.pendingIds.has('goal-1'),
       `B=${underB.scopeOps.length} A=${[...underA.pendingIds]}`,
     );
   }
@@ -626,21 +625,21 @@ export async function runCoordinatorPlannedCases(): Promise<{
     await h.coord.hydrate();
     h.setCreate(() => Promise.resolve(TRANSPORT_C));
     h.storage.failSet(1);
-    const enq = await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    const enq = await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await settle();
     check(
       '37 enqueue persist failure -> {ok:false, persist}, not visible',
-      enq.ok === false && enq.reason === 'persist' && h.coord.getState().planned.scopeOps.length === 0,
+      enq.ok === false && enq.reason === 'persist' && h.coord.getState().goal.scopeOps.length === 0,
       JSON.stringify(enq),
     );
   }
 
-  // 38 — restart/hydrate: a seeded planned CREATE is restored, no duplicate
+  // 38 — restart/hydrate: a seeded goal CREATE is restored, no duplicate
   {
     const h = makeHarness();
     await h.coord.hydrate();
     h.setCreate(() => Promise.resolve(TRANSPORT_C));
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd({ amount: 55555 }) });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd({ target: 5555500 }) });
     await settle();
     h.coord.dispose();
     const stored = h.storage.dump();
@@ -650,10 +649,9 @@ export async function runCoordinatorPlannedCases(): Promise<{
     await h2.coord.hydrate();
     await settle();
     check(
-      '38 restart -> pending planned row restored from storage, exactly one',
-      h2.coord.getState().planned.pendingIds.has('p-1') &&
-        h2.coord.getState().planned.scopeOps.length === 1,
-      JSON.stringify([...h2.coord.getState().planned.pendingIds]),
+      '38 restart -> pending goal row restored from storage, exactly one',
+      h2.coord.getState().goal.pendingIds.has('goal-1') && h2.coord.getState().goal.scopeOps.length === 1,
+      JSON.stringify([...h2.coord.getState().goal.pendingIds]),
     );
   }
 
@@ -662,15 +660,15 @@ export async function runCoordinatorPlannedCases(): Promise<{
     const h = makeHarness();
     await h.coord.hydrate();
     h.setUpdate(() => Promise.resolve(CONFLICT_U));
-    h.serverPut(srvRow('p-1', { amount: 999999 }));
-    await h.coord.enqueuePlannedUpdate({
+    h.serverPut(srvRow('goal-1', { target: 9999999 }));
+    await h.coord.enqueueGoalUpdate({
       scope: A,
-      entityId: 'p-1',
-      payload: pd({ amount: 1 }),
+      entityId: 'goal-1',
+      payload: gd({ target: 1 }),
       expectedUpdatedAt: 'V1',
     });
     await settle();
-    const recQ = h.coord.getState().planned.scopeOps.find((o) => o.entityId === 'p-1');
+    const recQ = h.coord.getState().goal.scopeOps.find((o) => o.entityId === 'goal-1');
     // scope isolation: cannot discard A's record while B is active
     h.setScope(B);
     const outB = await h.coord.discardPending(recQ!.queueId);
@@ -681,26 +679,26 @@ export async function runCoordinatorPlannedCases(): Promise<{
       outB.ok === false &&
         outB.reason === 'scope' &&
         outA.ok === true &&
-        h.coord.getState().planned.scopeOps.length === 0 &&
-        !h.coord.getState().planned.failedIds.has('p-1') &&
-        h.server.get('p-1')?.amount === 999999,
-      JSON.stringify({ outB, outA, server: h.server.get('p-1')?.amount }),
+        h.coord.getState().goal.scopeOps.length === 0 &&
+        !h.coord.getState().goal.failedIds.has('goal-1') &&
+        h.server.get('goal-1')?.target === 9999999,
+      JSON.stringify({ outB, outA, server: h.server.get('goal-1')?.target }),
     );
   }
 
-  // 40 — a budget op in the same queue is unaffected by planned dispatch
+  // 40 — a budget op in the same queue is unaffected by goal dispatch
   {
     const h = makeHarness();
     await h.coord.hydrate();
     h.setCreate(() => Promise.resolve(TRANSPORT_C));
-    await h.coord.enqueuePlannedCreate({ scope: A, entityId: 'p-1', payload: pd() });
+    await h.coord.enqueueGoalCreate({ scope: A, entityId: 'goal-1', payload: gd() });
     await h.coord.enqueueBudgetCreate({ scope: A, entityId: 'food', payload: { category: 'food', amount: 100 } });
     await settle();
     const st = h.coord.getState();
     check(
-      '40 planned + budget in one queue -> both tracked independently, keyed separately',
-      st.planned.pendingIds.has('p-1') && st.budget.scopeOps.some((o) => o.entityId === 'food'),
-      JSON.stringify({ planned: [...st.planned.pendingIds], budget: st.budget.scopeOps.map((o) => o.entityId) }),
+      '40 goal + budget in one queue -> both tracked independently, keyed separately',
+      st.goal.pendingIds.has('goal-1') && st.budget.scopeOps.some((o) => o.entityId === 'food'),
+      JSON.stringify({ goal: [...st.goal.pendingIds], budget: st.budget.scopeOps.map((o) => o.entityId) }),
     );
   }
 

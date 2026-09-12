@@ -64,6 +64,13 @@ import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
+  isValidGoalDraft,
+  isValidGoalMovementDraft,
+  type GoalMovementMode,
+  type NewGoalDraft,
+  type NewGoalMovementDraft,
+} from '@/lib/remoteGoalWriteMapping';
+import {
   isValidPlannedDraft,
   type NewPlannedExpenseDraft,
 } from '@/lib/remotePlannedWriteMapping';
@@ -73,7 +80,7 @@ import {
 } from '@/lib/remoteRecurringWriteMapping';
 import type { RemoteFinanceData, RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { BudgetMap, CreditCard, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type { BudgetMap, CreditCard, Goal, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 export const QUEUE_SCHEMA_VERSION = 1 as const;
 export const MAX_PENDING_WRITES = 200;
@@ -107,7 +114,9 @@ export type PendingEntity =
   | 'budget'
   | 'categoryBudget'
   | 'planned'
-  | 'recurring';
+  | 'recurring'
+  | 'goal'
+  | 'goalMovement';
 
 interface PendingWriteBase {
   /** Queue-internal identity — distinct from `entityId` (see the dedup rule). */
@@ -419,6 +428,91 @@ export interface PendingRecurringDelete extends PendingWriteBase {
   expectedUpdatedAt: string;
 }
 
+/* ---------------- savings-goal records (STEP 16-H2-G1) ---------------- */
+
+/**
+ * `payload` is exactly what `createGoal({ draft })` is re-handed — the
+ * UI-editable `NewGoalDraft` (`name` / `target` / `deadline` / `icon`).
+ * `entityId` is the SAME client `goal-…` id the direct `createGoal` used, so
+ * a lost-response replay hits the service's `unique(household_id, id)` 23505
+ * idempotency path. No `expectedUpdatedAt` — a CREATE has no token. `saved`
+ * is NEVER part of this payload — it is a server-maintained cache only
+ * `addGoalMovement` can change (deposit/withdraw is OUT OF SCOPE this step —
+ * see src/services/remoteGoalWrite.ts — and is never modelled as a
+ * `PendingWrite`).
+ */
+export interface PendingGoalCreate extends PendingWriteBase {
+  entity: 'goal';
+  op: 'create';
+  payload: NewGoalDraft;
+}
+
+/**
+ * `payload` is what `updateGoal({ draft })` is re-handed — `name` / `target`
+ * / `deadline` / `icon` ONLY; `saved` is never written by this op.
+ * `expectedUpdatedAt` is FROZEN from the `goalMeta.updatedAt` the edit
+ * screen opened against and is NEVER refreshed — a stale token turns a
+ * concurrent change (INCLUDING a deposit/withdrawal, which also bumps
+ * `goals.updated_at` via the `trg_goal_movements` trigger chain) into a
+ * `conflict`, never a blind overwrite.
+ */
+export interface PendingGoalUpdate extends PendingWriteBase {
+  entity: 'goal';
+  op: 'update';
+  payload: NewGoalDraft;
+  expectedUpdatedAt: string;
+}
+
+/** A soft delete — `softDeleteGoal` guarded on the FROZEN `expectedUpdatedAt`.
+ *  NO `payload`. Never a hard DELETE (no DELETE grant on `public.goals`).
+ *  Never touches `goal_movements` — those rows are left as history. */
+export interface PendingGoalDelete extends PendingWriteBase {
+  entity: 'goal';
+  op: 'delete';
+  expectedUpdatedAt: string;
+}
+
+/* ---------------- savings-goal MOVEMENT records (STEP 16-H2-G3) ---------------- */
+
+/**
+ * A deposit/withdrawal against an EXISTING goal — `entityId` is the
+ * movement's OWN client-generated `gm-…` id (STABLE across every replay —
+ * mirrors `remoteGoalWrite.ts`'s own contract: a fresh id on retry would let
+ * `trg_apply_goal_movement` apply the delta twice; the SAME id makes a
+ * lost-response retry hit `addGoalMovement`'s 23505-by-content reconcile and
+ * stay an idempotent no-op — THIS is what actually prevents a double-apply,
+ * not anything in this queue). `goalId` names the TARGET goal — a separate
+ * field from `entityId`, which is the ledger row's own identity. `op` is
+ * ALWAYS 'create': a movement is an append-only ledger insert, never
+ * updated or deleted (mirrors planned/recurring/goal CREATE's "always a
+ * brand-new id, no natural-key uniqueness to dedup against").
+ *
+ * `expectedBaselineSaved` is FROZEN at the moment the movement screen
+ * resolved (froze) the goal — the `saved` the user was looking at before
+ * typing an amount. It is NEVER sent to the server (`addGoalMovement` has no
+ * optimistic-concurrency parameter at all — a movement is INSERT-only) —
+ * it exists PURELY for this queue's own ack check: after a refresh, a
+ * movement is confirmed applied when the goal's CURRENT `saved` equals
+ * `expectedBaselineSaved + delta` exactly (STRICT content match, not just
+ * "changed since enqueue" — a coincidental unrelated change must never be
+ * mistaken for this movement having landed, which would durably drop the
+ * record before it ever actually applied). There is no server-fetched
+ * `goal_movements` row list to confirm against directly (only a row COUNT
+ * is fetched, never mapped into `RemoteFinanceData` — see
+ * `src/services/remoteFinance.ts`'s `goalMovementsCount`), so the aggregate
+ * `saved` is the only signal available; a false NEGATIVE here (another
+ * device's movement lands first, changing `saved` by a different amount) is
+ * always SAFE — it just causes one more replay, and replaying the SAME
+ * `entityId` is idempotent by construction.
+ */
+export interface PendingGoalMovementCreate extends PendingWriteBase {
+  entity: 'goalMovement';
+  op: 'create';
+  goalId: string;
+  payload: NewGoalMovementDraft;
+  expectedBaselineSaved: number;
+}
+
 export type PendingWrite =
   | PendingTransactionCreate
   | PendingTransactionUpdate
@@ -439,7 +533,11 @@ export type PendingWrite =
   | PendingRecurringCreate
   | PendingRecurringUpdate
   | PendingRecurringActiveUpdate
-  | PendingRecurringDelete;
+  | PendingRecurringDelete
+  | PendingGoalCreate
+  | PendingGoalUpdate
+  | PendingGoalDelete
+  | PendingGoalMovementCreate;
 
 /* ------------------------------------------------------------------ *
  * Validation
@@ -691,6 +789,76 @@ function isValidActiveTogglePayload(p: unknown): p is { active: boolean } {
   return keys.length === 1 && keys[0] === 'active';
 }
 
+/**
+ * Structural validity for a stored `NewGoalDraft` (STEP 16-H2-G1 — reuse
+ * `isValidGoalDraft` from remoteGoalWriteMapping.ts rather than re-deriving
+ * the target/deadline/name rules). Only the UI-editable shape — `name` /
+ * `target` / `deadline` / `icon`. `saved` must NEVER be present — it is a
+ * server-maintained cache no client payload may carry (mirrors
+ * remoteGoalWrite.ts's own contract). Any server / identity / timestamp /
+ * soft-delete column present -> reject; the final target>0 / real-calendar-
+ * deadline / non-empty-name checks are delegated to `isValidGoalDraft` — the
+ * SAME function `createGoal()` / `updateGoal()` themselves run — so the queue
+ * can never accept a draft the write service would refuse.
+ */
+function isValidGoalPayload(p: unknown): p is NewGoalDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (typeof d.name !== 'string') return false;
+  if (typeof d.target !== 'number') return false;
+  if (!(d.deadline === null || typeof d.deadline === 'string')) return false;
+  if (typeof d.icon !== 'string') return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d ||
+    'updatedAt' in d ||
+    'updated_at' in d ||
+    'deleted_at' in d ||
+    'saved' in d
+  ) {
+    return false;
+  }
+  return isValidGoalDraft({
+    name: d.name,
+    target: d.target,
+    deadline: d.deadline as string | null,
+    icon: d.icon,
+  });
+}
+
+/**
+ * Structural validity for a stored `NewGoalMovementDraft` (STEP 16-H2-G3 —
+ * reuse `isValidGoalMovementDraft` from remoteGoalWriteMapping.ts rather
+ * than re-deriving the mode/amount rules). Only `mode` / `amount` — no
+ * server / identity / timestamp field is ever valid here (a movement carries
+ * none at all — see `NewGoalMovementDraft`).
+ */
+function isValidGoalMovementPayload(p: unknown): p is NewGoalMovementDraft {
+  if (p == null || typeof p !== 'object') return false;
+  const d = p as Record<string, unknown>;
+  if (d.mode !== 'deposit' && d.mode !== 'withdraw') return false;
+  if (typeof d.amount !== 'number') return false;
+  if (
+    'id' in d ||
+    'household_id' in d ||
+    'householdId' in d ||
+    'goal_id' in d ||
+    'goalId' in d ||
+    'created_by' in d ||
+    'createdBy' in d ||
+    'createdAt' in d ||
+    'created_at' in d
+  ) {
+    return false;
+  }
+  return isValidGoalMovementDraft({ mode: d.mode, amount: d.amount });
+}
+
 /** Returns the record narrowed to `PendingWrite`, or `null` if anything is off. */
 export function validatePendingWrite(x: unknown): PendingWrite | null {
   if (x == null || typeof x !== 'object') return null;
@@ -704,7 +872,9 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     r.entity !== 'budget' &&
     r.entity !== 'categoryBudget' &&
     r.entity !== 'planned' &&
-    r.entity !== 'recurring'
+    r.entity !== 'recurring' &&
+    r.entity !== 'goal' &&
+    r.entity !== 'goalMovement'
   ) {
     return null;
   }
@@ -887,6 +1057,55 @@ export function validatePendingWrite(x: unknown): PendingWrite | null {
     if ('payload' in r) return null; // a DELETE carries no user payload
     if ('updateKind' in r) return null; // a DELETE carries no updateKind
     return { ...base, entity: 'recurring', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'goal') {
+    // STEP 16-H2-G1 — savings-goal CREATE / UPDATE / soft DELETE. Mirrors the
+    // `planned` branch: CREATE carries no token, UPDATE/DELETE carry a
+    // FROZEN `expectedUpdatedAt`, DELETE carries no user payload. Goal
+    // movements (deposit/withdraw) are OUT OF SCOPE — never a `PendingWrite`.
+    if (r.op === 'create') {
+      if ('expectedUpdatedAt' in r) return null; // a CREATE carries no token
+      if (!isValidGoalPayload(r.payload)) return null;
+      return { ...base, entity: 'goal', op: 'create', payload: r.payload };
+    }
+    if (r.op === 'update') {
+      if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+      if (!isValidGoalPayload(r.payload)) return null;
+      return {
+        ...base,
+        entity: 'goal',
+        op: 'update',
+        payload: r.payload,
+        expectedUpdatedAt: r.expectedUpdatedAt,
+      };
+    }
+    // goal delete
+    if (!isNonEmptyString(r.expectedUpdatedAt)) return null;
+    if ('payload' in r) return null; // a DELETE carries no user payload
+    return { ...base, entity: 'goal', op: 'delete', expectedUpdatedAt: r.expectedUpdatedAt };
+  }
+
+  if (r.entity === 'goalMovement') {
+    // STEP 16-H2-G3 — deposit/withdraw against an EXISTING goal. ALWAYS
+    // op:'create' (an append-only ledger insert — never updated/deleted).
+    // `goalId` is required and separate from `entityId` (the movement's own
+    // id). `expectedBaselineSaved` is required (this queue's own ack-check
+    // input, never a server token) — a record missing it is malformed.
+    if (r.op !== 'create') return null;
+    if (!isNonEmptyString(r.goalId)) return null;
+    if (!isValidGoalMovementPayload(r.payload)) return null;
+    if (typeof r.expectedBaselineSaved !== 'number' || !Number.isFinite(r.expectedBaselineSaved)) {
+      return null;
+    }
+    return {
+      ...base,
+      entity: 'goalMovement',
+      op: 'create',
+      goalId: r.goalId,
+      payload: r.payload,
+      expectedBaselineSaved: r.expectedBaselineSaved,
+    };
   }
 
   // ---- transaction ----
@@ -1385,6 +1604,102 @@ export function makePendingRecurringDelete(args: {
   };
 }
 
+export function makePendingGoalCreate(args: {
+  scope: PendingWriteScope;
+  /** Client-generated `goal-…` id — stable across replays of ONE form mount. */
+  entityId: string;
+  payload: NewGoalDraft;
+  queueId?: string;
+  now?: () => string;
+}): PendingGoalCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'goal',
+    op: 'create',
+    entityId: args.entityId,
+    payload: args.payload,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingGoalUpdate(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  payload: NewGoalDraft;
+  /** FROZEN — the `goalMeta.updatedAt` the edit screen opened against.
+   *  Handed to `updateGoal` verbatim on every replay; never refreshed. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingGoalUpdate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'goal',
+    op: 'update',
+    entityId: args.entityId,
+    payload: args.payload,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingGoalDelete(args: {
+  scope: PendingWriteScope;
+  entityId: string;
+  /** FROZEN — the server version the user was viewing when they hit delete. */
+  expectedUpdatedAt: string;
+  queueId?: string;
+  now?: () => string;
+}): PendingGoalDelete {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'goal',
+    op: 'delete',
+    entityId: args.entityId,
+    expectedUpdatedAt: args.expectedUpdatedAt,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
+export function makePendingGoalMovementCreate(args: {
+  scope: PendingWriteScope;
+  /** Client-generated `gm-…` movement id — STABLE across every replay of
+   *  ONE movement sheet mount (never regenerated, mirrors addGoalMovement's
+   *  own contract). */
+  entityId: string;
+  goalId: string;
+  payload: NewGoalMovementDraft;
+  /** FROZEN — the goal's `saved` the user was looking at when the movement
+   *  sheet resolved the goal (mount time). Used ONLY by this queue's own
+   *  ack check; never sent to the server. */
+  expectedBaselineSaved: number;
+  queueId?: string;
+  now?: () => string;
+}): PendingGoalMovementCreate {
+  return {
+    queueId: args.queueId ?? defaultQueueId(),
+    schemaVersion: QUEUE_SCHEMA_VERSION,
+    scope: { userId: args.scope.userId, householdId: args.scope.householdId },
+    entity: 'goalMovement',
+    op: 'create',
+    entityId: args.entityId,
+    goalId: args.goalId,
+    payload: args.payload,
+    expectedBaselineSaved: args.expectedBaselineSaved,
+    enqueuedAt: (args.now ?? nowIso)(),
+    attemptCount: 0,
+  };
+}
+
 /** `${userId}|${householdId}|${entity}|${op}|${entityId}` — the dedup identity.
  *  `entity` is part of the key, so a card op and a transaction op that happen
  *  to share an id NEVER collide here (STEP 16-H2-C2-A1 §21). */
@@ -1463,6 +1778,19 @@ function recurringEditableEqual(a: NewRecurringDraft, b: NewRecurringDraft): boo
     a.frequency === b.frequency &&
     a.dayOfMonth === b.dayOfMonth &&
     a.dayOfWeek === b.dayOfWeek
+  );
+}
+
+/** Equality of the SERVER-editable savings-goal fields (`name` / `target` /
+ *  `deadline` / `icon`). Unlike planned/recurring/category, a goal draft has
+ *  NO create-only field kept separate — CREATE and UPDATE compare the SAME
+ *  four fields (STEP 16-H2-G1); `saved` is never part of the draft at all. */
+function goalEditableEqual(a: NewGoalDraft, b: NewGoalDraft): boolean {
+  return (
+    a.name === b.name &&
+    Number(a.target) === Number(b.target) &&
+    a.deadline === b.deadline &&
+    a.icon === b.icon
   );
 }
 
@@ -1569,6 +1897,31 @@ function sameRequest(a: PendingWrite, b: PendingWrite): boolean {
     }
     if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
     return false;
+  }
+
+  if (a.entity === 'goal' && b.entity === 'goal') {
+    // CREATE: identity + same draft. Unlike card/category/planned/recurring
+    // there is no create-only field to add — `goalEditableEqual` alone is
+    // the full comparison. A DIFFERING CREATE for the same id is
+    // `existing-pending`, never a silent overwrite.
+    if (a.op === 'create' && b.op === 'create') return goalEditableEqual(a.payload, b.payload);
+    if (a.op === 'update' && b.op === 'update') {
+      return a.expectedUpdatedAt === b.expectedUpdatedAt && goalEditableEqual(a.payload, b.payload);
+    }
+    if (a.op === 'delete' && b.op === 'delete') return a.expectedUpdatedAt === b.expectedUpdatedAt;
+    return false;
+  }
+
+  if (a.entity === 'goalMovement' && b.entity === 'goalMovement') {
+    // ALWAYS op 'create'. entityId equality (the movement id) is already
+    // established by dedupKey; the EXACT same request additionally needs
+    // the same target goal, mode, amount, and frozen baseline.
+    return (
+      a.goalId === b.goalId &&
+      a.payload.mode === b.payload.mode &&
+      Number(a.payload.amount) === Number(b.payload.amount) &&
+      a.expectedBaselineSaved === b.expectedBaselineSaved
+    );
   }
 
   if (a.entity === 'transaction' && b.entity === 'transaction') {
@@ -2700,6 +3053,235 @@ function composeCardManagement(
   return { rows, opById, failedIds, hiddenIds };
 }
 
+/* ---------------- savings-goal display model (STEP 16-H2-G1) ---------------- */
+
+/** A pending CREATE / failed-orphan UPDATE payload -> a synthetic domain
+ *  `Goal`. The row is read-only (never re-edited) — `createdAt` is a
+ *  synthetic `enqueuedAt` placeholder, never a real server timestamp.
+ *  `saved` is ALWAYS `0` — a CREATE never sets it (the DB default applies)
+ *  and an UPDATE never touches it (STEP 16-H2-G1 — deposits/withdrawals are
+ *  out of scope, so there is no queued movement to reflect here). */
+function goalDraftToDomain(op: PendingGoalCreate | PendingGoalUpdate): Goal {
+  const d = op.payload;
+  return {
+    id: op.entityId,
+    name: d.name,
+    target: d.target,
+    saved: 0,
+    deadline: d.deadline,
+    icon: d.icon,
+    createdAt: op.enqueuedAt,
+  };
+}
+
+/** Overlay an UPDATE draft onto an existing domain goal. `id` / `saved` /
+ *  `createdAt` (server identity + the server-maintained savings cache) are
+ *  preserved from `row` — an UPDATE op never touches `saved`. */
+function applyGoalUpdate(row: Goal, d: NewGoalDraft): Goal {
+  return { ...row, name: d.name, target: d.target, deadline: d.deadline, icon: d.icon };
+}
+
+/**
+ * Does an authoritative server goal already reflect a queued CREATE/UPDATE's
+ * desired draft? STEP 16-H2-G1 — the pre-ack confirmation, mirroring the
+ * write service's own `isSameGoalCreate` / `goalFieldsMatch` field set at the
+ * READ-MODEL level: `name` (trimmed) / `target` / `deadline` / `icon`
+ * compared strictly. `saved` is NEVER compared (it is not part of the draft
+ * at all — a movement, not this op, changes it); `updatedAt` changing alone
+ * is never sufficient on its own — content match is what matters. Pure — no
+ * `JSON.stringify`.
+ */
+export function serverGoalConfirmsUpdate(serverRow: Goal, draft: NewGoalDraft): boolean {
+  return (
+    serverRow.name === draft.name.trim() &&
+    Number(serverRow.target) === Number(draft.target) &&
+    serverRow.deadline === draft.deadline &&
+    serverRow.icon === draft.icon
+  );
+}
+
+export interface GoalManagementView {
+  /**
+   * The savings goals to render on a GOAL-MANAGEMENT surface ONLY:
+   * authoritative server `goals`, with a NOT-failed pending UPDATE overlaid,
+   * plus a synthetic row for a pending/failed CREATE, plus a synthetic row
+   * for a FAILED UPDATE whose server row is GONE, minus a not-failed pending
+   * DELETE.
+   *
+   * A TERMINAL-failed UPDATE whose authoritative server row STILL EXISTS
+   * keeps the AUTHORITATIVE row verbatim (the other device won, OR a
+   * deposit/withdrawal landed and bumped `updated_at`) — the stale local
+   * draft is NEVER used to replace it. The attempted local draft is exposed
+   * via `attemptedDraftById` as conflict metadata only, and the row id is in
+   * `failedIds` so a future UI can offer "변경 버리기".
+   *
+   * DELIBERATELY separate from `data.goals` / `data.goalMeta` so any other
+   * consumer (backup, household-import) only ever sees authoritative server
+   * data. Equals `data.goals` when there are no goal ops. ENGINE ONLY this
+   * step — no screen reads it yet.
+   */
+  rows: Goal[];
+  /** goal id -> the pending op that produced or marks it. */
+  opById: ReadonlyMap<string, 'create' | 'update' | 'delete'>;
+  /** goal ids currently in a TERMINAL failed state. */
+  failedIds: ReadonlySet<string>;
+  /** server goal ids hidden from `rows` by a not-failed pending DELETE. */
+  hiddenIds: string[];
+  /**
+   * row ids that are SYNTHETIC — present in `rows` only because of an op,
+   * with no authoritative server goal behind them (pending/failed CREATE, and
+   * a failed UPDATE whose server row is gone). A failed UPDATE whose server
+   * row EXISTS is NOT here — its authoritative row stays a normal goal entry.
+   */
+  syntheticIds: ReadonlySet<string>;
+  /**
+   * goal id -> the full draft the user attempted in a TERMINAL-failed
+   * UPDATE. Conflict metadata ONLY — never used to replace the displayed row
+   * when the authoritative row exists. Present for both the "row exists" and
+   * the orphan case.
+   */
+  attemptedDraftById: ReadonlyMap<string, NewGoalDraft>;
+  /**
+   * STEP 16-H2-G3 — goal id -> the `{mode, amount}` of the goal's pending or
+   * TERMINAL-failed deposit/withdraw movement, when one is queued.
+   * DELIBERATELY populated for BOTH the still-pending AND the failed case
+   * (unlike `attemptedDraftById`, which is failed-only) — a not-yet-failed
+   * movement still needs its mode surfaced so the row label can say "저축
+   * 전송 대기" vs "인출 전송 대기" rather than a generic "수정 전송 대기".
+   */
+  movementById: ReadonlyMap<string, { mode: GoalMovementMode; amount: number }>;
+}
+
+function composeGoalManagement(
+  serverGoals: readonly Goal[],
+  ops: readonly PendingWrite[],
+  failedGoalIds?: ReadonlySet<string>,
+  /** STEP 16-H2-G3 — bare MOVEMENT-id set (the ledger row's OWN id, NOT the
+   *  goal id) of TERMINAL-failed pending deposit/withdraw ops; drives the
+   *  failed-vs-pending branch of the movement overlay below. */
+  failedGoalMovementIds?: ReadonlySet<string>,
+): GoalManagementView {
+  const opById = new Map<string, 'create' | 'update' | 'delete'>();
+  const failedIds = new Set<string>();
+  const hiddenIds: string[] = [];
+  const syntheticIds = new Set<string>();
+  const attemptedDraftById = new Map<string, NewGoalDraft>();
+  const movementById = new Map<string, { mode: GoalMovementMode; amount: number }>();
+  const goalOps = ops.filter(
+    (o): o is PendingGoalCreate | PendingGoalUpdate | PendingGoalDelete => o.entity === 'goal',
+  );
+  const movementOps = ops.filter(
+    (o): o is PendingGoalMovementCreate => o.entity === 'goalMovement',
+  );
+  if (goalOps.length === 0 && movementOps.length === 0) {
+    return {
+      rows: serverGoals.slice(),
+      opById,
+      failedIds,
+      hiddenIds,
+      syntheticIds,
+      attemptedDraftById,
+      movementById,
+    };
+  }
+
+  const failed = (id: string) => !!failedGoalIds?.has(id);
+  const rows = serverGoals.slice(); // never mutates serverGoals
+  const idxOf = (id: string) => rows.findIndex((g) => g.id === id);
+
+  for (const op of goalOps) {
+    const idx = idxOf(op.entityId);
+
+    if (op.op === 'create') {
+      if (idx !== -1) continue; // the flush already landed — no marker
+      rows.push(goalDraftToDomain(op));
+      opById.set(op.entityId, 'create');
+      syntheticIds.add(op.entityId); // no authoritative row behind it
+      if (failed(op.entityId)) failedIds.add(op.entityId);
+      continue;
+    }
+
+    if (op.op === 'update') {
+      if (idx !== -1) {
+        if (failed(op.entityId)) {
+          // TERMINAL-failed UPDATE + authoritative row still on the server
+          // (the other device won, or a deposit/withdrawal bumped it). KEEP
+          // the authoritative row verbatim — the stale local draft must NOT
+          // replace it. Mark it + keep the attempted draft as conflict
+          // metadata.
+          opById.set(op.entityId, 'update');
+          failedIds.add(op.entityId);
+          attemptedDraftById.set(op.entityId, op.payload);
+          continue;
+        }
+        // still-pending (non-terminal) UPDATE -> overlay the draft.
+        rows[idx] = applyGoalUpdate(rows[idx], op.payload);
+        opById.set(op.entityId, 'update');
+        continue;
+      }
+      // server row GONE: only a TERMINAL-failed UPDATE gets a display-only
+      // synthetic row (a not-failed one just waits — like every other entity).
+      if (failed(op.entityId)) {
+        rows.push(goalDraftToDomain(op));
+        opById.set(op.entityId, 'update');
+        failedIds.add(op.entityId);
+        syntheticIds.add(op.entityId); // no authoritative row behind it
+        attemptedDraftById.set(op.entityId, op.payload);
+      }
+      continue;
+    }
+
+    // delete
+    if (failed(op.entityId)) {
+      if (idx !== -1) {
+        opById.set(op.entityId, 'delete'); // keep the server row visible, mark it failed
+        failedIds.add(op.entityId);
+      }
+      continue;
+    }
+    if (idx !== -1) {
+      rows.splice(idx, 1);
+      hiddenIds.push(op.entityId);
+    }
+  }
+
+  // STEP 16-H2-G3 — overlay pending deposit/withdraw movements. A movement's
+  // OWN `entityId` is the ledger row's id, not the goal id, so it never
+  // participates in the create/update/delete dedup above; the target is
+  // named by `goalId`. `enqueueGoalMovementCreate` (coordinator) refuses a
+  // second movement — or a create/update/delete — while one is already
+  // queued for the SAME goalId ("the row is locked" — §7), so at most one
+  // movement op should ever target a given goal here; this loop stays
+  // defensive (a create/update/delete already claiming the row wins) rather
+  // than assuming that invariant holds.
+  const failedMovement = (movementEntityId: string) => !!failedGoalMovementIds?.has(movementEntityId);
+  for (const op of movementOps) {
+    if (opById.has(op.goalId)) continue; // a create/update/delete already claims this row
+    const idx = idxOf(op.goalId);
+    if (idx === -1) continue; // no authoritative row to overlay onto — nothing invented (§11)
+    const delta = op.payload.mode === 'deposit' ? op.payload.amount : -op.payload.amount;
+    if (failedMovement(op.entityId)) {
+      // TERMINAL-failed movement + authoritative row still on the server
+      // (mirrors the goal-UPDATE conflict rule exactly): KEEP the
+      // authoritative `saved` verbatim — the stale optimistic delta must
+      // NOT overwrite it. Mark it + keep the attempted movement as conflict
+      // metadata.
+      opById.set(op.goalId, 'update');
+      failedIds.add(op.goalId);
+      movementById.set(op.goalId, { mode: op.payload.mode, amount: op.payload.amount });
+      continue;
+    }
+    // still-pending (non-terminal) -> optimistic overlay: server `saved` +
+    // delta, clamped at 0 for DISPLAY only (never sent anywhere, never
+    // written back to `serverGoals`/`data.goals`).
+    rows[idx] = { ...rows[idx], saved: Math.max(0, rows[idx].saved + delta) };
+    opById.set(op.goalId, 'update');
+    movementById.set(op.goalId, { mode: op.payload.mode, amount: op.payload.amount });
+  }
+
+  return { rows, opById, failedIds, hiddenIds, syntheticIds, attemptedDraftById, movementById };
+}
+
 export interface ComposedFinance {
   /** `serverData` with pending overlays applied. A NEW object when anything
    *  changed; the SAME reference when nothing applied. `serverData` and its
@@ -2759,6 +3341,12 @@ export interface ComposedFinance {
    * when there are no recurring ops.
    */
   recurringManagement: RecurringManagementView;
+  /**
+   * STEP 16-H2-G1 — DISPLAY-ONLY savings-goal rows + markers. NEVER merged
+   * into `data.goals` / `data.goalMeta`. Equals `data.goals` when there are
+   * no goal ops. ENGINE ONLY — no screen reads it yet.
+   */
+  goalManagement: GoalManagementView;
 }
 
 /**
@@ -2806,6 +3394,13 @@ export function composeFinance(
    *  (create / full update / active toggle / delete); drives the
    *  failed-vs-pending branch of `recurringManagement`. */
   failedRecurringIds?: ReadonlySet<string>,
+  /** STEP 16-H2-G1 — bare goal-id set of TERMINAL-failed goal ops; drives the
+   *  failed-vs-pending branch of `goalManagement`. */
+  failedGoalIds?: ReadonlySet<string>,
+  /** STEP 16-H2-G3 — bare MOVEMENT-id set (not goal id) of TERMINAL-failed
+   *  pending deposit/withdraw ops; drives the failed-vs-pending branch of the
+   *  movement overlay inside `goalManagement`. */
+  failedGoalMovementIds?: ReadonlySet<string>,
 ): ComposedFinance {
   const cardManagement = composeCardManagement(serverData.cards, ops, failedCardIds);
   const categoryManagement = composeCategoryManagement(
@@ -2822,6 +3417,12 @@ export function composeFinance(
   );
   const plannedManagement = composePlannedManagement(serverData.planned, ops, failedPlannedIds);
   const recurringManagement = composeRecurringManagement(serverData.recurring, ops, failedRecurringIds);
+  const goalManagement = composeGoalManagement(
+    serverData.goals,
+    ops,
+    failedGoalIds,
+    failedGoalMovementIds,
+  );
 
   const txnOps = ops.filter((o) => o.entity === 'transaction');
   if (txnOps.length === 0) {
@@ -2835,6 +3436,7 @@ export function composeFinance(
       budgetManagement,
       plannedManagement,
       recurringManagement,
+      goalManagement,
     };
   }
 
@@ -2912,6 +3514,7 @@ export function composeFinance(
       budgetManagement,
       plannedManagement,
       recurringManagement,
+      goalManagement,
     };
   }
 
@@ -2929,5 +3532,6 @@ export function composeFinance(
     budgetManagement,
     plannedManagement,
     recurringManagement,
+    goalManagement,
   };
 }

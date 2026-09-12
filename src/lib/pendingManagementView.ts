@@ -17,10 +17,12 @@
 import type {
   BudgetManagementView,
   CategoryManagementView,
+  GoalManagementView,
   PendingWrite,
   PlannedManagementView,
   RecurringManagementView,
 } from '@/lib/offlineQueue';
+import type { GoalMovementMode, NewGoalDraft } from '@/lib/remoteGoalWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
@@ -124,6 +126,84 @@ export function buildPendingPlannedOps(
       ...(failed && view.attemptedDraftById.has(id)
         ? { attemptedDraft: view.attemptedDraftById.get(id) }
         : {}),
+    });
+  }
+  return out;
+}
+
+export interface GoalRowOpState {
+  op: ManagementOpKind;
+  failed: boolean;
+  reason?: WriteConflictReason;
+  queueId?: string;
+  synthetic: boolean;
+  /** For a TERMINAL-failed UPDATE, the FULL draft the user tried; conflict
+   *  metadata ONLY (the displayed row is the authoritative server row when it
+   *  still exists — STEP 16-H2-G1). */
+  attemptedDraft?: NewGoalDraft;
+  /**
+   * STEP 16-H2-G3 — present whenever this marker is backed by a pending or
+   * failed deposit/withdraw movement (`{op:'update', ...}` at the generic
+   * level — a movement reuses that bucket, same as a full goal edit).
+   * DELIBERATELY populated for BOTH the still-pending AND the failed case
+   * (unlike `attemptedDraft`, which is failed-only) — the row label needs
+   * the mode even while merely pending, to say "저축 전송 대기" / "인출 전송
+   * 대기" instead of a generic "수정 전송 대기".
+   */
+  movement?: { mode: GoalMovementMode; amount: number };
+}
+
+/**
+ * STEP 16-H2-G1/G3 — the screen-facing per-row op-state map for a
+ * goal-management surface. A marker is backed by EITHER a single-table
+ * `entity:'goal'` op (create/update/delete) OR a `entity:'goalMovement'` op
+ * (deposit/withdraw, keyed by the TARGET `goalId` — its own `entityId` is
+ * the movement ledger row's unrelated identity). The coordinator's
+ * `enqueueGoalMovementCreate` lock guard means never both for one id, so the
+ * resolution is unambiguous: a single-table op wins the `queueId` /
+ * failure-`reason` lookup; otherwise they come from the movement queue.
+ * Mirrors `buildPendingCategoryOps`'s dual-source shape.
+ */
+export function buildPendingGoalOps(
+  view: GoalManagementView,
+  /** current-scope `entity:'goal'` ops (create/update/delete, incl. failed). */
+  goalOps: readonly PendingWrite[],
+  /** current-scope `entity:'goalMovement'` ops (deposit/withdraw, incl. failed). */
+  movementOps: readonly PendingWrite[],
+  /** goal-id -> reason, for a terminal-failed single-table goal op. */
+  goalFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>,
+  /** MOVEMENT-id (not goal id) -> reason, for a terminal-failed movement. */
+  movementFailedReasons: ReadonlyMap<string, WriteConflictReason | undefined>,
+): Map<string, GoalRowOpState> {
+  const out = new Map<string, GoalRowOpState>();
+  for (const [id, op] of view.opById) {
+    const failed = view.failedIds.has(id);
+    const stQueueId = queueIdOf(goalOps, id);
+    const fromSingleTable = stQueueId !== undefined;
+    // A movement's OWN `entityId` is its ledger row's id, not the goal id —
+    // it is found by `goalId`, unlike `queueIdOf`'s generic `entityId` match.
+    const movementOp = fromSingleTable
+      ? undefined
+      : movementOps.find(
+          (o): o is Extract<PendingWrite, { entity: 'goalMovement' }> =>
+            o.entity === 'goalMovement' && o.goalId === id,
+        );
+    const queueId = fromSingleTable ? stQueueId : movementOp?.queueId;
+    const reason = fromSingleTable
+      ? goalFailedReasons.get(id)
+      : movementOp
+        ? movementFailedReasons.get(movementOp.entityId)
+        : undefined;
+    out.set(id, {
+      op,
+      failed,
+      synthetic: view.syntheticIds.has(id),
+      ...(queueId !== undefined ? { queueId } : {}),
+      ...(failed ? { reason } : {}),
+      ...(failed && view.attemptedDraftById.has(id)
+        ? { attemptedDraft: view.attemptedDraftById.get(id) }
+        : {}),
+      ...(view.movementById.has(id) ? { movement: view.movementById.get(id) } : {}),
     });
   }
   return out;
