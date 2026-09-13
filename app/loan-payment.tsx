@@ -15,10 +15,12 @@ import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey } from '@/lib/format';
 import { uid } from '@/lib/id';
 import { splitPayment } from '@/lib/loan';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { addLoanPayment } from '@/services/remoteLoanWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { Loan } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
@@ -53,7 +55,7 @@ export default function LoanPaymentRoute() {
 
 function LoanPaymentFormRoute({ loanId }: { loanId: string }) {
   const router = useRouter();
-  const { status, error, loans, refresh } = useFinanceRead();
+  const { status, error, loans, pendingLoanOps, refresh } = useFinanceRead();
 
   // STEP 16-G3-B2 §17-21: once the parent loan has resolved, FREEZE it for
   // this payment session. A later Realtime / foreground refresh that drops
@@ -61,6 +63,53 @@ function LoanPaymentFormRoute({ loanId }: { loanId: string }) {
   // lose the typed amount — addLoanPayment()'s authoritative re-SELECT /
   // INSERT then fails and the user sees that outcome.
   const frozenLoanRef = useRef<Loan | null>(null);
+
+  // STEP 16-H2-L2.1: only an ACTIVE (not-yet-terminal) offline op —
+  // create/update/delete OR another queued repayment — blocks a SECOND
+  // payment sheet from opening. A TERMINAL-failed op must NOT block: it is
+  // retained forever with no discard UI reachable from this route, and the
+  // coordinator's own `enqueueLoanPaymentCreate` clash guard already
+  // excludes `lastError` records (mirrors the H2-G4 fix on the goal side).
+  // Checked BEFORE the freeze below so a first entry is blocked only while
+  // genuinely active; a form already frozen for this session stays open.
+  const routePendingOp = pendingLoanOps.get(loanId);
+  const routeHasActivePending = !!routePendingOp && !routePendingOp.failed;
+  if (!frozenLoanRef.current && routeHasActivePending) {
+    return (
+      <ModalScreen title="상환하기" onClose={() => router.back()} scroll={false}>
+        <View
+          style={{
+            flex: 1,
+            alignItems: 'center',
+            justifyContent: 'center',
+            paddingHorizontal: spacing.xl,
+            gap: spacing.md,
+          }}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, textAlign: 'center' }}>
+            지금은 상환할 수 없어요
+          </Text>
+          <Text
+            style={{
+              fontFamily: fontFamily.regular,
+              fontSize: 13,
+              color: colors.textSub,
+              textAlign: 'center',
+              lineHeight: 19,
+            }}
+          >
+            전송 대기 중인 변경이 있어요. 반영된 뒤에 다시 시도할 수 있어요.
+          </Text>
+          <Pressable onPress={() => router.back()} hitSlop={8}>
+            <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>
+              목록으로 돌아가기
+            </Text>
+          </Pressable>
+        </View>
+      </ModalScreen>
+    );
+  }
+
   const liveLoan = loans.find((l) => l.id === loanId) ?? null;
   if (!frozenLoanRef.current && liveLoan) frozenLoanRef.current = liveLoan;
   if (frozenLoanRef.current) {
@@ -119,6 +168,10 @@ function LoanPaymentForm({ loan }: { loan: Loan }) {
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
   const { status, refresh } = useFinanceRead();
+  // STEP 16-H2-L2: durable offline fallback for a repayment create whose
+  // direct write hit a TRANSPORT failure (offline). Never used for a
+  // server/terminal verdict.
+  const pending = usePendingWrites();
 
   // Client-generated payment id, minted ONCE per sheet mount and reused on
   // EVERY save retry (STEP 16-G2-D4 §8-1). A fresh id on retry would move
@@ -144,6 +197,24 @@ function LoanPaymentForm({ loan }: { loan: Loan }) {
 
   const onKey = (k: string) => setAmount((a) => applyDigit(a, k));
 
+  /**
+   * STEP 16-H2-L2: a durable-enqueue that itself failed — the change is NOT
+   * queued, so the sheet stays open and the user is told why. Raw
+   * coordinator reasons are never surfaced. Mirrors goal-movement / goal-add.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '상환 기록을 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
   const save = async () => {
     if (submittingRef.current || !canSave) return;
     if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
@@ -164,6 +235,33 @@ function LoanPaymentForm({ loan }: { loan: Loan }) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('상환 기록을 추가했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-L2: a TRANSPORT failure (offline) -> durable payment-create
+    // queue. The SAME stable payment id (paymentIdRef, never regenerated)
+    // goes into the PendingWrite, so a later flush replays the exact request
+    // and its idempotency pre-check (STEP 16-H2-L1.1) stays safe — no
+    // double-charge accident on a lost response. Optimistic `paid` display
+    // comes from `composeLoanManagement`'s overlay (via `loanManagementRows`
+    // wherever a screen reads it) — this screen never mutates `loan.paid`
+    // itself.
+    if (res.transport === true) {
+      const enq = await pending.enqueueLoanPaymentCreate({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: paymentIdRef.current,
+        loanId: loan.id,
+        payload: { date, amount: magnitude },
+      });
+      submittingRef.current = false;
+      setSubmitting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('상환 기록을 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        router.back();
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
       return;
     }
 

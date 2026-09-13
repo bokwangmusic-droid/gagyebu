@@ -18,10 +18,12 @@ import { uid } from '@/lib/id';
 import type { RemoteLoanMeta } from '@/lib/remoteFinanceMapping';
 import type { NewLoanDraft } from '@/lib/remoteLoanWriteMapping';
 import { isValidDateKey } from '@/lib/remotePlannedWriteMapping';
+import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
 import { createLoan, softDeleteLoan, updateLoan } from '@/services/remoteLoanWrite';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
 import type { Loan, LoanRepayType } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
@@ -94,13 +96,33 @@ type FormMode =
 
 function LoanFormRoute({ editId }: { editId: string }) {
   const router = useRouter();
-  const { status, error, loans, loanMeta, refresh } = useFinanceRead();
+  const { status, error, loans, loanMeta, pendingLoanOps, refresh } = useFinanceRead();
 
   // STEP 16-G3-B2 §17-21: freeze the first resolved loan + token for the
   // edit session so a later Realtime / foreground refresh that drops the
   // row can't unmount the open form and lose the draft — the save's
   // optimistic-concurrency check decides deleted / gone / conflict.
   const frozenRef = useRef<{ loan: Loan; meta: RemoteLoanMeta } | null>(null);
+
+  // STEP 16-H2-L2.1: only an ACTIVE (not-yet-terminal) offline op — loan
+  // create/update/delete OR a queued repayment — blocks re-entry. A
+  // TERMINAL-failed op must NOT block: it is retained forever with no
+  // discard UI reachable from this route, and the coordinator's own
+  // enqueue-side clash guards already exclude `lastError` records
+  // (mirrors the H2-G4 fix on the goal side). Checked BEFORE the freeze
+  // below so a first entry is blocked only while genuinely active; a form
+  // already frozen for this session stays open.
+  const editPendingOp = pendingLoanOps.get(editId);
+  const editHasActivePending = !!editPendingOp && !editPendingOp.failed;
+  if (!frozenRef.current && editHasActivePending) {
+    return (
+      <EditUnavailable
+        body="전송 대기 중인 변경이 있어요. 반영된 뒤에 수정할 수 있어요."
+        onRetry={() => void refresh()}
+      />
+    );
+  }
+
   const liveTarget = loans.find((l) => l.id === editId) ?? null;
   const liveMeta = loanMeta[editId] ?? null;
   if (!frozenRef.current && liveTarget && liveMeta) {
@@ -186,6 +208,10 @@ function LoanForm({ mode }: { mode: FormMode }) {
   // Household finance READ values come ONLY from the remote read-only
   // source — never useStore(). No local addLoan/updateLoan is ever called.
   const { status, error, refresh } = useFinanceRead();
+  // STEP 16-H2-L2: durable offline fallback for a loan CREATE / UPDATE /
+  // DELETE whose direct write hit a TRANSPORT failure (offline). Never used
+  // for a server/terminal verdict.
+  const pending = usePendingWrites();
 
   const editing = mode.kind === 'edit' ? mode.loan : null;
   const isEdit = mode.kind === 'edit';
@@ -290,6 +316,24 @@ function LoanForm({ mode }: { mode: FormMode }) {
     };
   };
 
+  /**
+   * STEP 16-H2-L2: a durable-enqueue that itself failed — the change is NOT
+   * queued, so the form stays open and the user is told why. Raw coordinator
+   * reasons are never surfaced. Mirrors goal-add / planned-add.
+   */
+  const enqueueFailMessage = (reason: Exclude<EnqueueOutcome, { ok: true }>['reason']): string => {
+    switch (reason) {
+      case 'not-hydrated':
+        return '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.';
+      case 'persist':
+        return '대출 정보를 기기에 저장하지 못했어요. 다시 시도해주세요.';
+      case 'cap':
+        return '전송 대기 중인 항목이 너무 많아요. 인터넷 연결 후 다시 시도해주세요.';
+      case 'existing-pending':
+        return '이미 전송 대기 중인 변경이 있어요.';
+    }
+  };
+
   const save = async () => {
     if (submittingRef.current || deletingRef.current || !canSave) return;
     if (status !== 'ready' || !session?.user?.id || !activeHousehold) return;
@@ -311,6 +355,28 @@ function LoanForm({ mode }: { mode: FormMode }) {
         draft,
       });
       if (!res.ok) {
+        // STEP 16-H2-L2: a TRANSPORT failure (offline) -> durable CREATE
+        // queue. The SAME stable client id (loanIdRef, never regenerated)
+        // and the SAME draft go into the PendingWrite, so a later flush
+        // replays the exact request and its 23505 reconcile stays
+        // idempotent — no duplicate-loan accident on a lost response.
+        if (res.transport === true) {
+          const enq = await pending.enqueueLoanCreate({
+            scope: { userId: session.user.id, householdId: activeHousehold.id },
+            entityId: loanIdRef.current,
+            payload: draft,
+          });
+          submittingRef.current = false;
+          setSubmitting(false);
+          if (enq.ok) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+            toast.show('대출을 추가했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+            router.back();
+            return;
+          }
+          toast.show(enqueueFailMessage(enq.reason));
+          return;
+        }
         submittingRef.current = false;
         setSubmitting(false);
         toast.show(res.message);
@@ -323,6 +389,7 @@ function LoanForm({ mode }: { mode: FormMode }) {
       return;
     }
 
+    // ---- edit ---- expectedUpdatedAt is the token captured at MOUNT.
     const token = expectedUpdatedAtRef.current;
     if (!token) {
       submittingRef.current = false;
@@ -338,6 +405,29 @@ function LoanForm({ mode }: { mode: FormMode }) {
       draft,
     });
     if (!res.ok) {
+      // STEP 16-H2-L2: a TRANSPORT failure (offline) -> durable UPDATE queue
+      // with the FROZEN mount token (`token`, captured once at mount — NEVER
+      // re-read here or on a later retry) verbatim, so the optimistic-
+      // concurrency check still fires as a conflict when the flush runs if
+      // someone else changed the loan meanwhile.
+      if (res.transport === true) {
+        const enq = await pending.enqueueLoanUpdate({
+          scope: { userId: session.user.id, householdId: activeHousehold.id },
+          entityId: mode.loan.id,
+          payload: draft,
+          expectedUpdatedAt: token,
+        });
+        submittingRef.current = false;
+        setSubmitting(false);
+        if (enq.ok) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          toast.show('대출을 수정했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+          router.back();
+          return;
+        }
+        toast.show(enqueueFailMessage(enq.reason));
+        return;
+      }
       submittingRef.current = false;
       setSubmitting(false);
       if (
@@ -398,6 +488,29 @@ function LoanForm({ mode }: { mode: FormMode }) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast.show('대출을 삭제했어요');
       router.back();
+      return;
+    }
+
+    // STEP 16-H2-L2: a TRANSPORT failure (offline) -> durable soft-DELETE
+    // queue with the FROZEN token captured at mount time (never re-read).
+    // `composeLoanManagement` hides the row from the list right away
+    // (optimistic); `data.loans` stays server-authoritative until the flush
+    // lands and a refresh confirms it.
+    if (res.transport === true) {
+      const enq = await pending.enqueueLoanDelete({
+        scope: { userId: session.user.id, householdId: activeHousehold.id },
+        entityId: mode.loan.id,
+        expectedUpdatedAt: token,
+      });
+      deletingRef.current = false;
+      setDeleting(false);
+      if (enq.ok) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        toast.show('대출을 삭제했어요 · 인터넷에 연결되면 자동으로 반영할게요');
+        router.back();
+        return;
+      }
+      toast.show(enqueueFailMessage(enq.reason));
       return;
     }
 

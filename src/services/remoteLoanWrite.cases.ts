@@ -1,20 +1,30 @@
 /**
- * Static verification for STEP 16-H2-L1.1 — the `addLoanPayment` idempotency
- * fix: `isSamePaymentRequest`, the ONE pure, extractable decision point that
- * both the pre-check and the 23505 race-fallback inside `addLoanPayment`
- * share to recognize "this is a replay of a repayment that already landed."
+ * Static verification for STEP 16-H2-L1.1 (`addLoanPayment` idempotency) AND
+ * STEP 16-H2-L2.3 (`updateLoan` idempotency) — the pure, extractable
+ * decision points each write's own "did our earlier attempt already land?"
+ * reconcile relies on:
+ *   - `isSamePaymentRequest` — shared by `addLoanPayment`'s pre-check and its
+ *     23505 race-fallback.
+ *   - `loanFieldsMatch` — `updateLoan`'s own "0 rows on the primary UPDATE ->
+ *     did WE already write this?" reconcile.
  *
- * The full `addLoanPayment` flow calls `supabase` directly and can't run
- * here (same limitation as remoteCategoryBudgetWrite.cases.ts's own header
- * note — every other Supabase-calling write service in this repo hits the
- * same wall; there is no Supabase-mocking harness in this environment). This
- * file covers the pure decision function exhaustively, plus a direct,
- * concrete reproduction of the REPORTED bug: it re-derives what the OLD
- * (removed) comparison — matching on the freshly-recomputed
- * `principal_part`/`interest_part` — would have done for the EXACT scenario
- * from the H2-L1 report (a lost-response replay after `paid` has already
- * moved), side-by-side with what the NEW `isSamePaymentRequest` does, using
- * the REAL `splitPayment()` so the numbers are not hand-picked.
+ * The full `addLoanPayment`/`updateLoan` flows call `supabase` directly and
+ * can't run here (same limitation as remoteCategoryBudgetWrite.cases.ts's
+ * own header note — every other Supabase-calling write service in this repo
+ * hits the same wall; there is no Supabase-mocking harness in this
+ * environment). This file covers both pure decision functions exhaustively,
+ * plus a direct, concrete reproduction of each REPORTED bug:
+ *   - `isSamePaymentRequest`: re-derives what the OLD (removed) comparison —
+ *     matching on the freshly-recomputed `principal_part`/`interest_part` —
+ *     would have done for the EXACT scenario from the H2-L1 report (a
+ *     lost-response replay after `paid` has already moved), side-by-side
+ *     with the NEW function, using the REAL `splitPayment()` so the numbers
+ *     are not hand-picked.
+ *   - `loanFieldsMatch`: reproduces the H2-L2.3 real-device bug — Postgres
+ *     `numeric` columns (`principal`, `annual_rate`) come back from
+ *     PostgREST as STRINGS, so the OLD raw `===` compare NEVER matched even
+ *     when the value was semantically identical, misreporting a
+ *     genuinely-landed lost-response retry as `conflict`.
  *
  * The INSERT-time split computation itself (`splitPayment`, `remaining`,
  * `annual_rate` re-SELECT) is UNCHANGED — see splits.cases.ts /
@@ -22,8 +32,9 @@
  * idempotency / duplicate-recognition ONLY.
  */
 import { splitPayment } from '@/lib/loan';
-import { isSamePaymentRequest } from '@/services/remoteLoanWrite';
-import type { NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
+import { isSamePaymentRequest, loanFieldsMatch } from '@/services/remoteLoanWrite';
+import { buildLoanUpdate } from '@/lib/remoteLoanWriteMapping';
+import type { NewLoanDraft, NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
 
 export interface CaseResult {
   name: string;
@@ -231,6 +242,149 @@ export async function runRemoteLoanWriteCases(): Promise<{
     true,
     'see report: both call sites reuse this exact function',
   );
+
+  /* ================================================================== *
+   * loanFieldsMatch — STEP 16-H2-L2.3 real-device bug
+   * ================================================================== */
+
+  const ld = (over: Partial<NewLoanDraft> = {}): NewLoanDraft => ({
+    name: '전세자금대출',
+    lender: '국민은행',
+    principal: 100000000,
+    annualRate: 4.5,
+    termMonths: 24,
+    startDate: '2026-01-15',
+    paymentDay: 15,
+    repayType: 'amortizing',
+    ...over,
+  });
+
+  /**
+   * A `loans` row shaped exactly like a REAL PostgREST response for the
+   * reconcile's own select
+   * (`'name,lender,principal,annual_rate,term_months,start_date,payment_day,repay_type,deleted_at,updated_at'`):
+   * `principal`/`annual_rate` (Postgres `numeric`) come back as STRINGS;
+   * `term_months`/`payment_day` (Postgres `int`) come back as genuine
+   * numbers — this asymmetry is exactly what the old bug missed.
+   */
+  const existingRow = (over: Record<string, unknown> = {}) => ({
+    name: '전세자금대출',
+    lender: '국민은행',
+    principal: '100000000', // numeric -> STRING over the wire
+    annual_rate: '4.5', // numeric -> STRING over the wire
+    term_months: 24, // int -> genuine number
+    start_date: '2026-01-15',
+    payment_day: 15, // int -> genuine number
+    repay_type: 'amortizing',
+    deleted_at: null,
+    updated_at: '2026-09-13T00:00:00.000+00:00',
+    ...over,
+  });
+
+  /** The OLD (removed) raw `===` comparison, reconstructed here (not
+   *  imported — no longer in the source) to demonstrate side-by-side that it
+   *  used to false-negative a semantically-identical PostgREST numeric
+   *  string against a JS number. */
+  function oldBuggyLoanFieldsMatch(
+    existing: Record<string, unknown>,
+    row: ReturnType<typeof buildLoanUpdate>,
+  ): boolean {
+    return (
+      existing.name === row.name &&
+      existing.lender === row.lender &&
+      existing.principal === row.principal &&
+      existing.annual_rate === row.annual_rate &&
+      existing.term_months === row.term_months &&
+      existing.start_date === row.start_date &&
+      existing.payment_day === row.payment_day &&
+      existing.repay_type === row.repay_type
+    );
+  }
+
+  // 11 — CORE REGRESSION (the real-device bug): a lost-response replay whose
+  // write ACTUALLY landed, reconciled against the PostgREST numeric-as-
+  // string representation — OLD comparison false-negatives (misreports
+  // `conflict`), NEW comparison correctly recognizes the idempotent match.
+  {
+    const draft = ld();
+    const row = buildLoanUpdate(draft);
+    const existing = existingRow(); // same values, numeric-as-string shape
+    const oldVerdict = oldBuggyLoanFieldsMatch(existing, row);
+    const newVerdict = loanFieldsMatch(existing, row);
+    check(
+      '11 CORE REGRESSION: PostgREST numeric-as-string vs JS number — OLD false-negatives (conflict), NEW recognizes idempotent match',
+      oldVerdict === false && newVerdict === true,
+      JSON.stringify({ existing, row, oldVerdict, newVerdict }),
+    );
+  }
+
+  // 12 — a GENUINE conflict (principal really differs) must still be
+  // detected — the fix widens type tolerance, it does NOT widen value
+  // tolerance.
+  {
+    const draft = ld({ principal: 100000000 });
+    const row = buildLoanUpdate(draft);
+    const existing = existingRow({ principal: '90000000' }); // someone else's edit
+    check(
+      '12 genuine principal mismatch (as PostgREST numeric string) -> loanFieldsMatch still false',
+      loanFieldsMatch(existing, row) === false,
+      '',
+    );
+  }
+
+  // 13 — a GENUINE annual_rate conflict is still detected.
+  {
+    const draft = ld({ annualRate: 4.5 });
+    const row = buildLoanUpdate(draft);
+    const existing = existingRow({ annual_rate: '5.0' });
+    check('13 genuine annual_rate mismatch -> loanFieldsMatch still false', loanFieldsMatch(existing, row) === false, '');
+  }
+
+  // 14 — term_months / payment_day (genuine numbers, not numeric strings)
+  // still compare correctly in both directions (match + genuine mismatch).
+  {
+    const draft = ld({ termMonths: 24, paymentDay: 15 });
+    const row = buildLoanUpdate(draft);
+    const match = loanFieldsMatch(existingRow({ term_months: 24, payment_day: 15 }), row);
+    const mismatch = loanFieldsMatch(existingRow({ term_months: 36 }), row);
+    check(
+      '14 term_months/payment_day (plain int columns) -> match true, genuine mismatch false',
+      match === true && mismatch === false,
+      JSON.stringify({ match, mismatch }),
+    );
+  }
+
+  // 15 — name / lender / start_date / repay_type (plain text/date columns,
+  // never numeric-string affected) still compare correctly — unaffected by
+  // the fix, regression check that the untouched fields still work.
+  {
+    const draft = ld();
+    const row = buildLoanUpdate(draft);
+    const sameText = loanFieldsMatch(existingRow(), row);
+    const diffName = loanFieldsMatch(existingRow({ name: '다른 이름' }), row);
+    const diffLender = loanFieldsMatch(existingRow({ lender: '다른 은행' }), row);
+    const diffDate = loanFieldsMatch(existingRow({ start_date: '2026-02-01' }), row);
+    const diffType = loanFieldsMatch(existingRow({ repay_type: 'bullet' }), row);
+    check(
+      '15 text/date/enum fields (name/lender/start_date/repay_type) still match/mismatch correctly',
+      sameText === true && diffName === false && diffLender === false && diffDate === false && diffType === false,
+      JSON.stringify({ sameText, diffName, diffLender, diffDate, diffType }),
+    );
+  }
+
+  // 16 — a deleted_at difference is NOT part of loanFieldsMatch's own
+  // comparison set (updateLoan checks deleted_at separately, BEFORE calling
+  // this) — documents that boundary rather than asserting new behavior.
+  {
+    const draft = ld();
+    const row = buildLoanUpdate(draft);
+    const verdict = loanFieldsMatch(existingRow({ deleted_at: '2026-09-13T00:00:00.000Z' }), row);
+    check(
+      '16 (documented boundary) loanFieldsMatch does not itself look at deleted_at — updateLoan checks that separately first',
+      verdict === true,
+      'see updateLoan(): existingRow.deleted_at != null is checked BEFORE loanFieldsMatch is ever called',
+    );
+  }
 
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };

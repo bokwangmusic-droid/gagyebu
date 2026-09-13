@@ -205,19 +205,35 @@ export function isSamePaymentRequest(
   );
 }
 
-/** Does the stored loan already hold exactly what this edit would write? */
-function loanFieldsMatch(
+/**
+ * Does the stored loan already hold exactly what this edit would write?
+ *
+ * STEP 16-H2-L2.3 — `principal` / `annual_rate` are Postgres `numeric`
+ * columns (see supabase/migrations/20260905000200_household_data.sql), which
+ * PostgREST always serializes as JSON STRINGS (e.g. `"1000000"`), never
+ * numbers — unlike `term_months` / `payment_day` (`int`), which come back as
+ * genuine numbers. `existing` here is a RAW select result, so
+ * `existing.principal` / `existing.annual_rate` are strings at runtime
+ * despite `row` (built from the draft) holding JS numbers for the SAME
+ * fields. The old raw `===` compare therefore NEVER matched even when the
+ * value was semantically identical, misreporting a genuinely-landed,
+ * idempotent lost-response retry as a `conflict`. Wrapped in `Number()` for
+ * all four numeric-ish fields, mirroring `serverLoanConfirmsUpdate`'s
+ * already-safe pattern (the coordinator's separate ack comparison, which
+ * this bug did not affect).
+ */
+export function loanFieldsMatch(
   existing: Record<string, unknown>,
   row: ReturnType<typeof buildLoanUpdate>,
 ): boolean {
   return (
     existing.name === row.name &&
     existing.lender === row.lender &&
-    existing.principal === row.principal &&
-    existing.annual_rate === row.annual_rate &&
-    existing.term_months === row.term_months &&
+    Number(existing.principal) === Number(row.principal) &&
+    Number(existing.annual_rate) === Number(row.annual_rate) &&
+    Number(existing.term_months) === Number(row.term_months) &&
     existing.start_date === row.start_date &&
-    existing.payment_day === row.payment_day &&
+    Number(existing.payment_day) === Number(row.payment_day) &&
     existing.repay_type === row.repay_type
   );
 }
