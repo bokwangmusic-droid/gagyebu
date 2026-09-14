@@ -33,14 +33,14 @@
  */
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { Text, TextInput, View } from 'react-native';
+import { Platform, Text, TextInput, View } from 'react-native';
 
 import { AuthShell } from '@/components/auth/AuthShell';
 import { PasswordField } from '@/components/auth/PasswordField';
 import { Field } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { useToast } from '@/components/ui/Toast';
-import { MIN_PASSWORD_LENGTH, isValidNewPasswordForm } from '@/lib/authValidation';
+import { MIN_PASSWORD_LENGTH, isValidNewPassword } from '@/lib/authValidation';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/store/auth';
 import { colors, spacing } from '@/theme/tokens';
@@ -104,14 +104,33 @@ export default function ResetPassword() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canSubmit = state === 'ready' && isValidNewPasswordForm(password, confirm) && !submitting;
-
   const onSubmit = async () => {
-    if (submittingRef.current || !canSubmit) return;
+    if (submittingRef.current) return; // duplicate-submit guard
+
+    // UX fix: tell the user exactly what's missing instead of silently doing
+    // nothing, for BOTH entry points (keyboard "완료" and the button below —
+    // both call this same onSubmit). Checked before touching submittingRef/
+    // setSubmitting so a validation toast never flips the button into
+    // "변경 중...". The recovery-session gate itself is untouched — this
+    // form only ever renders (below) once `state === 'ready'`, so no extra
+    // state check is needed here.
+    if (password.length === 0) {
+      toast.show('새 비밀번호를 입력해주세요');
+      return;
+    }
+    if (!isValidNewPassword(password)) {
+      toast.show(`비밀번호는 ${MIN_PASSWORD_LENGTH}자 이상으로 설정해주세요`);
+      return;
+    }
+    if (confirm.length === 0) {
+      toast.show('새 비밀번호 확인을 입력해주세요');
+      return;
+    }
     if (password !== confirm) {
       toast.show('비밀번호가 서로 달라요');
       return;
     }
+
     submittingRef.current = true;
     setSubmitting(true);
     const result = await updatePassword(password);
@@ -210,12 +229,32 @@ export default function ResetPassword() {
             textContentType="newPassword"
             returnKeyType="done"
             onSubmitEditing={onSubmit}
+            // Android fallback (see app/sign-in.tsx for the confirmed root
+            // cause): only the LAST secureTextEntry field before submit
+            // needs this — some OEM keyboards deliver a masked field's
+            // "완료" as a raw Enter key event rather than an IME action.
+            // Reuses the same onSubmit; its own submittingRef/field guards
+            // make this a no-op if onSubmitEditing also fires. Android-only,
+            // so iOS behavior is unchanged.
+            onKeyPress={
+              Platform.OS === 'android'
+                ? ({ nativeEvent }) => {
+                    if (nativeEvent.key === 'Enter') onSubmit();
+                  }
+                : undefined
+            }
           />
         </Field>
         <GradientButton
           label={submitting ? '변경 중...' : '비밀번호 변경'}
           onPress={onSubmit}
-          disabled={!canSubmit}
+          // UX fix: no longer disabled just because a field is empty/
+          // mismatched — a tap now reaches onSubmit's own validation toast
+          // instead of doing nothing. Still gated on the recovery session
+          // being 'ready' (this JSX branch only renders then anyway) and on
+          // an in-flight submit (duplicate-submit guard for the button
+          // itself) — recovery/deep-link establishment above is untouched.
+          disabled={state !== 'ready' || submitting}
         />
       </View>
     </AuthShell>

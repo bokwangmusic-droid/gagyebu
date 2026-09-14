@@ -32,10 +32,23 @@ export default function ForgotPassword() {
   const [sent, setSent] = useState(false);
   const submittingRef = useRef(false); // guards against a double-tap racing the async call
 
-  const canSubmit = isValidEmail(email) && !submitting;
-
   const onSubmit = async () => {
-    if (submittingRef.current || !canSubmit) return;
+    if (submittingRef.current) return; // duplicate-submit guard
+
+    // UX fix: tell the user exactly what's wrong instead of silently doing
+    // nothing, for BOTH entry points (keyboard "완료" and the button below —
+    // both call this same onSubmit). Checked before touching submittingRef/
+    // setSubmitting so a validation toast never flips the button into
+    // "전송 중...".
+    if (!email.trim()) {
+      toast.show('이메일을 입력해주세요');
+      return;
+    }
+    if (!isValidEmail(email)) {
+      toast.show('올바른 이메일 주소를 입력해주세요');
+      return;
+    }
+
     submittingRef.current = true;
     setSubmitting(true);
     const result = await resetPasswordForEmail(email);
@@ -98,7 +111,14 @@ export default function ForgotPassword() {
         <GradientButton
           label={submitting ? '전송 중...' : '재설정 메일 보내기'}
           onPress={onSubmit}
-          disabled={!canSubmit}
+          // UX fix: no longer disabled just because the email is empty/
+          // invalid — a tap now reaches onSubmit's own validation toast
+          // instead of doing nothing. Still disabled while the request is
+          // actually in flight (duplicate-submit guard for the button
+          // itself). No Android raw-Enter fallback here — this field is a
+          // plain TextField, not secureTextEntry, so it isn't affected by
+          // the masked-field IME quirk fixed in app/sign-in.tsx.
+          disabled={submitting}
         />
       </View>
 

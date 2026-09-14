@@ -1,12 +1,13 @@
 import { useRouter } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Pressable, Text, TextInput, View } from 'react-native';
+import { Platform, Pressable, Text, TextInput, View } from 'react-native';
 
 import { AuthShell } from '@/components/auth/AuthShell';
 import { PasswordField } from '@/components/auth/PasswordField';
 import { Field, TextField } from '@/components/ui/controls';
 import { GradientButton } from '@/components/ui/GradientButton';
 import { useToast } from '@/components/ui/Toast';
+import { MIN_PASSWORD_LENGTH, isValidEmail, isValidNewPassword } from '@/lib/authValidation';
 import { useAuth } from '@/store/auth';
 import { colors, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
@@ -27,19 +28,44 @@ export default function SignUp() {
   const passwordRef = useRef<TextInput>(null);
   const confirmRef = useRef<TextInput>(null);
 
-  const canSubmit =
-    name.trim().length > 0 &&
-    email.trim().length > 0 &&
-    password.length >= 6 &&
-    confirm.length > 0 &&
-    !submitting;
-
   const onSubmit = async () => {
-    if (submittingRef.current || !canSubmit) return;
+    if (submittingRef.current) return; // duplicate-submit guard
+
+    // UX fix: guide the user to the FIRST missing/invalid field instead of
+    // silently doing nothing, for BOTH entry points (keyboard "완료" and the
+    // button below — both call this same onSubmit). Order matches the form's
+    // own top-to-bottom field order. Checked before touching submittingRef/
+    // setSubmitting so a validation toast never flips the button into
+    // "가입 중...".
+    if (!name.trim()) {
+      toast.show('이름을 입력해주세요');
+      return;
+    }
+    if (!email.trim()) {
+      toast.show('이메일을 입력해주세요');
+      return;
+    }
+    if (!isValidEmail(email)) {
+      toast.show('올바른 이메일 주소를 입력해주세요');
+      return;
+    }
+    if (password.length === 0) {
+      toast.show('비밀번호를 입력해주세요');
+      return;
+    }
+    if (!isValidNewPassword(password)) {
+      toast.show(`비밀번호는 ${MIN_PASSWORD_LENGTH}자 이상으로 설정해주세요`);
+      return;
+    }
+    if (confirm.length === 0) {
+      toast.show('비밀번호 확인을 입력해주세요');
+      return;
+    }
     if (password !== confirm) {
       toast.show('비밀번호가 서로 달라요');
       return;
     }
+
     submittingRef.current = true;
     setSubmitting(true);
     const result = await signUp({ name, email, password });
@@ -143,12 +169,30 @@ export default function SignUp() {
             textContentType="newPassword"
             returnKeyType="done"
             onSubmitEditing={onSubmit}
+            // Android fallback (see app/sign-in.tsx for the confirmed root
+            // cause): only the LAST secureTextEntry field before submit
+            // needs this — some OEM keyboards deliver a masked field's
+            // "완료" as a raw Enter key event rather than an IME action.
+            // Reuses the same onSubmit; its own submittingRef/field guards
+            // make this a no-op if onSubmitEditing also fires. Android-only,
+            // so iOS behavior is unchanged.
+            onKeyPress={
+              Platform.OS === 'android'
+                ? ({ nativeEvent }) => {
+                    if (nativeEvent.key === 'Enter') onSubmit();
+                  }
+                : undefined
+            }
           />
         </Field>
         <GradientButton
           label={submitting ? '가입 중...' : '돈돈 시작하기'}
           onPress={onSubmit}
-          disabled={!canSubmit}
+          // UX fix: no longer disabled just because a field is empty/invalid
+          // — a tap now reaches onSubmit's own validation toast instead of
+          // doing nothing. Still disabled while signUp is actually in
+          // flight (duplicate-submit guard for the button itself).
+          disabled={submitting}
         />
       </View>
 
