@@ -35,6 +35,22 @@ import { supabase } from '@/lib/supabase';
  */
 const EMAIL_REDIRECT_TO = Linking.createURL('auth-callback');
 
+/**
+ * STEP AUTH-F1: where Supabase's password-reset email sends the browser
+ * after verifying the recovery token — mirrors `EMAIL_REDIRECT_TO` exactly
+ * (same `Linking.createURL` mechanism, same scheme, just a different
+ * in-app route). Supabase's default (implicit-flow) redirect appends the
+ * new session as a URL FRAGMENT (`#access_token=...&refresh_token=...&
+ * type=recovery`, or `#error=...` on an expired/used link) — this client
+ * runs with `detectSessionInUrl: false` (src/lib/supabase.ts), so nothing
+ * auto-parses that fragment; app/reset-password.tsx reads it itself via
+ * `expo-linking` and calls `supabase.auth.setSession(...)` explicitly. Must
+ * also be added to Supabase Dashboard → Authentication → URL Configuration
+ * → Redirect URLs (see the completion report) or Supabase will reject it
+ * and fall back to the Site URL, exactly like `EMAIL_REDIRECT_TO`.
+ */
+const RESET_PASSWORD_REDIRECT_TO = Linking.createURL('reset-password');
+
 /** The row STEP 16-C's handle_new_user() trigger creates in public.profiles. */
 export interface AuthProfile {
   id: string;
@@ -66,6 +82,27 @@ interface AuthContextValue {
   signIn(params: { email: string; password: string }): Promise<AuthActionResult>;
   signOut(): Promise<void>;
   /**
+   * STEP AUTH-F1 — send a password-reset email via Supabase Auth
+   * (`resetPasswordForEmail`), redirecting the recovery link to
+   * `RESET_PASSWORD_REDIRECT_TO`. Anti-enumeration: Supabase itself never
+   * reveals whether the email is registered (this call succeeds either
+   * way), and `describeAuthError`'s fallback is already a generic,
+   * non-revealing message for any other failure — so the caller can
+   * always show its OWN generic "메일을 보냈어요" copy on `{ok:true}` without
+   * a separate "not found" branch to avoid here.
+   */
+  resetPasswordForEmail(email: string): Promise<AuthActionResult>;
+  /**
+   * STEP AUTH-F1 — change the CURRENTLY authenticated session's password
+   * (`supabase.auth.updateUser({ password })`). Requires an active session
+   * — for the password-recovery flow, app/reset-password.tsx establishes
+   * one itself (via `supabase.auth.setSession(...)` from the parsed
+   * recovery-link fragment) before this is ever callable. No re-auth
+   * challenge beyond "there is a live session" — same trust level
+   * `updateDisplayName` already relies on.
+   */
+  updatePassword(newPassword: string): Promise<AuthActionResult>;
+  /**
    * Update the CURRENT account's `public.profiles.display_name` (self-only,
    * RLS-enforced). Re-checks the live session first and refuses if it no
    * longer matches the context's user (stale-account guard). On success the
@@ -88,6 +125,12 @@ function describeAuthError(error: unknown): string {
   if (m.includes('invalid login credentials')) return '이메일 또는 비밀번호가 올바르지 않아요';
   if (m.includes('email not confirmed')) return '이메일 인증을 아직 완료하지 않았어요. 메일함을 확인해주세요';
   if (m.includes('already registered')) return '이미 가입된 이메일이에요';
+  // STEP AUTH-F1: `updateUser({ password })` returns THIS specific message
+  // when the new password matches the current one — checked BEFORE the
+  // generic "at least"/"should be" length-policy branch below, since
+  // Supabase's own wording for this case also happens to contain "should be".
+  if (m.includes('password') && m.includes('different from the old password'))
+    return '새 비밀번호가 이전 비밀번호와 같아요. 다른 비밀번호를 입력해주세요';
   if (m.includes('password') && (m.includes('at least') || m.includes('should be')))
     return '비밀번호는 6자 이상으로 설정해주세요';
   if (m.includes('rate limit') || m.includes('too many'))
@@ -216,6 +259,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const resetPasswordForEmail: AuthContextValue['resetPasswordForEmail'] = useCallback(async (email) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: RESET_PASSWORD_REDIRECT_TO,
+    });
+    if (error) return { ok: false, message: describeAuthError(error) };
+    return { ok: true };
+  }, []);
+
+  const updatePassword: AuthContextValue['updatePassword'] = useCallback(async (newPassword) => {
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) return { ok: false, message: describeAuthError(error) };
+    return { ok: true };
+  }, []);
+
   /**
    * STEP 16-PROFILE-FIX §4-§7: the ONLY writer of the account name. Writes
    * `public.profiles.display_name` for the LIVE session's own user (RLS
@@ -274,6 +331,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signUp,
       signIn,
       signOut,
+      resetPasswordForEmail,
+      updatePassword,
       updateDisplayName,
     }),
     [
@@ -285,6 +344,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signUp,
       signIn,
       signOut,
+      resetPasswordForEmail,
+      updatePassword,
       updateDisplayName,
     ],
   );

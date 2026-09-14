@@ -70,6 +70,15 @@ export default function SignIn() {
             onSubmitEditing={onSubmit}
           />
         </Field>
+        <Pressable
+          onPress={() => router.push('/forgot-password')}
+          hitSlop={8}
+          style={{ alignSelf: 'flex-end', marginTop: -8, marginBottom: spacing.md }}
+        >
+          <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
+            비밀번호를 잊으셨나요?
+          </Text>
+        </Pressable>
         <GradientButton
           label={submitting ? '로그인 중...' : '로그인'}
           onPress={onSubmit}

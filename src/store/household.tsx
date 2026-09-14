@@ -115,6 +115,11 @@ function householdNameOf(row: HouseholdMemberRow): string {
 
 export function HouseholdProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
+  // STEP AUTH-F1 root-cause fix — see the sign-in/sign-out effect below for
+  // why this provider keys its refetch on the primitive id, not the Session
+  // user OBJECT (whose reference changes on every auth event, same account
+  // or not).
+  const userId = user?.id ?? null;
   const [households, setHouseholds] = useState<Household[]>([]);
   const [activeHousehold, setActiveHousehold] = useState<Household | null>(null);
   const [members, setMembers] = useState<HouseholdMemberInfo[]>([]);
@@ -186,10 +191,28 @@ export function HouseholdProvider({ children }: { children: ReactNode }) {
 
   // Sign-out clears every bit of household state from memory (STEP 16-E
   // §6/§13) — this never touches gagyebu.* AsyncStorage data. Sign-in loads.
+  //
+  // STEP AUTH-F1 root-cause fix — keyed on `userId` (a primitive), not `user`
+  // (the Session's user OBJECT). Every field this provider ever reads off
+  // `user` is `.id` alone (see `refreshHouseholds`/`createHousehold`/
+  // `refreshMembers` above/below) — `user` itself gets a BRAND NEW object
+  // reference on every `onAuthStateChange` event, including a token refresh
+  // or a password-recovery `setSession()` call for the SAME account
+  // (confirmed by reading `@supabase/auth-js`'s `_setSession`: it builds a
+  // fresh session/user object every call, even when reusing the same
+  // tokens). Depending on the object reference meant this effect — and its
+  // `setLoading(true)` — refired for every such event even when the signed-
+  // in user hadn't actually changed, which is what let a recovery-flow
+  // `setSession()` retrigger the household fetch and, via `RootNav`'s own
+  // `householdLoading` gate, unmount the whole app mid-recovery. Comparing
+  // the id instead means a same-user session refresh no longer refetches at
+  // all — sign-out (`userId` -> null), a genuinely different account
+  // signing in (`userId` changes), and the very first sign-in (`userId`
+  // appears) all still behave exactly as before.
   useEffect(() => {
     mountedRef.current = true;
-    latestUserIdRef.current = user?.id ?? null;
-    if (!user) {
+    latestUserIdRef.current = userId;
+    if (!userId) {
       setHouseholds([]);
       setActiveHousehold(null);
       setMembers([]);
@@ -203,7 +226,7 @@ export function HouseholdProvider({ children }: { children: ReactNode }) {
       mountedRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
+  }, [userId]);
 
   const refreshMembers = useCallback(async () => {
     if (!activeHousehold) {
