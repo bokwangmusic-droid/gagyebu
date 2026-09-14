@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>돈돈 가계부 계정 및 데이터 삭제 안내</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #FAF6EE;
+    --card: #FFFFFF;
+    --text: #2A2220;
+    --sub: #6B6058;
+    --border: #E7DFD3;
+    --accent: #7C6AEF;
+    --danger: #C0392B;
+    --danger-bg: #FBEAE8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+    line-height: 1.6;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 0 64px;
+  }
+  header {
+    margin-bottom: 24px;
+  }
+  h1 {
+    font-size: 22px;
+    margin: 0 0 8px;
+  }
+  .meta {
+    color: var(--sub);
+    font-size: 13px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card.danger {
+    background: var(--danger-bg);
+    border-color: #EBC7C1;
+  }
+  h2 {
+    font-size: 16px;
+    margin: 0 0 10px;
+  }
+  p {
+    margin: 0 0 10px;
+    font-size: 14px;
+  }
+  ul {
+    margin: 0 0 10px;
+    padding-left: 20px;
+    font-size: 14px;
+  }
+  li {
+    margin-bottom: 6px;
+  }
+  a {
+    color: var(--accent);
+  }
+  code {
+    background: #F1ECE0;
+    border-radius: 6px;
+    padding: 2px 6px;
+    font-size: 13px;
+  }
+  .home-link {
+    display: inline-block;
+    margin-top: 8px;
+    font-size: 13px;
+  }
+  .step {
+    font-weight: 700;
+    color: var(--accent);
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>돈돈 가계부 계정 및 데이터 삭제 안내</h1>
+    <p class="meta">문의: <a href="mailto:dondonledger@gmail.com">dondonledger@gmail.com</a></p>
+    <a class="home-link" href="./index.html">← 돈돈 가계부 지원 페이지로</a>
+  </header>
+
+  <div class="card">
+    <h2>방법 1 — 앱에서 직접 삭제하기 (권장)</h2>
+    <p>
+      돈돈 가계부 앱을 설치·로그인할 수 있다면, 앱 안에서 바로 계정을 영구
+      삭제할 수 있습니다.
+    </p>
+    <p>
+      <span class="step">내정보</span> → <span class="step">계정 삭제</span>
+    </p>
+    <p>
+      진행 중 현재 비밀번호 재입력으로 본인 확인을 거치며, 공유 중인 우리집의
+      소유자라면 다른 구성원에게 소유권을 먼저 넘긴 뒤 최종 삭제를 확인합니다.
+      삭제가 완료되면 즉시 로그인 화면으로 이동합니다.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>방법 2 — 앱을 사용할 수 없는 경우 (이메일 요청)</h2>
+    <p>
+      기기를 잃어버렸거나 앱을 더 이상 사용할 수 없는 등 앱 내 삭제가 어려운
+      경우, 아래 이메일로 계정 삭제를 요청할 수 있습니다.
+    </p>
+    <p><a href="mailto:dondonledger@gmail.com?subject=%5B돈돈%20가계부%20계정%20삭제%20요청%5D">dondonledger@gmail.com</a></p>
+    <p>요청 시 아래 내용만 포함해 주세요.</p>
+    <ul>
+      <li>가입 시 사용한 이메일 주소</li>
+      <li>제목 예시: <code>[돈돈 가계부 계정 삭제 요청]</code></li>
+    </ul>
+    <p>
+      계정 보호를 위해 가입 이메일 주소 확인 등 합리적인 본인 확인 절차를 거칠 수
+      있습니다. <strong>비밀번호는 어떤 경우에도 이메일로 요청하지 않습니다.</strong>
+      본인 확인이 완료되면 아래 "삭제되는 항목"에 따라 계정과 데이터를 처리합니다.
+    </p>
+  </div>
+
+  <div class="card danger">
+    <h2>삭제 시 처리되는 항목</h2>
+    <p>계정을 삭제하면 아래 정책에 따라 처리됩니다.</p>
+    <ul>
+      <li>본인의 로그인 계정(이메일·비밀번호 등 인증 정보)이 영구 삭제됩니다.</li>
+      <li>
+        <strong>혼자 사용하는 우리집</strong>(구성원이 본인 한 명뿐인 우리집)이라면,
+        해당 우리집과 그 안의 거래·예산·카드·목표·대출 등 데이터가 함께
+        영구 삭제됩니다.
+      </li>
+      <li>
+        <strong>다른 구성원이 있는 우리집의 일반 구성원</strong>이라면, 본인의
+        참여(멤버십)만 사라지고 해당 우리집과 다른 구성원의 데이터는 그대로
+        유지됩니다.
+      </li>
+      <li>
+        <strong>다른 구성원이 있는 우리집의 소유자</strong>라면, 삭제 전에
+        해당 우리집의 소유권을 다른 구성원에게 먼저 넘겨야 합니다. 소유권
+        이전 없이는 계정 삭제가 진행되지 않습니다(앱이 자동으로 안내합니다).
+      </li>
+      <li>이 기기에 남아있던 미전송 오프라인 변경사항과 앱 내부 로컬 백업도
+        함께 정리됩니다.</li>
+    </ul>
+    <p>이 작업은 되돌릴 수 없습니다.</p>
+  </div>
+
+  <div class="card">
+    <h2>삭제되지 않을 수 있는 항목</h2>
+    <ul>
+      <li>이용자가 직접 파일로 저장하거나 다른 곳에 공유한 백업 파일 —
+        앱 밖으로 나간 파일은 자동으로 삭제할 수 없습니다.</li>
+      <li>다른 우리집 구성원이 소유·공유 중인 데이터 중 서비스 정책상 유지되는
+        데이터 — 위 "다른 구성원이 있는 우리집"의 경우처럼, 함께 쓰는 우리집
+        자체와 다른 구성원의 데이터는 본인 계정 삭제와 별개로 유지됩니다.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>처리 기간</h2>
+    <p>
+      앱 내 삭제는 인터넷 연결 상태에서 즉시 처리됩니다. 이메일 요청은 본인
+      확인 절차를 거쳐 합리적인 기간 내에 처리하며, 처리 완료 시 요청하신
+      이메일로 안내드립니다.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>더 알아보기</h2>
+    <p><a href="./privacy.html">돈돈 가계부 개인정보처리방침 보기 →</a></p>
+    <a class="home-link" href="./index.html">← 돈돈 가계부 지원 페이지로</a>
+  </div>
+</main>
+</body>
+</html>

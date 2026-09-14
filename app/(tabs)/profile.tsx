@@ -1,4 +1,5 @@
 import Constants from 'expo-constants';
+import * as Linking from 'expo-linking';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
@@ -20,6 +21,9 @@ import { useFinanceRead } from '@/store/financeRead';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
+
+/** Public policy pages — docs/*.html, served via GitHub Pages (see repo /docs). */
+const PRIVACY_POLICY_URL = 'https://bokwangmusic-droid.github.io/gagyebu/privacy.html';
 
 export default function ProfileScreen() {
   const router = useRouter();
@@ -89,12 +93,15 @@ export default function ProfileScreen() {
       : null;
   const appInfoSub = `버전 ${appVersion}${buildVersion ? ` (빌드 ${buildVersion})` : ''}`;
 
+  // Play 출시 감사 FIX: "데이터는 이 기기에만 저장돼요"는 더 이상 사실이
+  // 아님(우리집 가계부 데이터는 Supabase). showPrivacyInfo()의 정확한
+  // 문구와 모순되지 않도록 광고 없음만 남기고 저장 위치 언급은 뺐다.
   const showAppInfo = () =>
     Alert.alert(
       appName,
       `버전 ${appVersion}${buildVersion ? `\n빌드 ${buildVersion}` : ''}\n\n` +
         '뱅크샐러드의 시각화 + 편한가계부의 3초 입력을 합쳤어요.\n' +
-        '광고 없고, 데이터는 이 기기에만 저장돼요.',
+        '광고 없이 편하게 써요.',
     );
 
   // STEP 16-G1B PROFILE FINAL FIX: with household finance now living in
@@ -103,14 +110,33 @@ export default function ProfileScreen() {
   // true and would wrongly imply the household's remote data lives only on
   // this device. Rewritten to distinguish "우리집 가계부 데이터" (remote,
   // Supabase) from "개인 설정" (local, this device only) explicitly.
+  //
+  // Play 출시 감사 FIX: "지금은... 조회만 할 수 있어요"도 더 이상 사실이
+  // 아님 — src/lib/financeMode.ts의 REMOTE_FINANCE_WRITE는 모든 엔티티가
+  // true(추가·수정·삭제 전부 지원). 실제 지원 범위에 맞게 수정.
+  //
+  // 검수 FIX: "프로필 이름 같은 개인 설정은 이 기기에만 저장돼요"도 사실이
+  // 아님 — profile.displayName은 useAuth().updateDisplayName()을 통해
+  // Supabase profiles.display_name에 저장되는 원격 데이터(이 파일 33-37행
+  // 주석 참고). 로컬에만 저장되는 건 quickPaste 등 앱 설정과 백업 파일뿐.
   const showPrivacyInfo = () =>
     Alert.alert(
       '개인정보 · 데이터 보관',
-      '• 우리집 가계부 데이터(거래·예산·목표 등)는 Supabase에 안전하게 저장돼요.\n' +
-        '• 프로필 이름 같은 개인 설정은 이 기기에만 저장돼요.\n' +
-        '• 지금은 우리집 가계부 데이터를 조회만 할 수 있어요.\n' +
+      '• 우리집 가계부 데이터(거래·예산·카드·목표·대출 등)는 계정·우리집 단위로 Supabase 서버에 저장되고 기기 간 동기화돼요.\n' +
+        '• 일부 앱 설정과 로컬 백업은 이 기기에 저장될 수 있어요.\n' +
+        '• 우리집 가계부 데이터는 조회뿐 아니라 추가·수정·삭제도 할 수 있어요.\n' +
         '• 이 기기의 로컬 백업 파일은 직접 저장·공유할 때만 기기 밖으로 나가요.',
     );
+
+  const openPrivacyPolicy = () => {
+    void (async () => {
+      try {
+        await Linking.openURL(PRIVACY_POLICY_URL);
+      } catch {
+        toast.show('개인정보처리방침 페이지를 열지 못했어요. 잠시 후 다시 시도해주세요.');
+      }
+    })();
+  };
 
   const reviewOnboarding = () => {
     // Re-arm the onboarding gate, then jump to it. Finishing / skipping there
@@ -346,6 +372,14 @@ export default function ProfileScreen() {
           title="개인정보 · 데이터 보관"
           sub="개인 설정은 이 기기에 저장돼요"
           onPress={showPrivacyInfo}
+        />
+        <Row
+          icon="info"
+          iconBg={colors.infoLight}
+          iconColor={colors.infoText}
+          title="개인정보처리방침"
+          sub="전체 내용을 웹에서 확인해요"
+          onPress={openPrivacyPolicy}
         />
         <Row
           icon="help"
