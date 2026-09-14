@@ -37,6 +37,7 @@ import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
 import {
   createPendingWriteCoordinator,
+  type ClearPendingOutcome,
   type CoordinatorScope,
   type DiscardOutcome,
   type EnqueueOutcome,
@@ -320,6 +321,10 @@ interface PendingFinanceValue {
   discardPending: (queueId: string) => Promise<DiscardOutcome>;
   /** Ask for a flush now (e.g. pull-to-refresh). `includeFailed` retries held ops. */
   requestFlush: (opts?: { includeFailed?: boolean }) => void;
+  /** AUTH-F2-B destructive-flow queue controls. */
+  pauseForAccountDeletion: () => Promise<void>;
+  resumeAfterAccountDeletionFailure: () => void;
+  clearPendingForAccount: (userId: string) => Promise<ClearPendingOutcome>;
 }
 
 const PendingFinanceContext = createContext<PendingFinanceValue | null>(null);
@@ -597,6 +602,9 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       enqueueLoanPaymentDelete: coord.enqueueLoanPaymentDelete,
       discardPending: coord.discardPending,
       requestFlush: coord.requestFlush,
+      pauseForAccountDeletion: coord.pauseForAccountDeletion,
+      resumeAfterAccountDeletionFailure: coord.resumeAfterAccountDeletionFailure,
+      clearPendingForAccount: coord.clearPendingForAccount,
     }),
     // state is a fresh object each render; that's exactly when something changed
     [state, coord],

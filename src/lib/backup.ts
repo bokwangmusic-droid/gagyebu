@@ -114,6 +114,28 @@ async function writeIndex(list: BackupMeta[]): Promise<void> {
   await AsyncStorage.setItem(storageKey(INDEX_KEY), JSON.stringify(list));
 }
 
+/**
+ * AUTH-F2-B — remove every app-managed on-device backup AFTER confirmed
+ * server account deletion. Exported/shared files live outside AsyncStorage
+ * and cannot be removed here; only the app's own rolling snapshots/index
+ * and daily-auto guard are targeted.
+ */
+export async function clearLocalBackups(): Promise<boolean> {
+  try {
+    const allKeys = await AsyncStorage.getAllKeys();
+    const backupBodyPrefix = storageKey('backup:');
+    const indexKey = storageKey(INDEX_KEY);
+    const lastAutoKey = storageKey(LAST_AUTO_KEY);
+    const targets = allKeys.filter(
+      (key) => key === indexKey || key === lastAutoKey || key.startsWith(backupBodyPrefix),
+    );
+    if (targets.length > 0) await AsyncStorage.multiRemove(targets);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Split into the snapshots to keep (newest, within caps) and the ones to drop. */
 function applyCaps(list: BackupMeta[]): { keep: BackupMeta[]; drop: BackupMeta[] } {
   const keep: BackupMeta[] = [];

@@ -547,6 +547,20 @@ export interface PendingWriteCoordinator {
   /** Ask for a flush. `includeFailed` first clears the terminal-failed set so
    *  those ops get one more attempt (manual "다시 시도"). */
   requestFlush(opts?: { includeFailed?: boolean }): void;
+  /**
+   * AUTH-F2-B — stop scheduling new queue writes and wait for the currently
+   * running runOp (if any) to leave the flusher. Durable records are NOT
+   * removed here; this is safe to call before the server deletion request.
+   */
+  pauseForAccountDeletion(): Promise<void>;
+  /** Restore the live scope after a failed/uncertain delete-account call. */
+  resumeAfterAccountDeletionFailure(): void;
+  /**
+   * AUTH-F2-B — AFTER confirmed server deletion, durably discard every
+   * pending record owned by the deleted user while preserving records from
+   * any other account that may have used this device.
+   */
+  clearPendingForAccount(userId: string): Promise<ClearPendingOutcome>;
   dispose(): void;
   getState(): CoordinatorState;
 }
@@ -554,6 +568,10 @@ export interface PendingWriteCoordinator {
 export type DiscardOutcome =
   | { ok: true }
   | { ok: false; reason: 'not-hydrated' | 'not-found' | 'scope' | 'persist' };
+
+export type ClearPendingOutcome =
+  | { ok: true }
+  | { ok: false; reason: 'disposed' | 'hydrate' | 'persist' };
 
 const scopeKeyOf = (s: CoordinatorScope | null): string | null =>
   s ? `${s.userId}:${s.householdId}` : null;
@@ -571,6 +589,20 @@ export function createPendingWriteCoordinator(
   let disposed = false;
   let scope: CoordinatorScope | null = deps.getScope();
   let lastError: string | null = null;
+  /**
+   * AUTH-F2-B — true only while `pauseForAccountDeletion()` has frozen the
+   * queue for a destructive account-deletion attempt. `scope = null` /
+   * `flusher.setScope(null)` alone stop the FLUSHER from sending anything,
+   * but every `enqueueX...` call reaches `enqueue()` with a `CoordinatorScope`
+   * the CALLING SCREEN built for itself (from its own live `useAuth()`/
+   * `useHousehold()` reads — see e.g. app/input.tsx), never this closure's
+   * own `scope` variable. Without this flag, a still-mounted screen (or a
+   * stale in-flight retry) underneath the account-delete modal could still
+   * durably persist a brand-new pending write while deletion is in flight.
+   * Cleared inside `setScope()` — the one re-entry point already used both
+   * by a genuine scope change and by `resumeAfterAccountDeletionFailure()`.
+   */
+  let blockNewWrites = false;
 
   /** queueId -> op identity: server accepted it, awaiting refresh confirmation.
    *  Keyed by queueId (globally unique) — `entity`/`entityId`/`op` carried
@@ -1036,7 +1068,13 @@ export function createPendingWriteCoordinator(
 
   function setScope(next: CoordinatorScope | null): void {
     if (disposed) return;
+    // AUTH-F2-B: any genuine scope transition (a real sign-in/sign-out or
+    // household switch, OR `resumeAfterAccountDeletionFailure()` restoring
+    // the live scope) is the trusted re-entry point that lifts a prior
+    // `pauseForAccountDeletion()` freeze. A no-op call (same key) below must
+    // NOT be treated as that re-entry — see its early return.
     if (scopeKeyOf(next) === scopeKeyOf(scope)) return;
+    blockNewWrites = false;
     scope = next;
     flusher.setScope(next);
     clearBackoff();
@@ -1053,6 +1091,9 @@ export function createPendingWriteCoordinator(
 
   async function enqueue(record: PendingWrite): Promise<EnqueueOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
+    // AUTH-F2-B: refuse ANY new durable write while an account-deletion
+    // attempt has the queue frozen — see `blockNewWrites`'s own doc above.
+    if (blockNewWrites) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
       return { ok: false, reason: 'not-hydrated' };
     }
@@ -1602,6 +1643,66 @@ export function createPendingWriteCoordinator(
     );
   }
 
+  async function pauseForAccountDeletion(): Promise<void> {
+    if (disposed) return;
+    // Do NOT use setScope(null) here: that method intentionally clears
+    // ack/failed bookkeeping for a genuine account/household switch. This
+    // is only a temporary write freeze while the current account still owns
+    // its durable queue records.
+    //
+    // Set FIRST, synchronously, before anything else below: every
+    // `enqueueX...` call reaches `enqueue()` with a scope the CALLING
+    // SCREEN built for itself, not this closure's `scope` — nulling `scope`
+    // alone does not stop a still-mounted screen underneath the
+    // account-delete modal from durably persisting a new write while this
+    // function's own `await` below is in flight. See `blockNewWrites`'s doc.
+    blockNewWrites = true;
+    scope = null;
+    flusher.setScope(null);
+    clearBackoff();
+    backoffAttempt = 0;
+    await flusher.waitForIdle();
+  }
+
+  function resumeAfterAccountDeletionFailure(): void {
+    if (disposed) return;
+    setScope(deps.getScope());
+  }
+
+  async function clearPendingForAccount(userId: string): Promise<ClearPendingOutcome> {
+    if (disposed) return { ok: false, reason: 'disposed' };
+    if (!userId) return { ok: false, reason: 'persist' };
+
+    // Defensive: a caller should already have paused before invoking the
+    // server delete, but clearing itself also waits for any queue write that
+    // could still be in flight.
+    await pauseForAccountDeletion();
+
+    if (hydration !== 'ready' || !controller.isHydrated()) {
+      const loaded = await controller.hydrate(deps.storage);
+      if (!loaded.ok) return { ok: false, reason: 'hydrate' };
+      hydration = 'ready';
+    }
+
+    const out = await controller.mutate(
+      (cur) => ({
+        next: cur.filter((record) => record.scope.userId !== userId),
+        result: 0,
+      }),
+      deps.storage,
+    );
+    if (out.blockedNotHydrated) return { ok: false, reason: 'hydrate' };
+    if (!out.persist.ok) return { ok: false, reason: 'persist' };
+
+    awaitingAck.clear();
+    failedIds.clear();
+    failedReasons.clear();
+    lastError = null;
+    reconcileAgain = false;
+    emit();
+    return { ok: true };
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -1752,6 +1853,9 @@ export function createPendingWriteCoordinator(
     enqueueLoanPaymentDelete,
     discardPending,
     requestFlush,
+    pauseForAccountDeletion,
+    resumeAfterAccountDeletionFailure,
+    clearPendingForAccount,
     dispose,
     getState,
   };

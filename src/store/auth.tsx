@@ -21,7 +21,7 @@ import {
   type ReactNode,
 } from 'react';
 
-import { supabase } from '@/lib/supabase';
+import { clearPersistedSupabaseAuth, supabase } from '@/lib/supabase';
 
 /**
  * STEP 16-D1: where Supabase's confirmation email sends the browser after
@@ -81,6 +81,15 @@ interface AuthContextValue {
   signUp(params: { name: string; email: string; password: string }): Promise<SignUpResult>;
   signIn(params: { email: string; password: string }): Promise<AuthActionResult>;
   signOut(): Promise<void>;
+  /**
+   * AUTH-F2-B — local-only session cleanup AFTER the delete-account Edge
+   * Function has already returned confirmed success. Never call this as a
+   * pre-delete step. It must converge even when GoTrue can no longer find
+   * the just-deleted user or the network disappears after the success
+   * response, so it combines the public local-scope signOut path with a
+   * direct clear of this client's persisted auth key.
+   */
+  clearLocalSessionAfterAccountDeletion(): Promise<AuthActionResult>;
   /**
    * STEP AUTH-F1 — send a password-reset email via Supabase Auth
    * (`resetPasswordForEmail`), redirecting the recovery link to
@@ -259,6 +268,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const clearLocalSessionAfterAccountDeletion: AuthContextValue['clearLocalSessionAfterAccountDeletion'] =
+    useCallback(async () => {
+      let sdkCleared = false;
+      try {
+        const { error } = await supabase.auth.signOut({ scope: 'local' });
+        sdkCleared = !error;
+      } catch {
+        // The server account is already gone at this point. Fall through to
+        // the storage-level cleanup below instead of letting a logout network
+        // failure strand an invalid persisted session on this device.
+      }
+
+      const storageCleared = await clearPersistedSupabaseAuth();
+
+      // When the first SDK signOut could not reach a verdict but direct
+      // storage cleanup succeeded, one more local-scope call lets auth-js
+      // converge its own in-memory/session bookkeeping against an empty
+      // store. It is best-effort; React auth state is cleared below either
+      // way because the server deletion is already authoritative.
+      if (!sdkCleared && storageCleared) {
+        try {
+          await supabase.auth.signOut({ scope: 'local' });
+        } catch {
+          // no-op: persisted auth is already gone
+        }
+      }
+
+      if (mountedRef.current) {
+        setSession(null);
+        setProfile(null);
+        setProfileError(false);
+        setProfileLoading(false);
+        setLoading(false);
+      }
+
+      return sdkCleared || storageCleared
+        ? { ok: true }
+        : {
+            ok: false,
+            message: '계정은 삭제됐지만 이 기기의 로그인 정보 정리를 확인하지 못했어요',
+          };
+    }, []);
+
   const resetPasswordForEmail: AuthContextValue['resetPasswordForEmail'] = useCallback(async (email) => {
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
       redirectTo: RESET_PASSWORD_REDIRECT_TO,
@@ -331,6 +383,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signUp,
       signIn,
       signOut,
+      clearLocalSessionAfterAccountDeletion,
       resetPasswordForEmail,
       updatePassword,
       updateDisplayName,
@@ -344,6 +397,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signUp,
       signIn,
       signOut,
+      clearLocalSessionAfterAccountDeletion,
       resetPasswordForEmail,
       updatePassword,
       updateDisplayName,

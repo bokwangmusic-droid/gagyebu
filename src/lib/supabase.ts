@@ -35,9 +35,37 @@ if (!supabaseUrl || !supabasePublishableKey) {
   );
 }
 
+// Supabase Auth's default persisted-session key is derived from the project
+// ref. Pin the SAME value explicitly so account-deletion cleanup can remove
+// the local session even if the server-side user has already been deleted
+// (or the network drops immediately after a successful delete-account call).
+// This does not migrate/change existing sessions: it is the exact key
+// supabase-js derives by default for this URL.
+const supabaseProjectRef = new URL(supabaseUrl).hostname.split('.')[0];
+export const SUPABASE_AUTH_STORAGE_KEY = `sb-${supabaseProjectRef}-auth-token`;
+
+/**
+ * Server-independent auth-storage cleanup used ONLY after delete-account has
+ * returned confirmed success. Returns false instead of throwing so the UI can
+ * report a rare local-storage cleanup failure without pretending the server
+ * deletion failed.
+ */
+export async function clearPersistedSupabaseAuth(): Promise<boolean> {
+  try {
+    await AsyncStorage.multiRemove([
+      SUPABASE_AUTH_STORAGE_KEY,
+      `${SUPABASE_AUTH_STORAGE_KEY}-code-verifier`,
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const supabase = createClient(supabaseUrl, supabasePublishableKey, {
   auth: {
     storage: AsyncStorage,
+    storageKey: SUPABASE_AUTH_STORAGE_KEY,
     autoRefreshToken: true,
     persistSession: true,
     detectSessionInUrl: false,

@@ -65,6 +65,12 @@ export interface WriteQueueFlusher {
   setScope: (scope: FlushScope | null) => void;
   /** Ask for a flush. Coalesces; resolves when the drain settles. */
   request: () => Promise<void>;
+  /**
+   * AUTH-F2-B — wait until the CURRENT drain (if any) has left runOp. Used
+   * by account deletion after setScope(null) so no queued write can still be
+   * in-flight when the destructive server call starts.
+   */
+  waitForIdle: () => Promise<void>;
   /** No further passes / callbacks. */
   dispose: () => void;
   _debug: () => { scopeKey: string | null; flushing: boolean; dirty: boolean; disposed: boolean };
@@ -197,6 +203,7 @@ export function createWriteQueueFlusher(cfg: FlusherConfig): WriteQueueFlusher {
   return {
     setScope,
     request,
+    waitForIdle: () => drainPromise,
     dispose,
     _debug: () => ({ scopeKey, flushing, dirty, disposed }),
   };

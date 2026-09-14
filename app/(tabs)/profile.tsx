@@ -366,6 +366,20 @@ export default function ProfileScreen() {
         />
       </SettingsCard>
 
+      <SectionLabel>계정</SectionLabel>
+      <SettingsCard>
+        <Row
+          icon="warn"
+          iconBg={colors.expenseLight}
+          iconColor={colors.expenseText}
+          title="계정 삭제"
+          titleColor={colors.expenseText}
+          sub="계정과 연결된 데이터를 영구 삭제해요"
+          onPress={() => router.push('/account-delete')}
+          last
+        />
+      </SettingsCard>
+
       <View
         style={{
           paddingTop: spacing.lg,
@@ -535,6 +549,7 @@ function Row({
   iconBg,
   iconColor,
   title,
+  titleColor,
   sub,
   onPress,
   right,
@@ -544,6 +559,7 @@ function Row({
   iconBg: string;
   iconColor: string;
   title: string;
+  titleColor?: string;
   sub: string;
   onPress?: () => void;
   right?: React.ReactNode;
@@ -575,7 +591,15 @@ function Row({
         <AppIcon name={icon} size={16} color={iconColor} />
       </View>
       <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
-        <Text style={{ fontFamily: fontFamily.medium, fontSize: 14, lineHeight: 17, color: colors.text, ...noPad }}>
+        <Text
+          style={{
+            fontFamily: fontFamily.medium,
+            fontSize: 14,
+            lineHeight: 17,
+            color: titleColor ?? colors.text,
+            ...noPad,
+          }}
+        >
           {title}
         </Text>
         <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 13, color: colors.textMuted, ...noPad }}>
