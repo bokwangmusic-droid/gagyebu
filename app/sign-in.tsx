@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Pressable, Text, TextInput, View } from 'react-native';
+import { Platform, Pressable, Text, TextInput, View } from 'react-native';
 
 import { AuthShell } from '@/components/auth/AuthShell';
 import { PasswordField } from '@/components/auth/PasswordField';
@@ -22,10 +22,29 @@ export default function SignIn() {
   const submittingRef = useRef(false); // guards against a double-tap racing the async call
   const passwordRef = useRef<TextInput>(null);
 
-  const canSubmit = email.trim().length > 0 && password.length > 0 && !submitting;
-
   const onSubmit = async () => {
-    if (submittingRef.current || !canSubmit) return;
+    if (submittingRef.current) return; // duplicate-submit guard (unchanged)
+
+    // UX fix: tell the user exactly what's missing instead of silently doing
+    // nothing, for BOTH entry points (keyboard "완료" and the button below —
+    // both call this same onSubmit). Checked before touching submittingRef/
+    // setSubmitting so a validation toast never flips the button into
+    // "로그인 중...".
+    const hasEmail = email.trim().length > 0;
+    const hasPassword = password.length > 0;
+    if (!hasEmail && !hasPassword) {
+      toast.show('이메일과 비밀번호를 입력해주세요');
+      return;
+    }
+    if (!hasEmail) {
+      toast.show('이메일을 입력해주세요');
+      return;
+    }
+    if (!hasPassword) {
+      toast.show('비밀번호를 입력해주세요');
+      return;
+    }
+
     submittingRef.current = true;
     setSubmitting(true);
     const result = await signIn({ email, password });
@@ -68,6 +87,29 @@ export default function SignIn() {
             textContentType="password"
             returnKeyType="done"
             onSubmitEditing={onSubmit}
+            // Android root cause: this field is `secureTextEntry`, and on
+            // several OEM keyboards a masked/password EditText's "완료" key
+            // is delivered as a raw KEYCODE_ENTER key event
+            // (ReactEditTextInputConnectionWrapper -> onKeyPress "Enter")
+            // instead of the performEditorAction() call onSubmitEditing
+            // relies on (setOnEditorActionListener in
+            // ReactTextInputManager.kt) — confirmed by reading RN's own
+            // Android TextInput source; both dispatch paths exist natively,
+            // but only IME actions reach onSubmitEditing. The screen's
+            // "로그인" button never goes through either path, which is why
+            // it always worked while the keyboard's "완료" silently did
+            // nothing. Reuses the EXACT same onSubmit as the button and the
+            // "next" chain above; its own submittingRef/empty-field guards
+            // make this a no-op if onSubmitEditing also fires for the same
+            // press. Android-only: iOS already fires onSubmitEditing
+            // reliably, so this stays a pure no-op there.
+            onKeyPress={
+              Platform.OS === 'android'
+                ? ({ nativeEvent }) => {
+                    if (nativeEvent.key === 'Enter') onSubmit();
+                  }
+                : undefined
+            }
           />
         </Field>
         <Pressable
@@ -82,7 +124,12 @@ export default function SignIn() {
         <GradientButton
           label={submitting ? '로그인 중...' : '로그인'}
           onPress={onSubmit}
-          disabled={!canSubmit}
+          // UX fix: no longer disabled just because a field is empty — a tap
+          // now reaches onSubmit's own validation toast instead of doing
+          // nothing. Still disabled while a signIn is actually in flight, so
+          // this remains the duplicate-submit guard for the button itself
+          // (submittingRef inside onSubmit guards the keyboard-"완료" path).
+          disabled={submitting}
         />
       </View>
 
