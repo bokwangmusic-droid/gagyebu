@@ -3,16 +3,10 @@
     "name": "돈돈 가계부",
     "slug": "gagyebu",
     "scheme": "gagyebu",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
-    "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#FAF6EE"
-    },
     "ios": {
       "supportsTablet": true
     },
@@ -21,8 +15,7 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FAF6EE"
-      },
-      "edgeToEdgeEnabled": true
+      }
     },
     "web": {
       "bundler": "metro",
@@ -30,7 +23,17 @@
     },
     "plugins": [
       "expo-router",
-      "expo-font"
+      "expo-font",
+      "expo-sharing",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#FAF6EE"
+        }
+      ],
+      "expo-status-bar"
     ],
     "experiments": {
       "typedRoutes": true
@@ -41,6 +44,12 @@
         "projectId": "1ccc4e2c-2375-4c68-91b8-2434105ad349"
       }
     },
-    "owner": "ijcompany"
+    "owner": "ijcompany",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/1ccc4e2c-2375-4c68-91b8-2434105ad349"
+    }
   }
 }
