@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "돈돈 가계부 Dev",
+    "name": "돈돈 가계부",
     "slug": "gagyebu",
-    "scheme": "gagyebu-dev",
+    "scheme": "gagyebu",
     "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -11,7 +11,7 @@
       "supportsTablet": true
     },
     "android": {
-      "package": "com.ijcompany.ledger.dev",
+      "package": "com.ijcompany.ledger",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon-foreground.png",
         "backgroundColor": "#FAF6EE"
