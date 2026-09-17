@@ -132,6 +132,13 @@ function useBackspaceRepeat(onBackspace: () => void) {
 const CREDIT_SCROLL_HEADROOM = 16;
 /** Same idea for the 할부 상세 (개월 / preset / 직접 / preview) block. */
 const INSTALLMENT_SCROLL_HEADROOM = 12;
+/**
+ * Same idea for the initial 메모 row reveal (see `maybeRevealMemoRowOnce`) —
+ * deliberately the smallest spacing token, not a hand-picked number: the ask
+ * is "just barely uncovered", so this should add as little extra scroll as
+ * possible on top of the measured minimum.
+ */
+const MEMO_ROW_SCROLL_HEADROOM = spacing.xs;
 
 /** YYYY-MM-DD shifted by n days. */
 function shiftDateKey(key: string, days: number): string {
@@ -576,6 +583,17 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   const installmentBlockYRef = useRef(0); // 할부 상세 block.y in creditPanel
   const installmentBlockHeightRef = useRef(0); // 할부 상세 block height
   const formViewportHeightRef = useRef(0); // ScrollView's own visible height
+  // 메모 입력칸 first-open reveal — see `maybeRevealMemoRowOnce` below.
+  const memoRowYRef = useRef(0); // memoRow.y directly in the scroll content
+  const memoRowHeightRef = useRef(0); // memoRow height
+  // typeTabs.y directly in the scroll content — the hard upper bound on the
+  // reveal scroll below (scrolling past this clips 지출/수입 tabs).
+  const typeTabsYRef = useRef(0);
+  // ONE-SHOT for the LIFETIME of this mount: consumed the first time all
+  // measurements below are available, then never re-evaluated again — a
+  // later user scroll (or showQuick toggle, or keyboard open) must never be
+  // fought or re-corrected.
+  const initialMemoScrollArmRef = useRef(true);
 
   /** 할부 상세 block top in scroll-content coords (summed parent offsets). */
   const installmentBlockTop = () =>
@@ -614,9 +632,60 @@ function TransactionForm({ mode }: { mode: FormMode }) {
    *  ScrollView, so the measured height is already the post-shrink one. */
   const handleFormScrollLayout = (e: LayoutChangeEvent) => {
     formViewportHeightRef.current = e.nativeEvent.layout.height;
+    maybeRevealMemoRowOnce();
     if (!pendingDirectScrollRef.current) return;
     pendingDirectScrollRef.current = false;
     requestAnimationFrame(scrollInstallmentAbovePad);
+  };
+
+  /** 메모 입력칸 onLayout — caches its position in the scroll content (a
+   *  direct ScrollView child, so no summed parent offsets needed, unlike
+   *  the 할부 block above). Also drives the one-shot initial reveal. */
+  const handleMemoRowLayout = (e: LayoutChangeEvent) => {
+    memoRowYRef.current = e.nativeEvent.layout.y;
+    memoRowHeightRef.current = e.nativeEvent.layout.height;
+    maybeRevealMemoRowOnce();
+  };
+
+  /** typeTabs (지출/수입) onLayout — caches its own top position, the hard
+   *  ceiling the reveal scroll below must never exceed. Also drives the
+   *  one-shot initial reveal, same as the other two measurements. */
+  const handleTypeTabsLayout = (e: LayoutChangeEvent) => {
+    typeTabsYRef.current = e.nativeEvent.layout.y;
+    maybeRevealMemoRowOnce();
+  };
+
+  /**
+   * The keypad opens by default (`numTarget` starts as `{kind:'main'}`), so
+   * on a short viewport 메모 row can land partly hidden behind it on first
+   * open. This fires from the ScrollView's own onLayout, 메모 row's onLayout,
+   * and typeTabs' onLayout — whichever settles last is the one that actually
+   * has all three measurements — and runs AT MOST ONCE per mount
+   * (`initialMemoScrollArmRef`), so it is purely a first-open correction,
+   * never a recurring "pull the user back down" behaviour.
+   *
+   * The scroll target is the MINIMUM needed to clear 메모 row (no extra
+   * buffer beyond `MEMO_ROW_SCROLL_HEADROOM`), and is additionally capped at
+   * typeTabs' own top (`typeTabsYRef`) so 지출/수입 tabs can never be scrolled
+   * out of view for this — if the two constraints can't both be fully
+   * satisfied on a given device, keeping 지출/수입 tabs uncropped wins.
+   */
+  const maybeRevealMemoRowOnce = () => {
+    if (!initialMemoScrollArmRef.current) return;
+    const viewportH = formViewportHeightRef.current;
+    const memoH = memoRowHeightRef.current;
+    const typeTabsTop = typeTabsYRef.current;
+    if (viewportH <= 0 || memoH <= 0 || typeTabsTop <= 0) return; // wait for all three
+    initialMemoScrollArmRef.current = false; // consume now, whatever the outcome
+    if (!padVisible) return; // nothing hidden behind a pad that isn't open
+    const memoBottom = memoRowYRef.current + memoH;
+    const rawY = memoBottom - viewportH + MEMO_ROW_SCROLL_HEADROOM;
+    if (rawY <= 0) return; // 메모 row already fully visible — do nothing
+    const y = Math.min(rawY, typeTabsTop); // never crop into typeTabs
+    if (y <= 0) return;
+    requestAnimationFrame(() => {
+      formScrollRef.current?.scrollTo({ y, animated: false });
+    });
   };
 
   /** 결제수단 section onLayout — caches paySection.y; when the "신용" intent is
@@ -1041,7 +1110,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
         showsVerticalScrollIndicator={false}
       >
       {/* Type tabs */}
-      <View style={styles.typeTabs}>
+      <View style={styles.typeTabs} onLayout={handleTypeTabsLayout}>
         {(['expense', 'income'] as const).map((t) => {
           const active = type === t;
           return (
@@ -1155,7 +1224,11 @@ function TransactionForm({ mode }: { mode: FormMode }) {
           <Text style={[styles.unit, amountActive && styles.unitActive]}>원</Text>
         </Pressable>
 
-        <View style={styles.memoRow} onTouchStart={collapsePadForKeyboard}>
+        <View
+          style={styles.memoRow}
+          onTouchStart={collapsePadForKeyboard}
+          onLayout={handleMemoRowLayout}
+        >
           <AppIcon name="edit" size={16} color={colors.textMuted} />
           <TextInput
             value={memo}
@@ -1935,9 +2008,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'baseline',
+    marginTop: spacing.sm,
     marginHorizontal: spacing.lg,
     paddingHorizontal: spacing.lg,
-    paddingTop: 22,
+    paddingTop: spacing.xs, // was 22, then 12 — ~11% shorter box, number size/width/radius untouched
     paddingBottom: spacing.sm,
     // 1px transparent border kept in the base style so toggling the active
     // state never shifts the layout by a pixel.
@@ -1962,12 +2036,21 @@ const styles = StyleSheet.create({
     // adjustsFontSizeToFit has room to work.
     flexShrink: 1,
     textAlign: 'center',
+    // Android's default font padding on this custom (Noto Sans KR) font
+    // reserves far more vertical space than the 44px glyph actually needs —
+    // same fix as NumKey's digits, see `noPad`'s doc comment. This, not
+    // amountRow's own padding, was the real driver of the card's height.
+    ...noPad,
+    lineHeight: 52,
+    textAlignVertical: 'center',
   },
   unit: {
     fontFamily: fontFamily.semibold,
     fontSize: 20,
     color: colors.textSub,
     marginLeft: 8,
+    ...noPad,
+    lineHeight: 24,
   },
   unitActive: {
     color: colors.primaryStrong,
