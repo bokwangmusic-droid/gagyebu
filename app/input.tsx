@@ -2011,7 +2011,7 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
     marginHorizontal: spacing.lg,
     paddingHorizontal: spacing.lg,
-    paddingTop: spacing.xs, // was 22, then 12 — ~11% shorter box, number size/width/radius untouched
+    paddingTop: spacing.md, // was 22, then 12, then xs (too flat) — back to 12, still ~45% shorter than original
     paddingBottom: spacing.sm,
     // 1px transparent border kept in the base style so toggling the active
     // state never shifts the layout by a pixel.
