@@ -158,6 +158,8 @@ function financeWith(
     loans: [],
     loanMeta: {},
     loanPaymentMeta: {},
+    assets: [],
+    assetMeta: {},
     customCats: DEFAULT_CUSTOM_CATS,
     notes: '',
     catOrder: DEFAULT_CAT_ORDER,

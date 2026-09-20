@@ -16,6 +16,7 @@ import { createBackup } from '@/lib/backup';
 import { cardBillingForMonth } from '@/lib/card';
 import { REMOTE_FINANCE_READ_ONLY } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
+import { calculateTotalAssets } from '@/lib/netWorth';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useStore } from '@/store/store';
@@ -267,6 +268,18 @@ export default function ProfileScreen() {
           title="저축 목표"
           sub={`${remote.goals.length}개 진행 중`}
           onPress={() => router.push('/goals')}
+        />
+        <Row
+          icon="won"
+          iconBg={colors.incomeLight}
+          iconColor={colors.incomeStrong}
+          title="자산관리"
+          sub={
+            remote.assets.length > 0
+              ? `${remote.assets.length}개 · 총자산 ${fmt(calculateTotalAssets(remote.assets))}원`
+              : '현금·통장·예적금·투자 등록하기'
+          }
+          onPress={() => router.push('/assets')}
         />
         <Row
           icon="landmark"

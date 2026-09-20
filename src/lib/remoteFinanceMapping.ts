@@ -8,7 +8,8 @@
  * `RemoteFinanceRaw` (src/services/remoteFinance.ts) and returns plain
  * data reusing the app's EXISTING local domain types (Transaction,
  * CreditCard, Goal, RecurringRule, PlannedExpense, Loan, LoanPayment,
- * CustomCatMap, CatOrderMap, BudgetMap) — no new parallel type hierarchy.
+ * Asset, CustomCatMap, CatOrderMap, BudgetMap) — no new parallel type
+ * hierarchy.
  *
  * Deliberately excludes:
  *   - `settings` (profileName/profileEmail/quickPaste/...) — per-device
@@ -33,6 +34,7 @@
 import type { CatOrderMap, CustomCatMap, IconKey } from '@/data/categories';
 import type { RemoteFinanceRaw } from '@/services/remoteFinance';
 import type {
+  Asset,
   BudgetMap,
   CreditCard,
   Goal,
@@ -206,6 +208,24 @@ export interface RemoteLoanPaymentMeta {
 }
 
 /**
+ * Remote-only bookkeeping for one ASSET — 전체자산/순자산 STEP 4.
+ *
+ * Keyed by the asset id, parallel to `RemoteFinanceData.assets`. Only
+ * non-soft-deleted assets appear (`deleted_at IS NULL`). `updatedAt` is the
+ * opaque optimistic-concurrency token for asset edit / soft-delete — the
+ * RAW PostgREST string, never re-serialised. `createdBy` is author
+ * bookkeeping only. Unlike `RemoteLoanMeta`/`RemoteGoalMeta`, there is no
+ * companion trigger that bumps this token from a SEPARATE child-table
+ * write — `assets.balance` has no `loan_payments`/`goal_movements`
+ * equivalent; every change to it is a direct edit of the row itself. The
+ * `Asset` domain type stays free of this metadata.
+ */
+export interface RemoteAssetMeta {
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+/**
  * The read-only, household-financial subset of AppState this app can
  * currently reconstruct from Supabase. Intentionally NOT `AppState` itself
  * (no `seenOnboarding`, no `settings`) — see the file header.
@@ -236,6 +256,9 @@ export interface RemoteFinanceData {
   loanMeta: Record<string, RemoteLoanMeta>;
   /** loan-payment id -> remote-only metadata (write/concurrency only, never UI domain). STEP 16-G2-D4. */
   loanPaymentMeta: Record<string, RemoteLoanPaymentMeta>;
+  assets: Asset[];
+  /** asset id -> remote-only metadata (write/concurrency only, never UI domain). 전체자산/순자산 STEP 4. */
+  assetMeta: Record<string, RemoteAssetMeta>;
   customCats: CustomCatMap;
   notes: string;
   catOrder: CatOrderMap;
@@ -249,6 +272,7 @@ export interface RemoteFinanceCounts {
   planned: number;
   goals: number;
   loans: number;
+  assets: number;
   customCategories: number;
 }
 
@@ -262,6 +286,7 @@ export function remoteFinanceCounts(data: RemoteFinanceData): RemoteFinanceCount
     planned: data.planned.length,
     goals: data.goals.length,
     loans: data.loans.length,
+    assets: data.assets.length,
     customCategories: data.customCats.expense.length + data.customCats.income.length,
   };
 }
@@ -454,6 +479,21 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     loanMeta[l.id] = { updatedAt: l.updated_at, createdBy: l.created_by };
   }
 
+  const assets: Asset[] = raw.assets.map((a) => ({
+    id: a.id,
+    name: a.name,
+    type: a.type,
+    balance: a.balance,
+    createdAt: a.created_at,
+  }));
+
+  // Parallel to `assets`, keyed by id. `updatedAt` stored verbatim — an
+  // opaque concurrency token, never formatted/re-parsed (전체자산/순자산 STEP 4).
+  const assetMeta: Record<string, RemoteAssetMeta> = {};
+  for (const a of raw.assets) {
+    assetMeta[a.id] = { updatedAt: a.updated_at, createdBy: a.created_by };
+  }
+
   return {
     transactions,
     transactionMeta,
@@ -471,6 +511,8 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     loans,
     loanMeta,
     loanPaymentMeta,
+    assets,
+    assetMeta,
     customCats,
     notes: raw.householdSettings?.notes ?? '',
     catOrder: {

@@ -120,6 +120,8 @@ function financeWith(expense: Category[], income: Category[] = []): RemoteFinanc
     loans: [],
     loanMeta: {},
     loanPaymentMeta: {},
+    assets: [],
+    assetMeta: {},
     customCats: { expense, income },
     notes: '',
     catOrder: DEFAULT_CAT_ORDER,

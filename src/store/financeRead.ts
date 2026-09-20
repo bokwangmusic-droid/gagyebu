@@ -23,6 +23,7 @@ import { useMemo } from 'react';
 
 import { DEFAULT_CAT_ORDER, DEFAULT_CUSTOM_CATS, type CatOrderMap, type CustomCatMap } from '@/data/categories';
 import type {
+  RemoteAssetMeta,
   RemoteBudgetMeta,
   RemoteCardMeta,
   RemoteCategoryMeta,
@@ -51,7 +52,7 @@ import { useHousehold } from '@/store/household';
 import { usePendingWrites } from '@/store/pendingFinance';
 import { useRemoteFinance } from '@/store/remoteFinance';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
-import type { BudgetMap, CreditCard, Goal, Loan, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
+import type { Asset, BudgetMap, CreditCard, Goal, Loan, PlannedExpense, RecurringRule, Transaction } from '@/store/types';
 
 export type FinanceReadStatus = 'loading' | 'error' | 'ready';
 
@@ -128,6 +129,16 @@ export interface FinanceReadResult {
    * payment soft-delete.
    */
   loanPaymentMeta: Record<string, RemoteLoanPaymentMeta>;
+  /**
+   * 전체자산/순자산 STEP 4 — manually-entered held-asset balances. Plain
+   * authoritative-server data, same shape as `cards`/`budgets`: NO offline
+   * queue overlay yet (no `assetManagementRows`, no `pendingAssetOps`) —
+   * there is nothing to compose against, since asset writes aren't queued
+   * this STEP. `src/lib/netWorth.ts` consumes this directly.
+   */
+  assets: Asset[];
+  /** asset id -> remote-only metadata (updatedAt concurrency token + createdBy). 전체자산/순자산 STEP 4. `{}` while not ready. */
+  assetMeta: Record<string, RemoteAssetMeta>;
   customCats: CustomCatMap;
   notes: string;
   catOrder: CatOrderMap;
@@ -421,6 +432,8 @@ const EMPTY_SLICES = {
   loans: [] as Loan[],
   loanMeta: {} as Record<string, RemoteLoanMeta>,
   loanPaymentMeta: {} as Record<string, RemoteLoanPaymentMeta>,
+  assets: [] as Asset[],
+  assetMeta: {} as Record<string, RemoteAssetMeta>,
   customCats: DEFAULT_CUSTOM_CATS,
   notes: '',
   catOrder: DEFAULT_CAT_ORDER,
@@ -738,6 +751,8 @@ export function useFinanceRead(): FinanceReadResult {
         loans: data.loans,
         loanMeta: data.loanMeta,
         loanPaymentMeta: data.loanPaymentMeta,
+        assets: data.assets,
+        assetMeta: data.assetMeta,
         customCats: data.customCats,
         notes: data.notes,
         catOrder: data.catOrder,

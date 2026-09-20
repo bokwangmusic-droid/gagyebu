@@ -3,12 +3,10 @@
  *
  * The only place in the app that SELECTs the household's financial tables
  * (transactions/cards/budgets/recurring_rules/planned_expenses/goals/
- * loans/loan_payments/custom_categories/household_settings). SELECT only —
- * this module contains no `.insert()`/`.update()`/`.delete()`/`.upsert()`
- * call and no write RPC. Financial writes remain out of scope until a
- * later STEP explicitly adds them; the only existing write path in this
- * app is `src/services/householdImport.ts`'s one-time
- * `import_household_snapshot` RPC, untouched here.
+ * loans/loan_payments/assets/custom_categories/household_settings). SELECT
+ * only — this module contains no `.insert()`/`.update()`/`.delete()`/
+ * `.upsert()` call and no write RPC. Financial writes go through their own
+ * per-entity write modules (src/services/remote*Write.ts), never here.
  *
  * Rides the same `authenticated` session src/lib/supabase.ts already holds
  * — no service_role, no extra key. RLS (supabase/migrations/
@@ -101,6 +99,13 @@ import { supabase } from '@/lib/supabase';
  * is NEVER written directly by any client path; it changes only through a
  * `loan_payments` INSERT / soft-delete and the `trg_apply_loan_payment`
  * trigger (STEP 16-G2-D4).
+ *
+ * 전체자산/순자산 STEP 4: `assets` additionally selects `created_by` and
+ * `updated_at`, routed into a separate `assetMeta` map (the `Asset` domain
+ * type is untouched) — same opaque-token rule for `updated_at`. Unlike
+ * `loans.paid` / `goals.saved`, `assets.balance` has NO server-maintained
+ * cache trigger — it is a plain client-writable column, so there is
+ * nothing to protect it from being selected/edited directly.
  * ------------------------------------------------------------------ */
 
 export interface RemoteCustomCategory {
@@ -228,6 +233,23 @@ export interface RemoteLoan {
   updated_at: string;
 }
 
+export interface RemoteAsset {
+  id: string;
+  name: string;
+  type: 'cash' | 'bank' | 'savings' | 'investment' | 'other';
+  balance: number;
+  created_at: string;
+  /**
+   * 전체자산/순자산 STEP 4 — routed to `assetMeta`, NOT the `Asset` domain
+   * type. `updated_at` is the optimistic-concurrency token for asset edit /
+   * soft-delete (compared with an exact `.eq('updated_at', …)`), so it must
+   * travel as the RAW PostgREST string — never re-parsed through
+   * Date/toISOString anywhere. `created_by` is author bookkeeping only.
+   */
+  created_by: string | null;
+  updated_at: string;
+}
+
 export interface RemoteLoanPayment {
   id: string;
   loan_id: string;
@@ -297,6 +319,7 @@ export interface RemoteFinanceRaw {
   goals: RemoteGoal[];
   loans: RemoteLoan[];
   loanPayments: RemoteLoanPayment[];
+  assets: RemoteAsset[];
   transactions: RemoteTransaction[];
   budgets: RemoteBudgetRow[];
   householdSettings: RemoteHouseholdSettings | null;
@@ -334,7 +357,7 @@ function describeRemoteFinanceError(error: PostgrestError): string {
 
 /**
  * Fetches every finance table for one household, in parallel, read-only.
- * All-or-nothing (STEP 16-G1A §8): the first error found among the 11
+ * All-or-nothing (STEP 16-G1A §8): the first error found among the 12
  * queries below is what gets reported, and no partial data is returned
  * alongside it.
  */
@@ -349,6 +372,7 @@ export async function fetchHouseholdFinanceSnapshot(
     goalsRes,
     loansRes,
     loanPaymentsRes,
+    assetsRes,
     transactionsRes,
     budgetsRes,
     householdSettingsRes,
@@ -390,6 +414,11 @@ export async function fetchHouseholdFinanceSnapshot(
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
+      .from('assets')
+      .select('id,name,type,balance,created_at,created_by,updated_at')
+      .eq('household_id', householdId)
+      .is('deleted_at', null),
+    supabase
       .from('transactions')
       .select(
         'id,type,category,amount,memo,date,from_recurring,from_planned,payment_method,card_id,installment_months,splits,tags,member_id,created_by,updated_at',
@@ -421,6 +450,7 @@ export async function fetchHouseholdFinanceSnapshot(
     goalsRes,
     loansRes,
     loanPaymentsRes,
+    assetsRes,
     transactionsRes,
     budgetsRes,
     householdSettingsRes,
@@ -440,6 +470,7 @@ export async function fetchHouseholdFinanceSnapshot(
       goals: (goalsRes.data ?? []) as RemoteGoal[],
       loans: (loansRes.data ?? []) as RemoteLoan[],
       loanPayments: (loanPaymentsRes.data ?? []) as RemoteLoanPayment[],
+      assets: (assetsRes.data ?? []) as RemoteAsset[],
       transactions: (transactionsRes.data ?? []) as RemoteTransaction[],
       budgets: (budgetsRes.data ?? []) as RemoteBudgetRow[],
       householdSettings: (householdSettingsRes.data ?? null) as RemoteHouseholdSettings | null,

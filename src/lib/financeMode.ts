@@ -67,6 +67,17 @@
  * `goal-add` and `loan-add` are the former `REMOTE_FINANCE_READ_ONLY`
  * routes that now check `REMOTE_FINANCE_WRITE.*` instead. Nothing else is
  * gated.
+ *
+ * 전체자산/순자산 STEP 4 — asset CREATE / EDIT / (soft) DELETE, via
+ * src/services/remoteAssetWrite.ts (direct `public.assets` INSERT / UPDATE
+ * name·type·balance / UPDATE deleted_at, keyed on `(household_id, id)` with
+ * a client `asset-...` id; no RPC, no hard DELETE). Unlike every other
+ * entity above, this is DELIBERATELY NOT wired to the offline write queue
+ * yet — no `enqueueAssetCreate`/`Update`/`Delete`, no `pendingAssetOps`. A
+ * write attempted while offline just fails with an ordinary transport
+ * error (the same behaviour every other entity had before its own offline
+ * queue existed); there is no screen yet either (data-layer only, this
+ * STEP).
  */
 export const REMOTE_FINANCE_READ_ONLY = true as const;
 
@@ -100,4 +111,7 @@ export const REMOTE_FINANCE_WRITE = {
   loanDelete: true,
   loanAddPayment: true,
   loanDeletePayment: true,
+  assetCreate: true,
+  assetEdit: true,
+  assetDelete: true,
 } as const;

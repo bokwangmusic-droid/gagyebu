@@ -370,6 +370,8 @@ export async function runOfflineQueueCategoryBudgetCases(): Promise<{
       loans: [],
       loanMeta: {},
       loanPaymentMeta: {},
+      assets: [],
+      assetMeta: {},
       customCats: { expense, income: [] },
       notes: '',
       catOrder: DEFAULT_CAT_ORDER,

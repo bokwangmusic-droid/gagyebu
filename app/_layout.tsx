@@ -62,17 +62,18 @@ const HOUSEHOLD_SETUP_SCREENS = ['household-setup', 'household-create', 'househo
 // bouncing away from them, but with very different in-screen behaviour:
 //   - READ screens: '(tabs)' (home/stats/budget/planned/profile — all one
 //     route group, so one entry covers all five), all-transactions,
-//     calendar, cards, goals, loans, recurring. Each was rewired to read
-//     via src/store/financeRead.ts's useFinanceRead() instead of
-//     useStore(), with every inline add/edit/delete/toggle control
-//     removed from the screen itself (see the completion report's audit
-//     table) — reachable AND fully functional for viewing.
+//     calendar, cards, goals, loans, recurring, assets (전체자산/순자산
+//     STEP 5). Each was rewired to read via src/store/financeRead.ts's
+//     useFinanceRead() instead of useStore(), with every inline
+//     add/edit/delete/toggle control removed from the screen itself (see
+//     the completion report's audit table) — reachable AND fully
+//     functional for viewing.
 //   - WRITE screens: input, card-add, budget-add, recurring-add,
-//     planned-add, goal-add, loan-add, categories. Reachable (so tapping
-//     into one doesn't bounce jarringly) but each renders
-//     <ReadOnlyRouteNotice/> instead of its real form — see the guard at
-//     the top of each of those files (src/lib/financeMode.ts's
-//     REMOTE_FINANCE_READ_ONLY).
+//     planned-add, goal-add, loan-add, categories, asset-add (전체자산/
+//     순자산 STEP 5). Reachable (so tapping into one doesn't bounce
+//     jarringly) but each renders <ReadOnlyRouteNotice/> instead of its
+//     real form whenever its own REMOTE_FINANCE_WRITE.* flag is off — see
+//     the guard at the top of each of those files.
 // 'backup' (STEP 8) stays reachable too — it only ever reads/writes this
 // device's LOCAL gagyebu.* backup snapshots, never remote household data,
 // so it isn't part of either group above.
@@ -88,6 +89,7 @@ const HOUSEHOLD_READY_SCREENS = [
   'cards',
   'goals',
   'loans',
+  'assets',
   'recurring',
   'input',
   'card-add',
@@ -98,6 +100,7 @@ const HOUSEHOLD_READY_SCREENS = [
   'goal-movement',
   'loan-add',
   'loan-payment',
+  'asset-add',
   'categories',
   'backup',
   'account-delete',
@@ -670,6 +673,8 @@ function RootNav() {
         <Stack.Screen name="loans" options={MODAL} />
         <Stack.Screen name="loan-add" options={MODAL} />
         <Stack.Screen name="loan-payment" options={MODAL} />
+        <Stack.Screen name="assets" options={MODAL} />
+        <Stack.Screen name="asset-add" options={MODAL} />
         <Stack.Screen name="cards" options={MODAL} />
         <Stack.Screen name="card-add" options={MODAL} />
         <Stack.Screen name="categories" options={MODAL} />

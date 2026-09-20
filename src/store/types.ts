@@ -140,6 +140,24 @@ export interface Loan {
   createdAt: string;
 }
 
+export type AssetType = 'cash' | 'bank' | 'savings' | 'investment' | 'other';
+
+/**
+ * A manually-entered held-asset balance (전체자산/순자산 STEP 1/2) — 현금/
+ * 은행계좌/예적금/투자/기타. `balance` is entered by hand; there is no link
+ * to `Transaction` yet (that is a later STEP — see src/lib/netWorth.ts).
+ * Same shape convention as `Loan`/`CreditCard`/`Goal`: `householdId`/
+ * `createdBy`/`updatedAt`/`deletedAt` are remote-sync concerns, not part of
+ * this domain type.
+ */
+export interface Asset {
+  id: string;
+  name: string;
+  type: AssetType;
+  balance: number;
+  createdAt: string;
+}
+
 /**
  * A person in a shared (부부/가족) ledger. STEP 10 roadmap skeleton only — the
  * app is single-user, no UI creates or selects members, and nothing filters

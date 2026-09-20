@@ -111,6 +111,8 @@ function financeWith(budgets: BudgetMap, budgetMeta: Record<string, { updatedAt:
     loans: [],
     loanMeta: {},
     loanPaymentMeta: {},
+    assets: [],
+    assetMeta: {},
     customCats: { expense: [], income: [] },
     notes: '',
     catOrder: DEFAULT_CAT_ORDER,

@@ -155,6 +155,8 @@ function financeWith(
         ? loanMeta
         : Object.fromEntries(loans.map((l) => [l.id, { updatedAt: 'SRV-V1', createdBy: 'u-A' }])),
     loanPaymentMeta: {},
+    assets: [],
+    assetMeta: {},
     customCats: DEFAULT_CUSTOM_CATS,
     notes: '',
     catOrder: DEFAULT_CAT_ORDER,
