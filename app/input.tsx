@@ -67,8 +67,12 @@ const INSTALLMENT_PRESETS = ['3', '6', '12'];
  * Ported from the web InputModal.
  * ------------------------------------------------------------------ */
 
-const KEY_HEIGHT = 52;
-const KEY_GAP = 6;
+// BATCH: home/input UI compaction — 52→45 (≈13% per key) combined with the
+// KEY_GAP trim below brings the whole 4-row digit block down ≈14%, within
+// the requested 10–15% without shrinking the digit fontSize (kept at 22 in
+// NumKey below) or the touch target below a comfortable size.
+const KEY_HEIGHT = 45;
+const KEY_GAP = 5;
 
 /**
  * NUMPAD BACKSPACE LONG-PRESS REPEAT UX FIX — same interaction as
@@ -1077,7 +1081,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
           <AppIcon name="x" size={22} color={colors.text} />
         </Pressable>
 
-        <Pressable onPress={() => setShowDate(true)} style={styles.datePill}>
+        <Pressable onPress={() => setShowDate(true)} hitSlop={6} style={styles.datePill}>
           <AppIcon name="calendar" size={14} color={colors.primaryStrong} />
           <Text style={styles.datePillText}>{dateLabel(selectedDate)}</Text>
           <AppIcon name="chevron" size={12} color={colors.textMuted} />
@@ -1660,7 +1664,8 @@ function TransactionForm({ mode }: { mode: FormMode }) {
             disabled={!canSave || submitting || deleting}
             style={({ pressed }) => [
               styles.saveBtn,
-              { opacity: !canSave || submitting || deleting ? 0.4 : pressed ? 0.92 : 1, marginTop: 10 },
+              // FINAL BATCH: keypad→save gap trimmed slightly (was 10).
+              { opacity: !canSave || submitting || deleting ? 0.4 : pressed ? 0.92 : 1, marginTop: 8 },
             ]}
           >
             <LinearGradient
@@ -1893,15 +1898,21 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.sm,
+    paddingBottom: spacing.xs,
   },
-  iconBtn: { padding: 4 },
+  // FINAL BATCH: fixed 30x30 box + centered content so the X icon's visual
+  // center lines up with the date pill's center along the header's row axis
+  // — icon size/color/hitSlop/onPress all untouched.
+  iconBtn: { padding: 4, width: 30, height: 30, justifyContent: 'center', alignItems: 'center' },
+  // BATCH: date pill ≈18% shorter (paddingVertical 8→6.5px equiv via 6, plus
+  // horizontal trim) — hitSlop added at the call site so the smaller box
+  // doesn't shrink the tap target. Icon/text/chevron content untouched.
   datePill: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 14,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
     backgroundColor: colors.white,
     borderRadius: radii.pill,
     borderWidth: 1,
@@ -1917,14 +1928,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 4,
     marginHorizontal: spacing.xl,
-    marginTop: spacing.sm,
+    marginTop: 6,
     padding: 4,
     backgroundColor: colors.border,
     borderRadius: radii.md,
   },
+  // BATCH: ≈25% shorter tab (paddingVertical 8→6). Active-tab white fill/
+  // radius, selection state/logic untouched.
   typeTab: {
     flex: 1,
-    paddingVertical: 8,
+    paddingVertical: 6,
     alignItems: 'center',
     borderRadius: 9,
   },
@@ -1935,15 +1948,18 @@ const styles = StyleSheet.create({
   pillRow: {
     flexDirection: 'row',
     justifyContent: 'center',
-    gap: 8,
-    marginTop: 10,
+    gap: 6,
+    marginTop: 8,
   },
+  // BATCH: ≈19% shorter pill (paddingVertical 8→5) + slightly tighter
+  // horizontal padding. Icon/text/onPress untouched; both pills share this
+  // one style so their heights stay identical.
   pastePill: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    paddingVertical: 8,
-    paddingHorizontal: 14,
+    paddingVertical: 5,
+    paddingHorizontal: 12,
     backgroundColor: colors.primaryLight,
     borderRadius: radii.pill,
   },
@@ -2007,12 +2023,19 @@ const styles = StyleSheet.create({
   amountRow: {
     flexDirection: 'row',
     justifyContent: 'center',
-    alignItems: 'baseline',
-    marginTop: spacing.sm,
+    // BATCH: vertical-centering fix — was 'baseline', which combined with
+    // the asymmetric padding below made "0원" read as sitting low in the
+    // card. True cross-axis centering instead of baseline alignment.
+    alignItems: 'center',
+    marginTop: spacing.xs,
     marginHorizontal: spacing.lg,
     paddingHorizontal: spacing.lg,
-    paddingTop: spacing.md, // was 22, then 12, then xs (too flat) — back to 12, still ~45% shorter than original
-    paddingBottom: spacing.sm,
+    // BATCH: history above says padding.xs(4) was tried and rejected as
+    // "too flat" — total vertical padding kept the same as before (14),
+    // just made symmetric (was 10/4, now 7/7) so the text doesn't sag
+    // toward the bottom of the card.
+    paddingTop: 7,
+    paddingBottom: 7,
     // 1px transparent border kept in the base style so toggling the active
     // state never shifts the layout by a pixel.
     borderRadius: radii.lg,
@@ -2041,7 +2064,9 @@ const styles = StyleSheet.create({
     // same fix as NumKey's digits, see `noPad`'s doc comment. This, not
     // amountRow's own padding, was the real driver of the card's height.
     ...noPad,
-    lineHeight: 52,
+    // BATCH: lineHeight trimmed to match fontSize exactly (was 46, a 2px
+    // excess) so the glyph box has no residual offset to center within.
+    lineHeight: 44,
     textAlignVertical: 'center',
   },
   unit: {
@@ -2056,13 +2081,15 @@ const styles = StyleSheet.create({
     color: colors.primaryStrong,
   },
 
+  // BATCH: ≈25% shorter row (paddingVertical 12→9). Icon/placeholder/
+  // TextInput behaviour untouched.
   memoRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     marginHorizontal: spacing.lg,
-    marginBottom: spacing.md,
-    paddingVertical: 12,
+    marginBottom: spacing.sm,
+    paddingVertical: 9,
     paddingHorizontal: spacing.lg,
     backgroundColor: colors.white,
     borderRadius: radii.lg,
@@ -2079,7 +2106,9 @@ const styles = StyleSheet.create({
 
   catLabel: {
     paddingHorizontal: spacing.xl,
-    paddingBottom: spacing.sm,
+    // FINAL BATCH: tighter title→list gap (was spacing.sm=8). Shared by both
+    // the "카테고리" and "결제수단" titles.
+    paddingBottom: spacing.xs,
     fontFamily: fontFamily.bold,
     fontSize: 11,
     letterSpacing: 0.2,
@@ -2102,22 +2131,25 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
   },
   catPickActive: { backgroundColor: colors.primaryLight },
+  // FINAL BATCH: 30→28 (2px trim, within the requested cap).
   catPickIcon: {
-    width: 30,
-    height: 30,
-    borderRadius: 9,
+    width: 28,
+    height: 28,
+    borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },
 
   /* ---- split expense ---- */
+  // BATCH: ≈20% shorter row (paddingVertical 10→8). Checkbox/text/hint and
+  // the toggle's tap target untouched.
   splitToggle: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     marginHorizontal: spacing.lg,
-    marginBottom: spacing.sm,
-    paddingVertical: 10,
+    marginBottom: spacing.xs,
+    paddingVertical: 8,
     paddingHorizontal: spacing.lg,
     backgroundColor: colors.white,
     borderRadius: radii.lg,
@@ -2251,25 +2283,28 @@ const styles = StyleSheet.create({
   },
 
   /* ---- payment method / card / 할부 ---- */
+  // FINAL BATCH: marginTop trimmed (was spacing.sm=8) for a tighter section gap.
   paySection: {
-    marginTop: spacing.sm,
+    marginTop: 6,
     paddingBottom: spacing.md,
   },
   payChipRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     alignItems: 'center',
-    gap: 6,
+    gap: 5,
   },
   payMethodRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 6,
+    gap: 5,
     paddingHorizontal: spacing.lg,
   },
+  // FINAL BATCH: ≈11% shorter pill (paddingVertical 7→5) + slightly tighter
+  // horizontal padding (14→12). fontSize/selected-state styling untouched.
   payChip: {
-    paddingVertical: 7,
-    paddingHorizontal: 14,
+    paddingVertical: 5,
+    paddingHorizontal: 12,
     borderRadius: radii.pill,
     backgroundColor: colors.white,
     borderWidth: 1,
@@ -2289,7 +2324,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    paddingVertical: 7,
+    paddingVertical: 5,
     paddingHorizontal: 12,
     borderRadius: radii.pill,
     backgroundColor: colors.primaryLighter,
@@ -2358,7 +2393,11 @@ const styles = StyleSheet.create({
 
   numPad: {
     paddingHorizontal: spacing.lg,
-    paddingTop: spacing.md,
+    // FINAL BATCH: spacing.sm(8)→10 — a small breathing gap so the keypad
+    // sheet doesn't read as touching the category/payment content right
+    // above it. Key height/gap/digit size untouched, so total keypad height
+    // barely moves.
+    paddingTop: 10,
     backgroundColor: colors.border,
     borderTopLeftRadius: radii.sheet,
     borderTopRightRadius: radii.sheet,
@@ -2385,8 +2424,11 @@ const styles = StyleSheet.create({
   },
 
   saveBtn: { borderRadius: radii.xl, overflow: 'hidden' },
+  // BATCH: ≈11% shorter (54→48) so it doesn't read as over-thick next to
+  // the now-shorter keypad; still comfortably tappable. disabled/enabled
+  // opacity and the save() call at the Pressable are untouched.
   saveBtnFill: {
-    height: 54,
+    height: 48,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -2401,7 +2443,9 @@ const styles = StyleSheet.create({
     gap: 8,
     alignItems: 'center',
     paddingHorizontal: spacing.lg,
-    paddingTop: spacing.md,
+    // FINAL BATCH: matches numPad's paddingTop bump (8→10) for the same
+    // breathing-room reason, so collapsed/expanded states stay consistent.
+    paddingTop: 10,
     backgroundColor: colors.border,
   },
   reopenBtn: {

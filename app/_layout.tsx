@@ -105,6 +105,7 @@ const HOUSEHOLD_READY_SCREENS = [
   'categories',
   'backup',
   'account-delete',
+  'guide',
 ];
 
 /**
@@ -737,6 +738,7 @@ function RootNav() {
         <Stack.Screen name="planned-add" options={MODAL} />
         <Stack.Screen name="backup" options={MODAL} />
         <Stack.Screen name="account-delete" options={MODAL} />
+        <Stack.Screen name="guide" options={MODAL} />
       </Stack>
     </>
   );

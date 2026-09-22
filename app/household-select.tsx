@@ -25,7 +25,7 @@ export default function HouseholdSelect() {
               flexDirection: 'row',
               alignItems: 'center',
               justifyContent: 'space-between',
-              paddingVertical: 14,
+              paddingVertical: 11,
               paddingHorizontal: spacing.lg,
               backgroundColor: colors.white,
               borderWidth: 1,

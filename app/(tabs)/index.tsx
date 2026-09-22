@@ -9,7 +9,7 @@ import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRef
 import { Card } from '@/components/ui/Card';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Screen } from '@/components/ui/Screen';
-import { HeaderIconButton, ScreenHeader } from '@/components/ui/ScreenHeader';
+import { ScreenHeader } from '@/components/ui/ScreenHeader';
 import { getCat } from '@/data/categories';
 import { monthlyTotals, recentTransactions } from '@/lib/aggregate';
 import { cardBillingForMonth } from '@/lib/card';
@@ -122,10 +122,39 @@ export default function HomeScreen() {
         title={formatMonthLabel()}
         containerStyle={{ paddingTop: spacing.sm + 2, paddingBottom: spacing.sm }}
         right={
+          // BATCH 4-D: home-local (not the shared HeaderIconButton — that's
+          // also used by planned.tsx/budget.tsx, which this BATCH must not
+          // touch) slightly smaller version of the exact same button look,
+          // so only the home header shrinks. Function/route/color unchanged;
+          // hitSlop compensates the smaller box for touch target size.
           <View style={{ flexDirection: 'row', gap: spacing.sm }}>
-            <HeaderIconButton icon="calendar" onPress={() => router.push('/calendar')} />
-            <HeaderIconButton icon="refresh" onPress={() => router.push('/recurring')} />
-            <HeaderIconButton icon="target" onPress={() => router.push('/goals')} />
+            {(
+              [
+                { icon: 'calendar', label: '달력', onPress: () => router.push('/calendar') },
+                { icon: 'refresh', label: '반복 지출·수입', onPress: () => router.push('/recurring') },
+                { icon: 'target', label: '저축 목표', onPress: () => router.push('/goals') },
+              ] as const
+            ).map((b) => (
+              <Pressable
+                key={b.icon}
+                onPress={b.onPress}
+                hitSlop={6}
+                accessibilityRole="button"
+                accessibilityLabel={b.label}
+                style={{
+                  width: 33,
+                  height: 33,
+                  borderRadius: radii.pill,
+                  backgroundColor: colors.card,
+                  borderWidth: 1,
+                  borderColor: colors.border,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <AppIcon name={b.icon} size={18} color={colors.textSub} />
+              </Pressable>
+            ))}
           </View>
         }
       />
@@ -188,18 +217,20 @@ export default function HomeScreen() {
           );
         })()}
 
-      {/* Balance card */}
+      {/* Balance card — 홈 UI 개선 STEP 1: 더 컴팩트하게, 지출 금액을 항상
+          메인 숫자로(예산 설정 여부와 무관), 예산 사용률/남은 예산은 한 줄
+          보조정보로. onPress/라우팅 분기(totalBudget 기준)는 기존 그대로. */}
       <Pressable onPress={() => (totalBudget > 0 ? router.push('/(tabs)/budget') : router.push('/all-transactions'))}>
-        <Card style={{ paddingVertical: 13, marginBottom: spacing.md }}>
+        <Card style={{ paddingVertical: 9, marginBottom: spacing.md }}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
             <Text style={{ fontFamily: fontFamily.medium, fontSize: 12, color: colors.textSub }}>
-              이번 달 {totalBudget > 0 ? '남은 예산' : '지출 합계'}
+              이번 달 지출
             </Text>
             <AppIcon name="chev-right" size={16} color={colors.textFaint} />
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, marginTop: 2 }}>
-            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 34, lineHeight: 38, letterSpacing: -1, color: colors.text, ...noPad, ...tabularNums }}>
-              {fmt(totalBudget > 0 ? remaining : expense)}
+            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 34, lineHeight: 34, letterSpacing: -1, color: colors.text, ...noPad, ...tabularNums }}>
+              {fmt(expense)}
             </Text>
             <Text style={{ fontFamily: fontFamily.medium, fontSize: 16, color: colors.textSub, ...noPad }}>원</Text>
           </View>
@@ -208,15 +239,16 @@ export default function HomeScreen() {
             <>
               <ProgressBar
                 percent={percent}
-                style={{ marginTop: 10 }}
+                size="sm"
+                style={{ marginTop: 8 }}
                 fillColor={percent >= 100 ? colors.expenseSolid : percent >= 80 ? colors.warning : undefined}
               />
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 }}>
-                <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, ...tabularNums }}>
-                  {fmt(expense)}원 사용 <Text style={{ color: colors.textFaint }}>/ {fmt(totalBudget)}원</Text>
-                </Text>
-                <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>{percent}%</Text>
-              </View>
+              <Text
+                numberOfLines={1}
+                style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted, marginTop: 4, ...tabularNums }}
+              >
+                예산 {fmt(totalBudget)}원 중 {percent}% 사용 · {fmt(remaining)}원 남음
+              </Text>
             </>
           ) : (
             // STEP 16-G1B HOME FIX: the old "예산 설정하기" pill navigated to
@@ -225,9 +257,9 @@ export default function HomeScreen() {
             // Plain, non-interactive text now; the outer Card Pressable
             // above still navigates to /all-transactions (pure read nav,
             // untouched).
-            <View style={{ marginTop: 6 }}>
+            <View style={{ marginTop: 4 }}>
               <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
-                설정된 예산이 없어요 · 탭해서 이번 달 전체 내역 보기 →
+                예산을 설정하면 사용률을 확인할 수 있어요
               </Text>
             </View>
           )}
@@ -240,13 +272,186 @@ export default function HomeScreen() {
         <StatTile label="지출" value={expense} tone="expense" onPress={() => goToTxns('expense')} />
       </View>
 
+      {/* Recent — STEP 3: moved up (was the last section) so the most
+          time-sensitive info shows without scrolling past insights/card
+          bill/category breakdown. Block moved verbatim, no logic/style
+          changes. */}
+      <Pressable
+        onPress={() => router.push('/all-transactions')}
+        style={{
+          flexDirection: 'row',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginHorizontal: spacing.xl,
+          marginBottom: spacing.sm,
+        }}
+      >
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>최근 내역</Text>
+          <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+        </View>
+        <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>전체보기 →</Text>
+      </Pressable>
+
+      {recent.length === 0 && failedLocalTransactions.length === 0 ? (
+        <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.md, paddingBottom: spacing.xxl }}>
+          <View
+            style={{
+              width: 56,
+              height: 56,
+              borderRadius: radii.sheet,
+              backgroundColor: colors.track,
+              alignItems: 'center',
+              justifyContent: 'center',
+              marginBottom: 12,
+            }}
+          >
+            <AppIcon name="clipboard" size={24} color={colors.textMuted} strokeWidth={2.5} />
+          </View>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 4 }}>아직 거래가 없어요</Text>
+          <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub, textAlign: 'center' }}>
+            우리집 가계부에 기록된 거래가 없어요
+          </Text>
+        </View>
+      ) : (
+        <Card variant="sm" style={{ paddingVertical: 4, paddingHorizontal: spacing.lg }}>
+          {/* STEP 16-G2-B: row opens the edit form; a plain (non-pressable)
+              row when transaction editing is off. */}
+          {/* STEP 3-1: home is a quick-glance preview, not the full list —
+              cap the RENDERED normal rows at 3. `recentTransactions(
+              transactions, 5)` itself is untouched (still computes 5); only
+              the slice shown here changed. pending/failed rows below are
+              NEVER capped by this. */}
+          {recent.slice(0, 3).map((t, i) => {
+            const cat = getCat(t.category, t.type, customCats);
+            // STEP 16-H2-A2/B2: an offline pending CREATE/UPDATE is visible,
+            // and a FAILED DELETE keeps its server row visible — all
+            // read-only until the queue settles.
+            const opState = pendingTransactionOps.get(t.id);
+            const pendingState = opState ? (opState.failed ? 'failed' : 'pending') : null;
+            return (
+              <Pressable
+                key={t.id}
+                onPress={
+                  pendingState
+                    ? undefined
+                    : () => router.push({ pathname: '/input', params: { id: t.id } })
+                }
+                disabled={!!pendingState || !REMOTE_FINANCE_WRITE.transactionEdit}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: spacing.md,
+                  paddingVertical: 9,
+                  borderTopWidth: i === 0 ? 0 : 1,
+                  borderTopColor: colors.track,
+                  opacity: pendingState ? 0.6 : 1,
+                }}
+              >
+                <View
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 11,
+                    backgroundColor: cat.bg,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <AppIcon name={cat.icon} size={16} color={cat.color} />
+                </View>
+                <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+                  <Text
+                    numberOfLines={1}
+                    style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
+                  >
+                    {t.memo || cat.name}
+                  </Text>
+                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+                    {opState
+                      ? pendingTransactionRowLabel(opState)
+                      : `${formatRelativeDateTime(t.date)} · ${cat.name}`}
+                  </Text>
+                </View>
+                <Text
+                  style={{
+                    fontFamily: fontFamily.bold,
+                    fontSize: 13,
+                    color: t.type === 'income' ? colors.incomeStrong : colors.text,
+                    ...tabularNums,
+                  }}
+                >
+                  {t.type === 'income' ? '+' : '−'}
+                  {fmt(t.amount)}원
+                </Text>
+              </Pressable>
+            );
+          })}
+          {/* STEP 16-H2-B2.2: display-only rows for a failed offline UPDATE
+              whose server row was deleted elsewhere. NOT real transactions
+              (excluded from every total) — read-only, no edit entry. */}
+          {failedLocalTransactions.map(({ transaction: t, op, reason }, i) => {
+            const cat = getCat(t.category, t.type, customCats);
+            return (
+              <View
+                key={`failed-local-${t.id}`}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: spacing.md,
+                  paddingVertical: 9,
+                  borderTopWidth: recent.length === 0 && i === 0 ? 0 : 1,
+                  borderTopColor: colors.track,
+                  opacity: 0.6,
+                }}
+              >
+                <View
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 11,
+                    backgroundColor: cat.bg,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <AppIcon name={cat.icon} size={16} color={cat.color} />
+                </View>
+                <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+                  <Text
+                    numberOfLines={1}
+                    style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
+                  >
+                    {t.memo || cat.name}
+                  </Text>
+                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
+                    {pendingTransactionRowLabel({ op, failed: true, reason })}
+                  </Text>
+                </View>
+                <Text
+                  style={{
+                    fontFamily: fontFamily.bold,
+                    fontSize: 13,
+                    color: t.type === 'income' ? colors.incomeStrong : colors.text,
+                    ...tabularNums,
+                  }}
+                >
+                  {t.type === 'income' ? '+' : '−'}
+                  {fmt(t.amount)}원
+                </Text>
+              </View>
+            );
+          })}
+        </Card>
+      )}
+
       {/* 이번 달 인사이트 — rule-based, max 3, hidden when nothing to say */}
       {insights.length > 0 && (
-        <Card style={{ paddingVertical: spacing.lg, marginBottom: spacing.md }}>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginBottom: spacing.sm }}>
+        <Card style={{ paddingVertical: spacing.sm, marginBottom: spacing.md }}>
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, marginBottom: 6 }}>
             이번 달 인사이트
           </Text>
-          <View style={{ gap: 10 }}>
+          <View style={{ gap: 8 }}>
             {insights.map((ins) => {
               const t = insightTone(ins.tone);
               return (
@@ -323,21 +528,21 @@ export default function HomeScreen() {
           "카테고리별 지출 상세" screen (not the stats tab). */}
       {topCats.length > 0 && (
         <Pressable onPress={() => router.push('/category-spending')}>
-          <Card style={{ paddingVertical: spacing.lg, marginBottom: spacing.md }}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
+          <Card style={{ paddingVertical: spacing.md, marginBottom: spacing.md }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.sm }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
                 <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>카테고리별 지출</Text>
                 <AppIcon name="chev-right" size={14} color={colors.textFaint} />
               </View>
               <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>자세히 →</Text>
             </View>
-            <View style={{ gap: spacing.md }}>
+            <View style={{ gap: spacing.sm }}>
               {topCats.map(([catId, amount]) => {
                 const cat = getCat(catId, 'expense', customCats);
                 const pct = Math.min(100, Math.round((amount / maxCat) * 100));
                 return (
                   <View key={catId}>
-                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
                         <View
                           style={{
@@ -365,171 +570,6 @@ export default function HomeScreen() {
           </Card>
         </Pressable>
       )}
-
-      {/* Recent */}
-      <Pressable
-        onPress={() => router.push('/all-transactions')}
-        style={{
-          flexDirection: 'row',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          marginHorizontal: spacing.xl,
-          marginBottom: spacing.sm,
-        }}
-      >
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>최근 내역</Text>
-          <AppIcon name="chev-right" size={14} color={colors.textFaint} />
-        </View>
-        <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>전체보기 →</Text>
-      </Pressable>
-
-      {recent.length === 0 && failedLocalTransactions.length === 0 ? (
-        <View style={{ alignItems: 'center', paddingHorizontal: spacing.xxl, paddingTop: spacing.md, paddingBottom: spacing.xxl }}>
-          <View
-            style={{
-              width: 56,
-              height: 56,
-              borderRadius: radii.sheet,
-              backgroundColor: colors.track,
-              alignItems: 'center',
-              justifyContent: 'center',
-              marginBottom: 12,
-            }}
-          >
-            <AppIcon name="clipboard" size={24} color={colors.textMuted} strokeWidth={2.5} />
-          </View>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.text, marginBottom: 4 }}>아직 거래가 없어요</Text>
-          <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub, textAlign: 'center' }}>
-            우리집 가계부에 기록된 거래가 없어요
-          </Text>
-        </View>
-      ) : (
-        <Card variant="sm" style={{ paddingVertical: 4, paddingHorizontal: spacing.lg }}>
-          {/* STEP 16-G2-B: row opens the edit form; a plain (non-pressable)
-              row when transaction editing is off. */}
-          {recent.map((t, i) => {
-            const cat = getCat(t.category, t.type, customCats);
-            // STEP 16-H2-A2/B2: an offline pending CREATE/UPDATE is visible,
-            // and a FAILED DELETE keeps its server row visible — all
-            // read-only until the queue settles.
-            const opState = pendingTransactionOps.get(t.id);
-            const pendingState = opState ? (opState.failed ? 'failed' : 'pending') : null;
-            return (
-              <Pressable
-                key={t.id}
-                onPress={
-                  pendingState
-                    ? undefined
-                    : () => router.push({ pathname: '/input', params: { id: t.id } })
-                }
-                disabled={!!pendingState || !REMOTE_FINANCE_WRITE.transactionEdit}
-                style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: spacing.md,
-                  paddingVertical: 10,
-                  borderTopWidth: i === 0 ? 0 : 1,
-                  borderTopColor: colors.track,
-                  opacity: pendingState ? 0.6 : 1,
-                }}
-              >
-                <View
-                  style={{
-                    width: 34,
-                    height: 34,
-                    borderRadius: 11,
-                    backgroundColor: cat.bg,
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <AppIcon name={cat.icon} size={16} color={cat.color} />
-                </View>
-                <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
-                  <Text
-                    numberOfLines={1}
-                    style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
-                  >
-                    {t.memo || cat.name}
-                  </Text>
-                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-                    {opState
-                      ? pendingTransactionRowLabel(opState)
-                      : `${formatRelativeDateTime(t.date)} · ${cat.name}`}
-                  </Text>
-                </View>
-                <Text
-                  style={{
-                    fontFamily: fontFamily.bold,
-                    fontSize: 13,
-                    color: t.type === 'income' ? colors.incomeStrong : colors.text,
-                    ...tabularNums,
-                  }}
-                >
-                  {t.type === 'income' ? '+' : '−'}
-                  {fmt(t.amount)}원
-                </Text>
-              </Pressable>
-            );
-          })}
-          {/* STEP 16-H2-B2.2: display-only rows for a failed offline UPDATE
-              whose server row was deleted elsewhere. NOT real transactions
-              (excluded from every total) — read-only, no edit entry. */}
-          {failedLocalTransactions.map(({ transaction: t, op, reason }, i) => {
-            const cat = getCat(t.category, t.type, customCats);
-            return (
-              <View
-                key={`failed-local-${t.id}`}
-                style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: spacing.md,
-                  paddingVertical: 10,
-                  borderTopWidth: recent.length === 0 && i === 0 ? 0 : 1,
-                  borderTopColor: colors.track,
-                  opacity: 0.6,
-                }}
-              >
-                <View
-                  style={{
-                    width: 34,
-                    height: 34,
-                    borderRadius: 11,
-                    backgroundColor: cat.bg,
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <AppIcon name={cat.icon} size={16} color={cat.color} />
-                </View>
-                <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
-                  <Text
-                    numberOfLines={1}
-                    style={{ fontFamily: fontFamily.semibold, fontSize: 13, lineHeight: 16, color: colors.text, ...noPad }}
-                  >
-                    {t.memo || cat.name}
-                  </Text>
-                  <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
-                    {pendingTransactionRowLabel({ op, failed: true, reason })}
-                  </Text>
-                </View>
-                <Text
-                  style={{
-                    fontFamily: fontFamily.bold,
-                    fontSize: 13,
-                    color: t.type === 'income' ? colors.incomeStrong : colors.text,
-                    ...tabularNums,
-                  }}
-                >
-                  {t.type === 'income' ? '+' : '−'}
-                  {fmt(t.amount)}원
-                </Text>
-              </View>
-            );
-          })}
-        </Card>
-      )}
     </Screen>
   );
 }
@@ -551,7 +591,7 @@ function StatTile({
       onPress={onPress}
       style={{
         flex: 1,
-        paddingVertical: spacing.md - 1,
+        paddingVertical: spacing.sm,
         paddingHorizontal: spacing.lg,
         backgroundColor: colors.card,
         borderWidth: 1,
@@ -559,30 +599,43 @@ function StatTile({
         borderRadius: radii.xxl,
       }}
     >
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-          <View
-            style={{
-              width: 20,
-              height: 20,
-              borderRadius: radii.xs,
-              backgroundColor: isIncome ? colors.incomeLight : colors.expenseLight,
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <AppIcon
-              name={isIncome ? 'up' : 'down'}
-              size={10}
-              color={isIncome ? colors.incomeText : colors.expenseText}
-              strokeWidth={3}
-            />
-          </View>
-          <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>{label}</Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        <View
+          style={{
+            width: 20,
+            height: 20,
+            borderRadius: radii.xs,
+            backgroundColor: isIncome ? colors.incomeLight : colors.expenseLight,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <AppIcon
+            name={isIncome ? 'up' : 'down'}
+            size={10}
+            color={isIncome ? colors.incomeText : colors.expenseText}
+            strokeWidth={3}
+          />
         </View>
-        <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+        <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>{label}</Text>
+        {/* STEP 2-2: back in the header row (STEP 2-1's whole-card absolute
+            centring looked worse — floated between title and amount).
+            Fixed-size wrapper matches the left icon tile's 20x20 box so the
+            chevron's visual centre lines up with it and the label on the
+            SAME row, no translateY guess. */}
+        <View
+          style={{
+            marginLeft: 'auto',
+            width: 20,
+            height: 20,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <AppIcon name="chev-right" size={14} color={colors.textFaint} />
+        </View>
       </View>
-      <Text style={{ fontFamily: fontFamily.bold, fontSize: 18, color: colors.text, marginTop: 4, letterSpacing: -0.4, ...tabularNums }}>
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 18, color: colors.text, marginTop: 2, letterSpacing: -0.4, ...tabularNums }}>
         {fmt(value)}
       </Text>
     </Pressable>

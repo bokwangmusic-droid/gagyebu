@@ -50,6 +50,7 @@ export default function HouseholdCreate() {
           label={submitting ? '만드는 중...' : '만들기'}
           onPress={onSubmit}
           disabled={!canSubmit}
+          height={48}
         />
       </View>
     </AuthShell>

@@ -21,12 +21,17 @@ export function AuthShell({
   subtitle,
   children,
   footer,
+  compact = false,
 }: {
   title: string;
   subtitle: string;
   children: ReactNode;
   /** Rendered below the form, e.g. a "회원가입" switch link. */
   footer?: ReactNode;
+  /** BATCH 4: optional denser header spacing, opt-in only from sign-in /
+   * sign-up. Default false keeps every other AuthShell screen
+   * (household-*, forgot/reset-password) pixel-identical. */
+  compact?: boolean;
 }) {
   const insets = useSafeAreaInsets();
 
@@ -46,7 +51,7 @@ export function AuthShell({
       <ScrollView
         contentContainerStyle={{
           flexGrow: 1,
-          paddingTop: insets.top + 32,
+          paddingTop: insets.top + (compact ? 20 : 32),
           paddingBottom: insets.bottom + 24,
           paddingHorizontal: spacing.xl,
         }}
@@ -54,7 +59,7 @@ export function AuthShell({
         showsVerticalScrollIndicator={false}
       >
         <View style={{ width: '100%', maxWidth: 430, alignSelf: 'center', flexGrow: 1 }}>
-          <View style={{ alignItems: 'center', marginBottom: spacing.xxl }}>
+          <View style={{ alignItems: 'center', marginBottom: compact ? spacing.lg : spacing.xxl }}>
             <Image
               source={require('../../../assets/icon.png')}
               style={{ width: 84, height: 84, borderRadius: radii.xxl }}
@@ -90,7 +95,7 @@ export function AuthShell({
                 fontFamily: fontFamily.bold,
                 fontSize: 16,
                 color: colors.text,
-                marginBottom: spacing.md,
+                marginBottom: compact ? 8 : spacing.md,
               }}
             >
               {title}

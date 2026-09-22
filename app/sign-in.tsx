@@ -79,9 +79,9 @@ export default function SignIn() {
   };
 
   return (
-    <AuthShell title="로그인" subtitle="내 돈부터 우리집 돈까지, 더 쉽게 관리해요">
+    <AuthShell compact title="로그인" subtitle="내 돈부터 우리집 돈까지, 더 쉽게 관리해요">
       <View style={{ marginBottom: spacing.lg }}>
-        <Field label="이메일">
+        <Field label="이메일" style={{ marginBottom: 12 }}>
           <TextField
             value={email}
             onChangeText={setEmail}
@@ -94,9 +94,10 @@ export default function SignIn() {
             returnKeyType="next"
             onSubmitEditing={() => passwordRef.current?.focus()}
             blurOnSubmit={false}
+            style={{ paddingVertical: 10 }}
           />
         </Field>
-        <Field label="비밀번호">
+        <Field label="비밀번호" style={{ marginBottom: 12 }}>
           <PasswordField
             ref={passwordRef}
             value={password}
@@ -107,6 +108,7 @@ export default function SignIn() {
             textContentType="password"
             returnKeyType="done"
             onSubmitEditing={onSubmit}
+            style={{ paddingVertical: 10 }}
             // Android root cause: this field is `secureTextEntry`, and on
             // several OEM keyboards a masked/password EditText's "완료" key
             // is delivered as a raw KEYCODE_ENTER key event
@@ -135,7 +137,7 @@ export default function SignIn() {
         <Pressable
           onPress={() => router.push('/forgot-password')}
           hitSlop={8}
-          style={{ alignSelf: 'flex-end', marginTop: -8, marginBottom: spacing.md }}
+          style={{ alignSelf: 'flex-end', marginTop: -8, marginBottom: 8 }}
         >
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>
             비밀번호를 잊으셨나요?
@@ -150,6 +152,7 @@ export default function SignIn() {
           // this remains the duplicate-submit guard for the button itself
           // (submittingRef inside onSubmit guards the keyboard-"완료" path).
           disabled={submitting}
+          height={48}
         />
 
         {/* Kakao-OAuth STEP 1 — 1차 기능 테스트 단계: 로고/이미지 asset 없이
@@ -159,8 +162,8 @@ export default function SignIn() {
           onPress={() => void onKakaoPress()}
           disabled={kakaoSubmitting}
           style={({ pressed }) => ({
-            marginTop: spacing.md,
-            height: 54,
+            marginTop: 10,
+            height: 48,
             borderRadius: radii.xl,
             backgroundColor: '#FEE500',
             alignItems: 'center',
@@ -177,7 +180,7 @@ export default function SignIn() {
       <Pressable
         onPress={() => router.replace('/sign-up')}
         hitSlop={8}
-        style={{ alignItems: 'center', paddingVertical: spacing.md }}
+        style={{ alignItems: 'center', paddingVertical: 8 }}
       >
         <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub }}>
           처음이신가요?{' '}

@@ -45,7 +45,6 @@ export default function ProfileScreen() {
   const {
     settings,
     setSettings,
-    setSeenOnboarding,
     recurring: localRecurring,
     goals: localGoals,
     loans: localLoans,
@@ -139,12 +138,22 @@ export default function ProfileScreen() {
     })();
   };
 
-  const reviewOnboarding = () => {
-    // Re-arm the onboarding gate, then jump to it. Finishing / skipping there
-    // flips `seenOnboarding` back on and returns home (app/onboarding.tsx).
-    setSeenOnboarding(false);
-    router.replace('/onboarding');
-  };
+  // FIX: this used to jump to app/onboarding.tsx via setSeenOnboarding(false)
+  // + router.replace('/onboarding') — but that screen is the FIRST-LAUNCH
+  // marketing splash, whose only two buttons ("건너뛰기"/"시작하기") both
+  // immediately call setSeenOnboarding(true) + router.replace('/'), so any
+  // tap bounced straight back to home. seenOnboarding also gates AuthGate's
+  // own routing (app/_layout.tsx), so it's not safe to reuse for a "view
+  // guide" action. app/guide.tsx is a dedicated, state-free usage guide.
+  const openGuide = () => router.push('/guide');
+
+  // BATCH 4: oh-tap protection — same Alert.alert pattern as confirmReset
+  // below, just without the destructive style (logging out loses no data).
+  const confirmSignOut = () =>
+    Alert.alert('로그아웃', '로그아웃하시겠어요?', [
+      { text: '취소', style: 'cancel' },
+      { text: '로그아웃', onPress: () => void signOut() },
+    ]);
 
   const confirmReset = () =>
     Alert.alert(
@@ -195,8 +204,8 @@ export default function ProfileScreen() {
         style={{
           marginHorizontal: spacing.lg,
           marginTop: spacing.sm,
-          marginBottom: spacing.md,
-          padding: 14,
+          marginBottom: spacing.sm,
+          padding: 11,
           backgroundColor: colors.white,
           borderWidth: 1,
           borderColor: colors.border,
@@ -208,8 +217,8 @@ export default function ProfileScreen() {
       >
         <View
           style={{
-            width: 44,
-            height: 44,
+            width: 40,
+            height: 40,
             borderRadius: radii.pill,
             backgroundColor: colors.primary,
             alignItems: 'center',
@@ -399,8 +408,8 @@ export default function ProfileScreen() {
           iconBg={colors.primaryLight}
           iconColor={colors.primaryStrong}
           title="사용법 다시 보기"
-          sub="시작 화면 안내를 다시 봐요"
-          onPress={reviewOnboarding}
+          sub="자주 쓰는 기능을 빠르게 확인해요"
+          onPress={openGuide}
         />
         <Row
           icon="info"
@@ -429,11 +438,11 @@ export default function ProfileScreen() {
 
       <View
         style={{
-          paddingTop: spacing.lg,
+          paddingTop: spacing.md,
           paddingHorizontal: spacing.xl,
-          paddingBottom: spacing.xl,
+          paddingBottom: spacing.lg,
           alignItems: 'center',
-          gap: 10,
+          gap: 8,
         }}
       >
         <Text
@@ -455,7 +464,7 @@ export default function ProfileScreen() {
             flexDirection: 'row',
             alignItems: 'center',
             gap: 6,
-            paddingVertical: 9,
+            paddingVertical: 8,
             paddingHorizontal: 18,
             borderRadius: radii.pill,
             backgroundColor: colors.expenseLight,
@@ -485,13 +494,13 @@ export default function ProfileScreen() {
           borderTopWidth: 1,
           borderTopColor: colors.border,
           marginHorizontal: spacing.lg,
-          paddingTop: spacing.lg,
-          paddingBottom: 40,
+          paddingTop: spacing.md,
+          paddingBottom: 28,
           alignItems: 'center',
         }}
       >
         <Pressable
-          onPress={() => void signOut()}
+          onPress={confirmSignOut}
           hitSlop={8}
           accessibilityRole="button"
           style={{ paddingVertical: 8, paddingHorizontal: 16 }}
@@ -578,7 +587,7 @@ function SettingsCard({ children }: { children: React.ReactNode }) {
     <View
       style={{
         marginHorizontal: spacing.lg,
-        marginBottom: spacing.md,
+        marginBottom: spacing.sm,
         paddingHorizontal: spacing.lg,
         backgroundColor: colors.white,
         borderWidth: 1,
@@ -620,16 +629,16 @@ function Row({
         flexDirection: 'row',
         alignItems: 'center',
         gap: 11,
-        paddingVertical: 10,
+        paddingVertical: 8,
         borderBottomWidth: last ? 0 : 1,
         borderBottomColor: colors.track,
       }}
     >
       <View
         style={{
-          width: 32,
-          height: 32,
-          borderRadius: 9,
+          width: 30,
+          height: 30,
+          borderRadius: 8,
           backgroundColor: iconBg,
           alignItems: 'center',
           justifyContent: 'center',

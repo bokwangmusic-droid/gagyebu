@@ -19,15 +19,16 @@ export default function HouseholdSetup() {
 
   return (
     <AuthShell title="" subtitle="어떻게 시작할까요?">
-      <View style={{ gap: spacing.md }}>
+      <View style={{ gap: 10 }}>
         <GradientButton
           label="🏠  우리집 가계부 만들기"
           onPress={() => router.push('/household-create')}
+          height={48}
         />
         <Pressable
           onPress={() => router.push('/household-join')}
           style={{
-            height: 54,
+            height: 48,
             borderRadius: radii.xl,
             borderWidth: 1.5,
             borderColor: colors.primaryLight,
@@ -45,7 +46,7 @@ export default function HouseholdSetup() {
       <Pressable
         onPress={() => void signOut()}
         hitSlop={8}
-        style={{ alignItems: 'center', paddingVertical: spacing.xl }}
+        style={{ alignItems: 'center', paddingVertical: spacing.lg }}
       >
         <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textMuted }}>
           다른 계정으로 로그인하고 싶다면 · 로그아웃

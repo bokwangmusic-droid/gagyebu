@@ -15,14 +15,20 @@ interface GradientButtonProps {
   onPress: () => void;
   disabled?: boolean;
   style?: StyleProp<ViewStyle>;
+  /** BATCH 3: optional override, default unchanged at 54 — lets specific
+   * screens (household onboarding) opt into the tighter 48px CTA height
+   * already used by app/input.tsx's saveBtnFill, without affecting any of
+   * the other screens that render this component at the default height. */
+  height?: number;
 }
 
-/** Primary CTA — lavender 135° gradient, full width, 54px tall. */
+/** Primary CTA — lavender 135° gradient, full width, 54px tall by default. */
 export function GradientButton({
   label,
   onPress,
   disabled,
   style,
+  height = 54,
 }: GradientButtonProps) {
   return (
     <Pressable
@@ -39,7 +45,7 @@ export function GradientButton({
         start={{ x: 0, y: 0 }}
         end={{ x: 1, y: 1 }}
         style={{
-          height: 54,
+          height,
           borderRadius: radii.xl,
           alignItems: 'center',
           justifyContent: 'center',

@@ -165,13 +165,18 @@ export function Field({
   label,
   hint,
   children,
+  style,
 }: {
   label: string;
   hint?: string;
   children: ReactNode;
+  /** BATCH 4: optional wrapper override, opt-in only — default unchanged so
+   * every other Field usage (17 screens) stays pixel-identical. Lets
+   * sign-in/sign-up trim the default marginBottom without a global change. */
+  style?: object;
 }) {
   return (
-    <View style={{ marginBottom: spacing.lg }}>
+    <View style={[{ marginBottom: spacing.lg }, style]}>
       <Text
         style={{
           fontFamily: fontFamily.bold,

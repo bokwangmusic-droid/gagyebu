@@ -51,6 +51,7 @@ export default function HouseholdJoin() {
           label={submitting ? '참여하는 중...' : '우리집 참여하기'}
           onPress={onSubmit}
           disabled={!canSubmit}
+          height={48}
         />
       </View>
     </AuthShell>

@@ -87,8 +87,8 @@ export default function SignUp() {
 
   if (awaitingVerification) {
     return (
-      <AuthShell title="" subtitle="회원가입">
-        <View style={{ alignItems: 'center', paddingVertical: spacing.xxl }}>
+      <AuthShell compact title="" subtitle="회원가입">
+        <View style={{ alignItems: 'center', paddingVertical: spacing.lg }}>
           <Text style={{ fontFamily: fontFamily.bold, fontSize: 17, color: colors.text }}>
             인증 메일을 보냈어요
           </Text>
@@ -107,7 +107,8 @@ export default function SignUp() {
           <GradientButton
             label="로그인 화면으로"
             onPress={() => router.replace('/sign-in')}
-            style={{ width: '100%', marginTop: spacing.xxl }}
+            style={{ width: '100%', marginTop: spacing.lg }}
+            height={48}
           />
         </View>
       </AuthShell>
@@ -115,9 +116,9 @@ export default function SignUp() {
   }
 
   return (
-    <AuthShell title="회원가입" subtitle="내 돈부터 우리집 돈까지, 더 쉽게 관리해요">
+    <AuthShell compact title="회원가입" subtitle="내 돈부터 우리집 돈까지, 더 쉽게 관리해요">
       <View style={{ marginBottom: spacing.lg }}>
-        <Field label="이름">
+        <Field label="이름" style={{ marginBottom: 12 }}>
           <TextField
             value={name}
             onChangeText={setName}
@@ -126,9 +127,10 @@ export default function SignUp() {
             returnKeyType="next"
             onSubmitEditing={() => emailRef.current?.focus()}
             blurOnSubmit={false}
+            style={{ paddingVertical: 10 }}
           />
         </Field>
-        <Field label="이메일">
+        <Field label="이메일" style={{ marginBottom: 12 }}>
           <TextField
             ref={emailRef}
             value={email}
@@ -142,9 +144,10 @@ export default function SignUp() {
             returnKeyType="next"
             onSubmitEditing={() => passwordRef.current?.focus()}
             blurOnSubmit={false}
+            style={{ paddingVertical: 10 }}
           />
         </Field>
-        <Field label="비밀번호" hint="6자 이상으로 설정해주세요">
+        <Field label="비밀번호" hint="6자 이상으로 설정해주세요" style={{ marginBottom: 12 }}>
           <PasswordField
             ref={passwordRef}
             value={password}
@@ -156,9 +159,10 @@ export default function SignUp() {
             returnKeyType="next"
             onSubmitEditing={() => confirmRef.current?.focus()}
             blurOnSubmit={false}
+            style={{ paddingVertical: 10 }}
           />
         </Field>
-        <Field label="비밀번호 확인">
+        <Field label="비밀번호 확인" style={{ marginBottom: 12 }}>
           <PasswordField
             ref={confirmRef}
             value={confirm}
@@ -169,6 +173,7 @@ export default function SignUp() {
             textContentType="newPassword"
             returnKeyType="done"
             onSubmitEditing={onSubmit}
+            style={{ paddingVertical: 10 }}
             // Android fallback (see app/sign-in.tsx for the confirmed root
             // cause): only the LAST secureTextEntry field before submit
             // needs this — some OEM keyboards deliver a masked field's
@@ -193,13 +198,14 @@ export default function SignUp() {
           // doing nothing. Still disabled while signUp is actually in
           // flight (duplicate-submit guard for the button itself).
           disabled={submitting}
+          height={48}
         />
       </View>
 
       <Pressable
         onPress={() => router.replace('/sign-in')}
         hitSlop={8}
-        style={{ alignItems: 'center', paddingVertical: spacing.md }}
+        style={{ alignItems: 'center', paddingVertical: 8 }}
       >
         <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.textSub }}>
           이미 계정이 있나요?{' '}

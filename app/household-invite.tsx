@@ -120,9 +120,10 @@ export default function HouseholdInvite() {
           <GradientButton
             label="공유하기"
             onPress={onShare}
-            style={{ width: '100%', maxWidth: 430, marginTop: spacing.xxl }}
+            height={48}
+            style={{ width: '100%', maxWidth: 430, marginTop: spacing.xl }}
           />
-          <Pressable onPress={generate} hitSlop={8} style={{ marginTop: spacing.lg }}>
+          <Pressable onPress={generate} hitSlop={8} style={{ marginTop: spacing.md }}>
             <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.textSub }}>
               새 코드 만들기
             </Text>
@@ -130,7 +131,7 @@ export default function HouseholdInvite() {
         </>
       ) : null}
 
-      <Pressable onPress={() => router.back()} hitSlop={8} style={{ marginTop: spacing.xxl }}>
+      <Pressable onPress={() => router.back()} hitSlop={8} style={{ marginTop: spacing.lg }}>
         <Text style={{ fontFamily: fontFamily.medium, fontSize: 13, color: colors.textMuted }}>
           닫기
         </Text>

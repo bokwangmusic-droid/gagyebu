@@ -11,7 +11,7 @@
  */
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback } from 'react';
-import { BackHandler, Pressable, ScrollView, Text, View } from 'react-native';
+import { Alert, BackHandler, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { GradientButton } from '@/components/ui/GradientButton';
@@ -75,13 +75,24 @@ export default function HouseholdReady() {
     loadedForCurrentHousehold &&
     !hasFinanceError;
 
+  // BATCH 4: same confirm-before-sign-out pattern as (tabs)/profile.tsx.
+  const confirmSignOut = () =>
+    Alert.alert('로그아웃', '로그아웃하시겠어요?', [
+      { text: '취소', style: 'cancel' },
+      { text: '로그아웃', onPress: () => void signOut() },
+    ]);
+
   return (
     <ScrollView
       style={{ flex: 1, backgroundColor: colors.bg }}
       contentContainerStyle={{
         flexGrow: 1,
-        paddingTop: insets.top + 40,
-        paddingBottom: insets.bottom + 32,
+        // BATCH 3: less top/bottom breathing room (was +40/+32) to match the
+        // tighter density set by home/input — title font size untouched.
+        // FINAL: trimmed further (28→16) per real-device feedback; insets.top
+        // itself is untouched so the safe area is still respected.
+        paddingTop: insets.top + 16,
+        paddingBottom: insets.bottom + 24,
         paddingHorizontal: spacing.xl,
         alignItems: 'center',
       }}
@@ -100,13 +111,13 @@ export default function HouseholdReady() {
         {activeHousehold?.name ?? '우리집 가계부'}
       </Text>
 
-      <View style={{ width: '100%', maxWidth: 430, marginTop: spacing.xxl }}>
+      <View style={{ width: '100%', maxWidth: 430, marginTop: spacing.lg }}>
         <Text
           style={{
             fontFamily: fontFamily.bold,
             fontSize: 12,
             color: colors.textSub,
-            marginBottom: spacing.sm,
+            marginBottom: spacing.xs,
           }}
         >
           함께 쓰는 사람
@@ -139,7 +150,8 @@ export default function HouseholdReady() {
                   flexDirection: 'row',
                   alignItems: 'center',
                   justifyContent: 'space-between',
-                  paddingVertical: 14,
+                  // FINAL: member row trimmed further (12→9).
+                  paddingVertical: 9,
                   paddingHorizontal: spacing.lg,
                   borderTopWidth: i === 0 ? 0 : 1,
                   borderTopColor: colors.border,
@@ -179,7 +191,8 @@ export default function HouseholdReady() {
         // does the normal Android "exit / previous tab" thing.
         onPress={() => router.replace('/(tabs)')}
         disabled={!financeReady}
-        style={{ width: '100%', maxWidth: 430, marginTop: spacing.xl }}
+        height={48}
+        style={{ width: '100%', maxWidth: 430, marginTop: spacing.lg }}
       />
       {hasFinanceError && (
         <Pressable onPress={() => void refreshRemoteFinance()} hitSlop={8} style={{ marginTop: spacing.sm }}>
@@ -193,7 +206,8 @@ export default function HouseholdReady() {
         <GradientButton
           label="함께 쓰는 사람 초대하기"
           onPress={() => router.push('/household-invite')}
-          style={{ width: '100%', maxWidth: 430, marginTop: spacing.md }}
+          height={48}
+          style={{ width: '100%', maxWidth: 430, marginTop: 8 }}
         />
       )}
 
@@ -207,14 +221,17 @@ export default function HouseholdReady() {
           style={{
             width: '100%',
             maxWidth: 430,
-            height: 48,
+            // BATCH 3: secondary action — shorter (48→42) and a hair less
+            // bold border than before, one visual step below the two
+            // primary CTAs above.
+            height: 42,
             borderRadius: radii.xl,
-            borderWidth: 1.5,
+            borderWidth: 1,
             borderColor: colors.primaryLight,
             backgroundColor: colors.white,
             alignItems: 'center',
             justifyContent: 'center',
-            marginTop: spacing.md,
+            marginTop: 8,
           }}
         >
           <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.primaryStrong }}>
@@ -232,14 +249,15 @@ export default function HouseholdReady() {
         style={{
           width: '100%',
           maxWidth: 430,
-          height: 48,
+          // BATCH 3: matches the "기존 데이터 연결 준비" secondary-action trim above.
+          height: 42,
           borderRadius: radii.xl,
-          borderWidth: 1.5,
+          borderWidth: 1,
           borderColor: colors.primaryLight,
           backgroundColor: colors.white,
           alignItems: 'center',
           justifyContent: 'center',
-          marginTop: spacing.md,
+          marginTop: 8,
         }}
       >
         <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.primaryStrong }}>
@@ -253,13 +271,13 @@ export default function HouseholdReady() {
           fontSize: 12,
           color: colors.textMuted,
           textAlign: 'center',
-          marginTop: spacing.xl,
+          marginTop: spacing.lg,
         }}
       >
         거래 데이터 연결은 다음 단계에서 진행할게요.
       </Text>
 
-      <Pressable onPress={() => void signOut()} hitSlop={8} style={{ marginTop: spacing.xxl }}>
+      <Pressable onPress={confirmSignOut} hitSlop={8} style={{ marginTop: spacing.xl }}>
         <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.expenseText }}>
           로그아웃
         </Text>

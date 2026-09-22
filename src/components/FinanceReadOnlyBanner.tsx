@@ -22,15 +22,19 @@ export function FinanceReadOnlyBanner() {
         alignSelf: 'flex-start',
         marginHorizontal: spacing.lg,
         marginBottom: spacing.sm,
-        paddingVertical: 5,
-        paddingHorizontal: 10,
+        paddingVertical: 4,
+        paddingHorizontal: 8,
         borderRadius: radii.pill,
-        backgroundColor: colors.primaryLighter,
+        // BATCH 4-C: no longer the primary-lavender accent — writes are open
+        // now (src/lib/financeMode.ts), so this is just a quiet context
+        // label, not a state worth visually competing with the home
+        // screen's real numbers above it.
+        backgroundColor: colors.track,
       }}
     >
-      <AppIcon name="cloud" size={11} color={colors.primaryStrong} />
-      <Text style={{ fontFamily: fontFamily.semibold, fontSize: 10, color: colors.primaryStrong }}>
-        우리집 가계부 · 조회 전용
+      <AppIcon name="cloud" size={11} color={colors.textMuted} />
+      <Text style={{ fontFamily: fontFamily.semibold, fontSize: 10, color: colors.textMuted }}>
+        우리집 가계부
       </Text>
     </View>
   );
