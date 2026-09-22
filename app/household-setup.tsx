@@ -37,7 +37,7 @@ export default function HouseholdSetup() {
           }}
         >
           <Text style={{ fontFamily: fontFamily.bold, fontSize: 15, color: colors.primaryStrong }}>
-            💌  배우자의 가계부 참여하기
+            💌  초대받은 가계부 참여하기
           </Text>
         </Pressable>
       </View>

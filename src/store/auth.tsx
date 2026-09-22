@@ -80,6 +80,23 @@ interface AuthContextValue {
 
   signUp(params: { name: string; email: string; password: string }): Promise<SignUpResult>;
   signIn(params: { email: string; password: string }): Promise<AuthActionResult>;
+  /**
+   * Kakao-OAuth STEP 1 — starts the Supabase `signInWithOAuth({ provider:
+   * 'kakao' })` flow with `skipBrowserRedirect: true` (so this app opens the
+   * browser itself via `Linking.openURL`, rather than relying on a
+   * `window.location` redirect that doesn't exist in React Native) and the
+   * SAME `EMAIL_REDIRECT_TO` the existing email-confirmation flow already
+   * uses — one fewer Supabase Redirect URL to register, not a new one.
+   * Resolving `{ok:true}` means only "the Kakao browser page was opened" —
+   * it does NOT mean signed in yet. The actual session is established later,
+   * out of band, when the OAuth redirect lands back on `auth-callback` and
+   * app/_layout.tsx's `PasswordRecoveryLinkGate` (shared `Linking` listener)
+   * calls `supabase.auth.setSession(...)` with the fragment's tokens; this
+   * provider's existing `onAuthStateChange` subscription then picks that up
+   * exactly like every other sign-in path, with no separate wiring needed
+   * here.
+   */
+  signInWithKakao(): Promise<AuthActionResult>;
   signOut(): Promise<void>;
   /**
    * AUTH-F2-B — local-only session cleanup AFTER the delete-account Edge
@@ -251,6 +268,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { ok: true };
   }, []);
 
+  /**
+   * Kakao-OAuth STEP 1 — see the interface doc above for the full flow.
+   * Client ID/Secret are never referenced here — Supabase Dashboard already
+   * holds them (Authentication -> Providers -> Kakao), exactly like every
+   * other provider Supabase manages server-side.
+   */
+  const signInWithKakao: AuthContextValue['signInWithKakao'] = useCallback(async () => {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'kakao',
+      options: {
+        redirectTo: EMAIL_REDIRECT_TO,
+        skipBrowserRedirect: true,
+      },
+    });
+    if (error) return { ok: false, message: describeAuthError(error) };
+    if (!data.url) {
+      return { ok: false, message: '카카오 로그인을 시작하지 못했어요. 잠시 후 다시 시도해주세요' };
+    }
+    try {
+      await Linking.openURL(data.url);
+    } catch {
+      return { ok: false, message: '카카오 로그인 페이지를 열지 못했어요. 잠시 후 다시 시도해주세요' };
+    }
+    return { ok: true };
+  }, []);
+
   const signOut = useCallback(async () => {
     // STEP 16-D scope: clears the Supabase session only. Existing
     // gagyebu.* AsyncStorage data is untouched — there is no household/
@@ -382,6 +425,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       profileError,
       signUp,
       signIn,
+      signInWithKakao,
       signOut,
       clearLocalSessionAfterAccountDeletion,
       resetPasswordForEmail,
@@ -396,6 +440,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       profileError,
       signUp,
       signIn,
+      signInWithKakao,
       signOut,
       clearLocalSessionAfterAccountDeletion,
       resetPasswordForEmail,

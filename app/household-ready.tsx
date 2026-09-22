@@ -191,7 +191,7 @@ export default function HouseholdReady() {
 
       {activeHousehold?.role === 'owner' && (
         <GradientButton
-          label="배우자 초대하기"
+          label="함께 쓰는 사람 초대하기"
           onPress={() => router.push('/household-invite')}
           style={{ width: '100%', maxWidth: 430, marginTop: spacing.md }}
         />

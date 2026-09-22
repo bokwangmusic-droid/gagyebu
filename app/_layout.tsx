@@ -9,9 +9,10 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { ToastProvider, useToast } from '@/components/ui/Toast';
 import { maybeAutoBackup } from '@/lib/backup';
-import { isResetPasswordUrl, parseRecoveryFragment } from '@/lib/authValidation';
+import { isAuthCallbackUrl, isResetPasswordUrl, parseOAuthFragment, parseRecoveryFragment } from '@/lib/authValidation';
 import { decideRecoveryFlowAction } from '@/lib/recoveryFlowGuard';
 import { computeMissedOccurrences } from '@/lib/recurring';
+import { supabase } from '@/lib/supabase';
 import { AuthProvider, useAuth } from '@/store/auth';
 import { HouseholdProvider, useHousehold } from '@/store/household';
 import { PendingWritesProvider } from '@/store/pendingFinance';
@@ -330,7 +331,24 @@ function AuthGate({
       target = '/household-select';
       allowed = ['household-select'];
     } else {
-      target = '/household-ready';
+      // A single household is now resolved. This effect runs BEFORE it
+      // dispatches its own navigation, so `seg0` still reflects wherever the
+      // user actually came from THIS render — no extra ref needed to
+      // remember it. Two cases share this branch:
+      //   - just came from a household-CONNECT screen (created/joined/
+      //     picked one just now) -> show the '우리집 연결 완료' confirmation,
+      //     same as always.
+      //   - arrived here any other way (e.g. straight from sign-in with an
+      //     already-known single household, or a plain cold start with a
+      //     persisted session) -> that celebration screen has nothing new to
+      //     say; skip straight to the finance home.
+      // Screens ALREADY inside HOUSEHOLD_READY_SCREENS (e.g. the user is
+      // sitting on '(tabs)' or 'cards' when this re-runs) are unaffected
+      // either way: `allowed.includes(seg0)` below short-circuits before
+      // `target` is ever acted on.
+      const cameFromHouseholdConnectFlow =
+        HOUSEHOLD_SETUP_SCREENS.includes(seg0 ?? '') || seg0 === 'household-select';
+      target = cameFromHouseholdConnectFlow ? '/household-ready' : '/(tabs)';
       allowed = HOUSEHOLD_READY_SCREENS;
     }
 
@@ -411,6 +429,17 @@ function AuthGate({
  * (`recoveryFlowLockRef.current = true`) before touching React state at
  * all — see `AuthGate`'s own doc for why the ref, not the mirrored state
  * alone, is what actually and definitively closes this race.
+ *
+ * Kakao-OAuth STEP 1: this is now ALSO the single entry point for the Kakao
+ * OAuth redirect (`gagyebu://auth-callback#access_token=...`, same
+ * `EMAIL_REDIRECT_TO` the email-confirmation flow already uses,
+ * src/store/auth.tsx's `signInWithKakao`) — deliberately reusing this one
+ * `Linking` listener instead of registering a second one. See the
+ * `isAuthCallbackUrl(url)` branch inside `handle()` below; it is fully
+ * independent of the recovery lock/routing machinery documented above (no
+ * `onRecoveryRouteMatched()`, no `router.replace(...)`) — it only calls
+ * `supabase.auth.setSession(...)` and lets AuthGate's existing
+ * session-based redirect do the rest.
  */
 function PasswordRecoveryLinkGate({
   onInitialCheckSettled,
@@ -425,7 +454,33 @@ function PasswordRecoveryLinkGate({
   useEffect(() => {
     const handle = (url: string | null) => {
       if (handledRef.current) return;
-      if (!url || !isResetPasswordUrl(url)) return;
+      if (!url) return;
+
+      // Kakao-OAuth STEP 1 — SAME listener, branched by path segment
+      // (`auth-callback` vs `reset-password` — mutually exclusive by
+      // construction, see isAuthCallbackUrl/isResetPasswordUrl's own docs).
+      // Deliberately does NOT call `onRecoveryRouteMatched()` (recovery-only
+      // lock) and does NOT `router.replace(...)` anywhere — establishing the
+      // session via `setSession()` is enough: AuthProvider's existing
+      // `onAuthStateChange` subscription picks it up, and AuthGate's own
+      // existing session/household redirect (below) takes it from there,
+      // exactly like every other sign-in path. `parseOAuthFragment` already
+      // excludes `type === 'recovery'`, so a recovery link opened against
+      // this path (which should never happen, but isn't trusted not to)
+      // still can't be mistaken for a Kakao session here.
+      if (isAuthCallbackUrl(url)) {
+        handledRef.current = true;
+        const parsed = parseOAuthFragment(url);
+        if (parsed) {
+          void supabase.auth.setSession({
+            access_token: parsed.accessToken,
+            refresh_token: parsed.refreshToken,
+          });
+        }
+        return;
+      }
+
+      if (!isResetPasswordUrl(url)) return;
       handledRef.current = true;
       // Recognized BEFORE dispatching the navigation itself — see this
       // component's own doc and AuthGate's "Lifecycle" note.

@@ -34,7 +34,7 @@ export default function HouseholdJoin() {
   };
 
   return (
-    <AuthShell title="배우자의 가계부 참여하기" subtitle={'전달받은 초대코드를\n입력해 주세요.'}>
+    <AuthShell title="초대받은 가계부 참여하기" subtitle={'전달받은 초대코드를\n입력해 주세요.'}>
       <View style={{ marginBottom: spacing.lg }}>
         <Field label="초대코드" hint="공백이나 - 는 그대로 입력해도 괜찮아요">
           <TextField

@@ -80,7 +80,7 @@ export default function HouseholdInvite() {
       }}
     >
       <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.textSub }}>
-        배우자 초대코드
+        함께 쓰는 사람 초대 코드
       </Text>
 
       {loading ? (
