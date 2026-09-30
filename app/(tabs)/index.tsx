@@ -288,7 +288,6 @@ export default function HomeScreen() {
       >
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
           <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>최근 내역</Text>
-          <AppIcon name="chev-right" size={14} color={colors.textFaint} />
         </View>
         <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>전체보기 →</Text>
       </Pressable>
