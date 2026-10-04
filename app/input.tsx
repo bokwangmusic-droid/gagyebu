@@ -25,7 +25,8 @@ import { CalendarSheet } from '@/components/ui/CalendarSheet';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
 import { getAllCats, getCat, type TxnType } from '@/data/categories';
-import { installmentPerMonth } from '@/lib/card';
+import { describeAccount } from '@/lib/asset';
+import { cardTypeOf, debitSourceAssetId, installmentPerMonth } from '@/lib/card';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
 import { uid } from '@/lib/id';
@@ -342,7 +343,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   // source — never useStore(). While status !== 'ready' the form is not
   // rendered at all (FinanceLoadState gate below), so cards/customCats/
   // catOrder are always trusted household data wherever they are used.
-  const { status, error, cards, customCats, catOrder, refresh } = useFinanceRead();
+  const { status, error, cards, assets, customCats, catOrder, refresh } = useFinanceRead();
   // STEP 16-H2-A2: durable offline fallback for a transaction CREATE whose
   // direct write hit a TRANSPORT failure. Never used for edit/delete.
   const pending = usePendingWrites();
@@ -383,6 +384,22 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     editing?.paymentMethod,
   );
   const [cardId, setCardId] = useState<string | undefined>(editing?.cardId);
+  // 출금 계좌 — a record of which account paid; never changes a balance.
+  // 이체: picked by the user. 체크: COPIED from the 체크카드's linked account
+  // when the card is chosen, so an edit keeps the account this transaction
+  // was saved with even if the card has been re-linked since.
+  const [sourceAssetId, setSourceAssetId] = useState<string | undefined>(
+    editing?.paymentMethod === 'transfer' || editing?.paymentMethod === 'debit'
+      ? editing.sourceAssetId
+      : undefined,
+  );
+  // 수입 입금처 — 'transfer' + this account, or 'cash' with no account. Never
+  // required; a legacy income simply has neither.
+  const [destinationAssetId, setDestinationAssetId] = useState<string | undefined>(
+    editing?.type === 'income' && editing.paymentMethod === 'transfer'
+      ? editing.destinationAssetId
+      : undefined,
+  );
   const [installmentOn, setInstallmentOn] = useState(!!editing?.installment);
   const [installmentMonths, setInstallmentMonths] = useState(
     editing?.installment ? String(editing.installment.months) : '3',
@@ -440,18 +457,74 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     if (type !== 'expense' && splitOn) setSplitOn(false);
   }, [type, splitOn]);
 
-  // Payment method is expense-only.
+  // 지출 <-> 수입: 결제수단 and 입금처 are different things, so a real type
+  // flip clears the whole payment link (card, 할부, 출금 계좌, 입금처). Keyed
+  // on an actual CHANGE so an edit form's initial values are never wiped.
+  const prevTypeRef = useRef(type);
   useEffect(() => {
-    if (type !== 'expense' && paymentMethod !== undefined) setPaymentMethod(undefined);
-  }, [type, paymentMethod]);
+    if (prevTypeRef.current === type) return;
+    prevTypeRef.current = type;
+    setPaymentMethod(undefined);
+    setCardId(undefined);
+    setInstallmentOn(false);
+    setSourceAssetId(undefined);
+    setDestinationAssetId(undefined);
+  }, [type]);
 
-  // Card & 할부 details only apply to 신용; clear them otherwise.
+  // Detail links only apply to their own method; clear them otherwise:
+  // card -> 신용/체크, 할부 -> 신용 only, 출금 계좌 -> 이체/체크 only,
+  // 입금처 계좌 -> 수입 'transfer' only.
   useEffect(() => {
-    if (paymentMethod !== 'credit') {
-      if (cardId !== undefined) setCardId(undefined);
-      if (installmentOn) setInstallmentOn(false);
+    if (paymentMethod !== 'credit' && paymentMethod !== 'debit' && cardId !== undefined) {
+      setCardId(undefined);
     }
-  }, [paymentMethod, cardId, installmentOn]);
+    if (paymentMethod !== 'credit' && installmentOn) setInstallmentOn(false);
+    if (paymentMethod !== 'transfer' && paymentMethod !== 'debit' && sourceAssetId !== undefined) {
+      setSourceAssetId(undefined);
+    }
+    if (paymentMethod !== 'transfer' && destinationAssetId !== undefined) {
+      setDestinationAssetId(undefined);
+    }
+  }, [paymentMethod, cardId, installmentOn, sourceAssetId, destinationAssetId]);
+
+  // Picker lists. The card / account already on this transaction stays listed
+  // even if it no longer matches the filter (e.g. its type was changed later).
+  const creditCards = cards.filter((c) => cardTypeOf(c) === 'credit' || c.id === cardId);
+  const debitCards = cards.filter((c) => cardTypeOf(c) === 'debit' || c.id === cardId);
+  const accounts = assets.filter((a) => a.type === 'bank' || a.id === sourceAssetId);
+  // A stored 출금 계좌 that is no longer an active asset (soft-deleted): kept
+  // as-is on save, just not selectable.
+  const sourceAssetMissing = !!sourceAssetId && !assets.some((a) => a.id === sourceAssetId);
+  const sourceAsset = sourceAssetId ? assets.find((a) => a.id === sourceAssetId) : undefined;
+  // 수입 입금처 choices: active 은행계좌 (+ the stored one if its type changed).
+  const depositAccounts = assets.filter((a) => a.type === 'bank' || a.id === destinationAssetId);
+  const destinationMissing =
+    !!destinationAssetId && !assets.some((a) => a.id === destinationAssetId);
+
+  /** The account to copy onto a NEW 체크카드 pick — only an active one. */
+  const debitAccountFor = (card: (typeof cards)[number]): string | undefined => {
+    const linked = debitSourceAssetId(card);
+    return linked && assets.some((a) => a.id === linked) ? linked : undefined;
+  };
+
+  // 체크카드 ↔ 출금 계좌. The account is COPIED onto the transaction when a
+  // card is picked (balance sync moves THAT account). An edit that keeps the
+  // transaction's original card keeps its original account — or, for a
+  // legacy row saved before cards had accounts, keeps having none.
+  const selectedDebitCard =
+    type === 'expense' && paymentMethod === 'debit' && cardId ? cards.find((c) => c.id === cardId) : undefined;
+  const isOriginalDebitPick =
+    !!editing && editing.paymentMethod === 'debit' && editing.cardId === cardId;
+  // A card picked here that only got its account just now (e.g. the user
+  // linked it via 「카드 수정」 and came back): pick that account up.
+  const pendingDebitAccount =
+    selectedDebitCard && !sourceAssetId && !isOriginalDebitPick ? debitAccountFor(selectedDebitCard) : undefined;
+  useEffect(() => {
+    if (pendingDebitAccount) setSourceAssetId(pendingDebitAccount);
+  }, [pendingDebitAccount]);
+  // A newly picked 체크카드 with no active 출금 계좌 can't be saved: its spend
+  // would have no account to come out of.
+  const debitNeedsAccount = !!selectedDebitCard && !sourceAssetId && !isOriginalDebitPick && !pendingDebitAccount;
 
   const displayAmount = amount ? fmt(Number(amount)) : '0';
   const total = parseNum(amount);
@@ -467,7 +540,8 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   const canSave =
     total > 0 &&
     (!splitOn || splitCheck.ok) &&
-    (!installmentActive || instMonths >= 2);
+    (!installmentActive || instMonths >= 2) &&
+    !debitNeedsAccount;
   const today = toDateKey(new Date());
 
   // Keep the active numeric target valid: a 분할 금액 row can disappear (split
@@ -727,6 +801,9 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     if (!(total > 0)) return null;
     if (type !== 'expense' && type !== 'income') return null;
     const isCredit = type === 'expense' && paymentMethod === 'credit';
+    const isCard = isCredit || (type === 'expense' && paymentMethod === 'debit');
+    const isTransfer = type === 'expense' && paymentMethod === 'transfer';
+    const isDebit = type === 'expense' && paymentMethod === 'debit';
     if (splitOn && !splitCheck.ok) return null;
     if (isCredit && installmentOn && !(instMonths >= 2)) return null;
     const categoryToSave = splitOn ? splits[0].category : category;
@@ -758,8 +835,13 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       amount: total,
       memo: memo.trim(),
       date: dateISO,
-      paymentMethod: type === 'expense' ? paymentMethod ?? undefined : undefined,
-      cardId: isCredit ? cardId ?? undefined : undefined,
+      // 지출: 결제수단. 수입: 입금 방식 ('cash' / 'transfer'). The mapper keeps
+      // only what fits the type (src/lib/paymentLink.ts).
+      paymentMethod: paymentMethod ?? undefined,
+      cardId: isCard ? cardId ?? undefined : undefined,
+      sourceAssetId: isTransfer || isDebit ? sourceAssetId ?? undefined : undefined,
+      destinationAssetId:
+        type === 'income' && paymentMethod === 'transfer' ? destinationAssetId ?? undefined : undefined,
       installment:
         isCredit && installmentOn && instMonths >= 2 ? { months: instMonths } : undefined,
       splits: splitOn ? normSplits : undefined,
@@ -1012,6 +1094,8 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     // The parser doesn't detect card / 할부 — clear any stale edit state.
     setPaymentMethod(undefined);
     setCardId(undefined);
+    setSourceAssetId(undefined);
+    setDestinationAssetId(undefined);
     setInstallmentOn(false);
     if (pastePreview.category) {
       const c = pastePreview.category;
@@ -1034,6 +1118,8 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     setSplitOn(false); // quick entry always fills a normal single-category row
     setPaymentMethod(undefined); // parser has no card / 할부 concept
     setCardId(undefined);
+    setSourceAssetId(undefined);
+    setDestinationAssetId(undefined);
     setInstallmentOn(false);
     setAmount(String(r.amount));
     if (r.category) setCategory(r.category);
@@ -1445,6 +1531,12 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                       onPress={() => {
                         tap();
                         setPaymentMethod(active ? undefined : pm.value);
+                        // 신용 and 체크 pick from different card lists — a card
+                        // chosen under one method never carries over.
+                        if (!active) {
+                          setCardId(undefined);
+                          setSourceAssetId(undefined);
+                        }
                         if (pm.value === 'credit' && !active) {
                           setPadVisible(false);
                           // non-credit -> credit by a DIRECT user tap: arm the
@@ -1465,9 +1557,9 @@ function TransactionForm({ mode }: { mode: FormMode }) {
 
               {paymentMethod === 'credit' && (
                 <View style={styles.creditPanel} onLayout={handleCreditPanelLayout}>
-                  <Text style={styles.creditLabel}>카드</Text>
+                  <Text style={styles.creditLabel}>신용카드</Text>
                   <View style={styles.payChipRow}>
-                    {cards.map((c) => {
+                    {creditCards.map((c) => {
                       const active = cardId === c.id;
                       return (
                         <Pressable
@@ -1492,9 +1584,9 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                       <Text style={styles.payChipAddText}>카드 등록</Text>
                     </Pressable>
                   </View>
-                  {cards.length === 0 && (
+                  {creditCards.length === 0 && (
                     <Text style={styles.creditHint}>
-                      등록된 카드가 없어요. 지금 저장하면 「카드 미지정」으로 기록돼요.
+                      등록된 신용카드가 없어요. 지금 저장하면 「카드 미지정」으로 기록돼요.
                     </Text>
                   )}
 
@@ -1600,6 +1692,155 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                     </View>
                   )}
                 </View>
+              )}
+
+              {/* 체크카드 — 즉시 지출: no 할부, never part of the 예상 카드값. */}
+              {paymentMethod === 'debit' && (
+                <View style={styles.creditPanel}>
+                  <Text style={styles.creditLabel}>체크카드</Text>
+                  <View style={styles.payChipRow}>
+                    {debitCards.map((c) => {
+                      const active = cardId === c.id;
+                      return (
+                        <Pressable
+                          key={c.id}
+                          onPress={() => {
+                            tap();
+                            setCardId(active ? undefined : c.id);
+                            // Copy the card's account NOW; later re-links of
+                            // the card never touch this transaction.
+                            setSourceAssetId(active ? undefined : debitAccountFor(c));
+                          }}
+                          style={[styles.payChip, active && styles.payChipOn]}
+                        >
+                          <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
+                            {c.name}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                    <Pressable
+                      onPress={() => router.push({ pathname: '/card-add', params: { type: 'debit' } })}
+                      style={styles.payChipAdd}
+                    >
+                      <AppIcon name="plus" size={12} color={colors.primaryStrong} strokeWidth={2.6} />
+                      <Text style={styles.payChipAddText}>체크카드 등록</Text>
+                    </Pressable>
+                  </View>
+                  {debitCards.length === 0 && (
+                    <Text style={styles.creditHint}>
+                      등록된 체크카드가 없어요. 카드 없이 저장해도 체크카드 지출로 기록돼요.
+                    </Text>
+                  )}
+                  {sourceAssetId && (
+                    <Text style={styles.creditHint}>
+                      출금 계좌 · {sourceAsset ? describeAccount(sourceAsset) : '삭제된 계좌'}
+                    </Text>
+                  )}
+                  {debitNeedsAccount && selectedDebitCard && (
+                    <Pressable
+                      onPress={() => router.push({ pathname: '/card-add', params: { id: selectedDebitCard.id } })}
+                      hitSlop={6}
+                    >
+                      <Text style={[styles.creditHint, { color: colors.expenseText }]}>
+                        체크카드의 출금 계좌를 먼저 연결해주세요.{' '}
+                        <Text style={{ fontFamily: fontFamily.bold, color: colors.primaryStrong }}>카드 수정</Text>
+                      </Text>
+                    </Pressable>
+                  )}
+                </View>
+              )}
+
+              {/* 이체 — 출금 계좌; the DB trigger takes the amount out of it on save. */}
+              {paymentMethod === 'transfer' && (
+                <View style={styles.creditPanel}>
+                  <Text style={styles.creditLabel}>출금 계좌</Text>
+                  <View style={styles.payChipRow}>
+                    {accounts.map((a) => {
+                      const active = sourceAssetId === a.id;
+                      return (
+                        <Pressable
+                          key={a.id}
+                          onPress={() => {
+                            tap();
+                            setSourceAssetId(active ? undefined : a.id);
+                          }}
+                          style={[styles.payChip, active && styles.payChipOn]}
+                        >
+                          <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
+                            {describeAccount(a)}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                    <Pressable onPress={() => router.push('/asset-add')} style={styles.payChipAdd}>
+                      <AppIcon name="plus" size={12} color={colors.primaryStrong} strokeWidth={2.6} />
+                      <Text style={styles.payChipAddText}>계좌 등록</Text>
+                    </Pressable>
+                  </View>
+                  {accounts.length === 0 && !sourceAssetMissing && (
+                    <Text style={styles.creditHint}>
+                      등록된 계좌가 없어요. 자산 관리에 은행계좌를 등록하면 선택할 수 있어요.
+                    </Text>
+                  )}
+                  {sourceAssetMissing && (
+                    <Text style={styles.creditHint}>
+                      삭제된 계좌로 기록된 거래예요. 다른 계좌를 고르지 않으면 그대로 유지돼요.
+                    </Text>
+                  )}
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* 수입 입금처 — never required. 현금 = 'cash' (no Asset needed); an
+              account = 'transfer' + destination (the DB trigger adds it to that account). */}
+          {type === 'income' && (
+            <View style={styles.paySection}>
+              <Text style={styles.catLabel}>입금처 (선택)</Text>
+              <View style={styles.payChipRow}>
+                {(() => {
+                  const cashOn = paymentMethod === 'cash';
+                  return (
+                    <Pressable
+                      onPress={() => {
+                        tap();
+                        setDestinationAssetId(undefined);
+                        setPaymentMethod(cashOn ? undefined : 'cash');
+                      }}
+                      style={[styles.payChip, cashOn && styles.payChipOn]}
+                    >
+                      <Text style={[styles.payChipText, cashOn && styles.payChipTextOn]}>현금</Text>
+                    </Pressable>
+                  );
+                })()}
+                {depositAccounts.map((a) => {
+                  const active = paymentMethod === 'transfer' && destinationAssetId === a.id;
+                  return (
+                    <Pressable
+                      key={a.id}
+                      onPress={() => {
+                        tap();
+                        setPaymentMethod(active ? undefined : 'transfer');
+                        setDestinationAssetId(active ? undefined : a.id);
+                      }}
+                      style={[styles.payChip, active && styles.payChipOn]}
+                    >
+                      <Text style={[styles.payChipText, active && styles.payChipTextOn]}>
+                        {describeAccount(a)}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+                <Pressable onPress={() => router.push('/asset-add')} style={styles.payChipAdd}>
+                  <AppIcon name="plus" size={12} color={colors.primaryStrong} strokeWidth={2.6} />
+                  <Text style={styles.payChipAddText}>계좌 등록</Text>
+                </Pressable>
+              </View>
+              {destinationMissing && (
+                <Text style={styles.creditHint}>
+                  삭제된 계좌로 기록된 수입이에요. 다른 입금처를 고르지 않으면 그대로 유지돼요.
+                </Text>
               )}
             </View>
           )}

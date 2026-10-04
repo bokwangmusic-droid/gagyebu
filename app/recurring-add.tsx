@@ -17,6 +17,8 @@ import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { getAllCats, type TxnType } from '@/data/categories';
+import { describeAccount } from '@/lib/asset';
+import { cardTypeOf } from '@/lib/card';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum } from '@/lib/format';
 import { uid } from '@/lib/id';
@@ -32,11 +34,56 @@ import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
 import { usePendingWrites } from '@/store/pendingFinance';
-import type { Frequency, RecurringRule } from '@/store/types';
+import type { Frequency, PaymentMethod, RecurringRule } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, tabularNums } from '@/theme/typography';
 
 const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
+
+/** 반복 지출 결제수단 chips — '' = 선택 안 함 (legacy rules have none). */
+const REC_PAY_OPTIONS: { value: PaymentMethod | ''; label: string }[] = [
+  { value: '', label: '선택 안 함' },
+  { value: 'cash', label: '현금' },
+  { value: 'debit', label: '체크카드' },
+  { value: 'credit', label: '신용카드' },
+  { value: 'transfer', label: '이체' },
+  { value: 'other', label: '기타' },
+];
+
+/** A card / account picker with the "삭제됨" fallback and an "add" shortcut. */
+function LinkField({
+  label,
+  value,
+  onChange,
+  options,
+  missingText,
+  emptyText,
+  addLabel,
+  onAdd,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  missingText?: string;
+  emptyText?: string;
+  addLabel: string;
+  onAdd: () => void;
+}) {
+  const note = { fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub, marginTop: 6 } as const;
+  return (
+    <Field label={label}>
+      <ChipSelect value={value} onChange={onChange} options={options} />
+      {missingText && <Text style={note}>{missingText}</Text>}
+      <Pressable onPress={onAdd} hitSlop={6}>
+        <Text style={note}>
+          {emptyText ? `${emptyText} ` : ''}
+          <Text style={{ fontFamily: fontFamily.bold, color: colors.primaryStrong }}>{addLabel}</Text>
+        </Text>
+      </Pressable>
+    </Field>
+  );
+}
 
 /**
  * Custom-NumPad scroll assist (STEP 16-G2-D2 UX fix).
@@ -235,7 +282,7 @@ function RecurringForm({ mode }: { mode: FormMode }) {
   // Household finance READ values come ONLY from the remote read-only
   // source — never useStore(). No local addRecurring/updateRecurring/
   // toggleRecurring/deleteRecurring is ever called from this screen.
-  const { status, error, customCats, catOrder, refresh } = useFinanceRead();
+  const { status, error, customCats, catOrder, cards, assets, refresh } = useFinanceRead();
   // STEP 16-H2-F2: durable offline fallback for a recurring CREATE / FULL
   // UPDATE / soft DELETE whose direct write hit a TRANSPORT failure
   // (offline). Never used for a server/terminal verdict. The active toggle
@@ -273,6 +320,57 @@ function RecurringForm({ mode }: { mode: FormMode }) {
     editing?.dayOfWeek != null ? String(editing.dayOfWeek) : '1',
   );
   // 금액·매월 며칠은 OS 숫자 키보드 대신 앱 전용 키패드(NumPad)를 공유해서 입력.
+  // 결제수단 (지출) / 입금처 (수입) — optional, '' = 선택 안 함. A 체크카드 rule
+  // stores the CARD only: the rule describes future payments, so the card's
+  // account is resolved when a transaction is created (and frozen there).
+  const [payMethod, setPayMethod] = useState<PaymentMethod | ''>(
+    editing?.type === 'expense' ? editing.paymentMethod ?? '' : '',
+  );
+  const [linkCardId, setLinkCardId] = useState(editing?.cardId ?? '');
+  const [linkSourceId, setLinkSourceId] = useState(editing?.sourceAssetId ?? '');
+  // 수입: '' | 'cash' | <asset id>  ('cash' never collides with an `asset-…` id).
+  const [deposit, setDeposit] = useState(
+    editing?.type === 'income'
+      ? editing.paymentMethod === 'cash'
+        ? 'cash'
+        : editing.paymentMethod === 'transfer'
+          ? editing.destinationAssetId ?? ''
+          : ''
+      : '',
+  );
+  const changeType = (t: TxnType) => {
+    if (t === type) return;
+    // 결제수단 and 입금처 never carry over between 지출 and 수입.
+    setPayMethod('');
+    setLinkCardId('');
+    setLinkSourceId('');
+    setDeposit('');
+    setType(t);
+  };
+  const changePayMethod = (m: PaymentMethod | '') => {
+    if (m === payMethod) return;
+    setPayMethod(m);
+    setLinkCardId(''); // 신용/체크 pick from different card lists
+    setLinkSourceId('');
+  };
+
+  // Picker lists: active cards/accounts of the right kind, plus whatever the
+  // rule already points at if it is still active but changed kind.
+  const pickCards = (want: 'credit' | 'debit') => [
+    { value: '', label: '선택 안 함' },
+    ...cards
+      .filter((c) => cardTypeOf(c) === want || c.id === linkCardId)
+      .map((c) => ({ value: c.id, label: c.name })),
+  ];
+  const bankOptions = (current: string) =>
+    assets
+      .filter((a) => a.type === 'bank' || a.id === current)
+      .map((a) => ({ value: a.id, label: describeAccount(a) }));
+  const cardMissing = !!linkCardId && !cards.some((c) => c.id === linkCardId);
+  const sourceMissing = !!linkSourceId && !assets.some((a) => a.id === linkSourceId);
+  const depositMissing =
+    !!deposit && deposit !== 'cash' && !assets.some((a) => a.id === deposit);
+
   const [activeField, setActiveField] = useState<'amount' | 'day' | null>(null);
 
   // ---- Scroll assist for the custom NumPad (see the module constants) ----
@@ -377,13 +475,28 @@ function RecurringForm({ mode }: { mode: FormMode }) {
     if (!Number.isFinite(amt) || amt <= 0) return null;
     if (!category) return null;
 
+    // Always carries `paymentMethod` (null = none), so an edit writes the
+    // link columns; the mapper keeps only what fits (src/lib/paymentLink.ts).
+    const link: Pick<NewRecurringDraft, 'paymentMethod' | 'cardId' | 'sourceAssetId' | 'destinationAssetId'> =
+      type === 'income'
+        ? deposit === 'cash'
+          ? { paymentMethod: 'cash' }
+          : deposit
+            ? { paymentMethod: 'transfer', destinationAssetId: deposit }
+            : { paymentMethod: null }
+        : {
+            paymentMethod: payMethod || null,
+            ...((payMethod === 'credit' || payMethod === 'debit') && linkCardId ? { cardId: linkCardId } : {}),
+            ...(payMethod === 'transfer' && linkSourceId ? { sourceAssetId: linkSourceId } : {}),
+          };
+
     if (frequency === 'monthly') {
       const dom = Math.min(31, Math.max(1, parseInt(dayOfMonth, 10) || 1));
-      return { type, name: n, amount: amt, category, frequency, dayOfMonth: dom, dayOfWeek: null };
+      return { type, name: n, amount: amt, category, frequency, dayOfMonth: dom, dayOfWeek: null, ...link };
     }
     const dow = parseInt(dayOfWeek, 10);
     if (!Number.isInteger(dow) || dow < 0 || dow > 6) return null;
-    return { type, name: n, amount: amt, category, frequency, dayOfMonth: null, dayOfWeek: dow };
+    return { type, name: n, amount: amt, category, frequency, dayOfMonth: null, dayOfWeek: dow, ...link };
   };
 
   const save = async () => {
@@ -645,7 +758,7 @@ function RecurringForm({ mode }: { mode: FormMode }) {
         ) : (
           <SegmentedTabs
             value={type}
-            onChange={setType}
+            onChange={changeType}
             options={[
               { value: 'expense', label: '지출', tone: 'expense' },
               { value: 'income', label: '수입', tone: 'income' },
@@ -714,6 +827,58 @@ function RecurringForm({ mode }: { mode: FormMode }) {
               options={WEEKDAYS.map((d, i) => ({ value: String(i), label: d }))}
             />
           </Field>
+        )}
+
+        {/* 결제수단 / 입금처 — optional; a record only (no balance change, and
+            no transaction is generated from a rule by this app). */}
+        {type === 'expense' ? (
+          <>
+            <Field label="결제수단 (선택)">
+              <ChipSelect value={payMethod} onChange={changePayMethod} options={REC_PAY_OPTIONS} />
+            </Field>
+            {(payMethod === 'credit' || payMethod === 'debit') && (
+              <LinkField
+                label={payMethod === 'debit' ? '체크카드' : '신용카드'}
+                value={linkCardId}
+                onChange={setLinkCardId}
+                options={pickCards(payMethod)}
+                missingText={cardMissing ? '삭제된 카드에 연결된 반복이에요. 다른 카드를 고르면 바뀌어요.' : undefined}
+                emptyText={
+                  pickCards(payMethod).length === 1
+                    ? `등록된 ${payMethod === 'debit' ? '체크카드' : '신용카드'}가 없어요.`
+                    : undefined
+                }
+                addLabel="카드 등록하기"
+                onAdd={() => router.push({ pathname: '/card-add', params: { type: payMethod } })}
+              />
+            )}
+            {payMethod === 'transfer' && (
+              <LinkField
+                label="출금 계좌"
+                value={linkSourceId}
+                onChange={setLinkSourceId}
+                options={[{ value: '', label: '선택 안 함' }, ...bankOptions(linkSourceId)]}
+                missingText={sourceMissing ? '삭제된 계좌에 연결된 반복이에요. 다른 계좌를 고르면 바뀌어요.' : undefined}
+                emptyText={bankOptions(linkSourceId).length === 0 ? '등록된 은행계좌가 없어요.' : undefined}
+                addLabel="계좌 등록하기"
+                onAdd={() => router.push('/asset-add')}
+              />
+            )}
+          </>
+        ) : (
+          <LinkField
+            label="입금처 (선택)"
+            value={deposit}
+            onChange={setDeposit}
+            options={[
+              { value: '', label: '선택 안 함' },
+              { value: 'cash', label: '현금' },
+              ...bankOptions(deposit),
+            ]}
+            missingText={depositMissing ? '삭제된 계좌에 연결된 반복이에요. 다른 입금처를 고르면 바뀌어요.' : undefined}
+            addLabel="계좌 등록하기"
+            onAdd={() => router.push('/asset-add')}
+          />
         )}
 
         {/* Reserve scroll room so a lower numeric field can be lifted clear

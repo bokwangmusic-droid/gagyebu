@@ -30,6 +30,10 @@ const INSERT_ALLOWED_KEYS: (keyof RecurringInsertRow)[] = [
   'frequency',
   'day_of_month',
   'day_of_week',
+  'payment_method',
+  'card_id',
+  'source_asset_id',
+  'destination_asset_id',
 ];
 
 /** Server-managed / product-immutable columns that must NEVER be in an
@@ -63,6 +67,10 @@ const UPDATE_ALLOWED_KEYS = [
   'frequency',
   'day_of_month',
   'day_of_week',
+  'payment_method',
+  'card_id',
+  'source_asset_id',
+  'destination_asset_id',
 ];
 
 export interface RecurringMapperCaseResult {

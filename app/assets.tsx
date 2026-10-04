@@ -7,10 +7,11 @@ import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { useRemoteFinanceRefreshControl } from '@/components/useRemoteFinanceRefreshControl';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
-import { assetTypeIcon, describeAssetType } from '@/lib/asset';
+import { assetTypeIcon, describeAssetDetail, describeAssetType } from '@/lib/asset';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
+import { signedBalance } from '@/lib/assetBalance';
 import { fmt } from '@/lib/format';
-import { summarizeNetWorth } from '@/lib/netWorth';
+import { summarizeAssetsByType, summarizeNetWorth } from '@/lib/netWorth';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
@@ -34,7 +35,7 @@ import { fontFamily, noPad, tabularNums } from '@/theme/typography';
  */
 export default function AssetsList() {
   const router = useRouter();
-  const { status, error, assets, loans, refresh } = useFinanceRead();
+  const { status, error, assets, assetBalanceOverlay, loans, refresh } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
   const canCreate = REMOTE_FINANCE_WRITE.assetCreate;
@@ -42,6 +43,9 @@ export default function AssetsList() {
 
   const openAdd = () => router.push('/asset-add');
   const openEdit = (id: string) => router.push({ pathname: '/asset-add', params: { id } });
+  // 은행계좌 opens its 계좌 상세 / 입출금 내역 first (수정 lives there);
+  // every other asset type keeps going straight to the edit form.
+  const openDetail = (id: string) => router.push({ pathname: '/asset-detail', params: { id } });
 
   if (status !== 'ready') {
     return (
@@ -51,8 +55,15 @@ export default function AssetsList() {
     );
   }
 
+  // 표시용 잔액 = 서버 잔액(DB 트리거가 거래마다 반영) + 오프라인 대기 거래의
+  // 표시 전용 보정값. 서버로 다시 쓰지 않는다 (src/lib/assetBalance.ts).
+  const displayAssets = assets.map((a) => {
+    const d = assetBalanceOverlay.get(a.id);
+    return d ? { ...a, balance: a.balance + d } : a;
+  });
   // netWorth.ts 재사용 — 이 파일에서 직접 합계식을 다시 만들지 않는다.
-  const { totalAssets, totalDebt, netWorth } = summarizeNetWorth(assets, loans);
+  const { totalAssets, totalDebt, netWorth } = summarizeNetWorth(displayAssets, loans);
+  const typeTotals = summarizeAssetsByType(displayAssets);
 
   const addBtn = canCreate ? (
     <Pressable
@@ -97,13 +108,43 @@ export default function AssetsList() {
         </View>
         <View style={{ flexDirection: 'row', gap: 14, marginTop: 10 }}>
           <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: 'rgba(255,255,255,0.9)', ...tabularNums }}>
-            총자산 {fmt(totalAssets)}원
+            총자산 {signedBalance(totalAssets, fmt)}원
           </Text>
           <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: 'rgba(255,255,255,0.9)', ...tabularNums }}>
             총부채 {fmt(totalDebt)}원
           </Text>
         </View>
       </LinearGradient>
+
+      {/* 종류별 합계 — 0원인 종류는 summarizeAssetsByType이 이미 제외한다. */}
+      {typeTotals.length > 0 && (
+        <View
+          style={{
+            marginHorizontal: spacing.lg,
+            marginBottom: spacing.sm,
+            padding: spacing.lg,
+            backgroundColor: colors.white,
+            borderWidth: 1,
+            borderColor: colors.border,
+            borderRadius: radii.xxl,
+            gap: 6,
+          }}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.textSub, marginBottom: 2 }}>
+            종류별 자산
+          </Text>
+          {typeTotals.map((t) => (
+            <View key={t.type} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text style={{ fontFamily: fontFamily.regular, fontSize: 13, color: colors.text }}>
+                {describeAssetType(t.type)}
+              </Text>
+              <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.text, ...tabularNums }}>
+                {signedBalance(t.total, fmt)}원
+              </Text>
+            </View>
+          ))}
+        </View>
+      )}
 
       {assets.length === 0 ? (
         <EmptyState
@@ -113,12 +154,14 @@ export default function AssetsList() {
           title="등록된 자산이 없어요"
           sub={
             canCreate
-              ? '현금, 통장, 예적금, 투자자산을 등록해 보세요.'
+              ? '통장, 예·적금, 투자, 부동산 같은 자산을 등록해 보세요.'
               : '우리집 가계부에 등록된 자산이 없어요'
           }
         />
       ) : (
-        assets.map((a) => {
+        displayAssets.map((a) => {
+          const isBank = a.type === 'bank';
+          const onPress = isBank ? () => openDetail(a.id) : canEdit ? () => openEdit(a.id) : undefined;
           const row = (
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.md }}>
               <View
@@ -140,14 +183,17 @@ export default function AssetsList() {
                 >
                   {a.name}
                 </Text>
-                <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 14, color: colors.textMuted, ...noPad }}>
-                  {describeAssetType(a.type)}
+                <Text
+                  numberOfLines={1}
+                  style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 14, color: colors.textMuted, ...noPad }}
+                >
+                  {describeAssetDetail(a)}
                 </Text>
               </View>
               <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, ...tabularNums }}>
-                {fmt(a.balance)}원
+                {signedBalance(a.balance, fmt)}원
               </Text>
-              {canEdit && <AppIcon name="chev-right" size={16} color={colors.textFaint} />}
+              {onPress && <AppIcon name="chev-right" size={16} color={colors.textFaint} />}
             </View>
           );
           return (
@@ -163,8 +209,8 @@ export default function AssetsList() {
                 borderRadius: radii.xxl,
               }}
             >
-              {canEdit ? (
-                <Pressable onPress={() => openEdit(a.id)} style={({ pressed }) => [pressed && { opacity: 0.7 }]}>
+              {onPress ? (
+                <Pressable onPress={onPress} style={({ pressed }) => [pressed && { opacity: 0.7 }]}>
                   {row}
                 </Pressable>
               ) : (

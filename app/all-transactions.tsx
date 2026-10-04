@@ -11,6 +11,8 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { getCat } from '@/data/categories';
 import { sumByType } from '@/lib/aggregate';
+import { describeAccount } from '@/lib/asset';
+import { describePaymentLink } from '@/lib/paymentLink';
 import { fmt, toDateKey } from '@/lib/format';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { hasSplits } from '@/lib/splits';
@@ -34,6 +36,7 @@ export default function AllTransactions() {
     transactions,
     customCats,
     cards,
+    assets,
     refresh,
     pendingTransactionOps,
     failedLocalTransactions,
@@ -302,12 +305,29 @@ export default function AllTransactions() {
                 const cat = getCat(t.category, t.type, customCats);
                 const d = new Date(t.date);
                 const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+                const sourceAsset = t.sourceAssetId
+                  ? assets.find((a) => a.id === t.sourceAssetId)
+                  : undefined;
+                const accountText =
+                  (t.paymentMethod === 'transfer' || t.paymentMethod === 'debit') && t.sourceAssetId
+                    ? sourceAsset
+                      ? describeAccount(sourceAsset)
+                      : '삭제된 계좌'
+                    : '';
                 const card =
-                  t.paymentMethod === 'credit'
+                  t.type === 'income'
+                    ? describePaymentLink('income', t, cards, assets) // "입금 · …" or ''
+                    : t.paymentMethod === 'credit'
                     ? `${cards.find((c) => c.id === t.cardId)?.name ?? '카드 미지정'}${
                         t.installment ? ` ${t.installment.months}개월 할부` : ''
                       }`
-                    : '';
+                    : t.paymentMethod === 'debit' && (t.cardId || accountText)
+                      ? [cards.find((c) => c.id === t.cardId)?.name ?? '체크카드', accountText]
+                          .filter(Boolean)
+                          .join(' · ')
+                      : t.paymentMethod === 'transfer' && accountText
+                        ? `이체 · ${accountText}`
+                        : '';
                 const opState = pendingTransactionOps.get(t.id);
                 const pendingState = opState ? (opState.failed ? 'failed' : 'pending') : null;
                 return (

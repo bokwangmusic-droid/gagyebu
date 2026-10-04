@@ -25,8 +25,25 @@
  * A `cardId` that isn't among the household's current (non-deleted) cards is
  * sent as `card_id: null` — same "카드 미지정" semantics the read mapping
  * and the import RPC already use for a dangling card reference.
+ *
+ * source_asset_id (결제수단 연결 BATCH) — the 출금 계좌. Sent only for a
+ * 'transfer' payment (the account the user picked) or a 'debit' payment
+ * (the 체크카드's linked account, COPIED by the form when the card was
+ * chosen — never re-derived from the card later, so re-linking a card
+ * never rewrites history). NULL for everything else, so switching to
+ * another method clears it. destination_asset_id is the 수입 입금처 (an
+ * income paid by 'transfer'). Which link fields are kept for a given
+ * type + method is decided ONLY by src/lib/paymentLink.ts
+ * (`paymentLinkColumns`), the same rules recurring rules use. Nothing here,
+ * or anywhere in the client write path, touches public.assets.balance — the
+ * DB trigger from 20261004001900 moves it from these columns, once per row
+ * change, so an offline replay can't double-apply. No "known ids" guard is needed: the
+ * form only offers the household's own accounts, an edit carries the
+ * stored value through unchanged (even for a soft-deleted account), and the
+ * household-scoped composite FK rejects anything else.
  */
 import type { TxnType } from '@/data/categories';
+import { paymentLinkColumns } from '@/lib/paymentLink';
 import type { PaymentMethod, TransactionSplit } from '@/store/types';
 
 /**
@@ -42,6 +59,13 @@ export interface NewTransactionDraft {
   date: string;
   paymentMethod?: PaymentMethod;
   cardId?: string;
+  /**
+   * 출금 계좌 (Asset id). Meaningful for 'transfer' (picked by the user) and
+   * 'debit' (the 체크카드's linked account, copied at save time).
+   */
+  sourceAssetId?: string;
+  /** 수입 입금처 (Asset id). Meaningful for an income paid by 'transfer'. */
+  destinationAssetId?: string;
   installment?: { months: number };
   splits?: TransactionSplit[];
 }
@@ -71,6 +95,8 @@ export interface TransactionInsertRow {
   date: string;
   payment_method: PaymentMethod | null;
   card_id: string | null;
+  source_asset_id: string | null;
+  destination_asset_id: string | null;
   installment_months: number | null;
   splits: TransactionSplit[] | null;
   tags: null;
@@ -80,8 +106,8 @@ export function buildTransactionInsert(
   draft: NewTransactionDraft,
   ctx: BuildTransactionInsertContext,
 ): TransactionInsertRow {
-  const cardId =
-    draft.cardId && ctx.knownCardIds.has(draft.cardId) ? draft.cardId : null;
+  const link = paymentLinkColumns(draft.type, draft);
+  const cardId = link.card_id && ctx.knownCardIds.has(link.card_id) ? link.card_id : null;
 
   return {
     id: ctx.id,
@@ -92,8 +118,10 @@ export function buildTransactionInsert(
     amount: draft.amount,
     memo: draft.memo,
     date: draft.date,
-    payment_method: draft.paymentMethod ?? null,
+    payment_method: link.payment_method,
     card_id: cardId,
+    source_asset_id: link.source_asset_id,
+    destination_asset_id: link.destination_asset_id,
     installment_months: draft.installment?.months ?? null,
     splits: draft.splits && draft.splits.length > 0 ? draft.splits : null,
     tags: null,
@@ -123,10 +151,11 @@ export function buildTransactionInsert(
  * soft-deleted, a transaction can legitimately still carry a real DB
  * `card_id` that points at a now-deleted card while the read model shows
  * `Transaction.cardId === undefined` ("카드 미지정"). Editing only that
- * transaction's memo/amount/category must NOT wipe the DB link. The rule:
- *   A. draft.paymentMethod !== 'credit'            -> card_id: null
+ * transaction's memo/amount/category must NOT wipe the DB link. The rule
+ * ("card payment" = 'credit' 신용카드 or 'debit' 체크카드):
+ *   A. not a card payment                          -> card_id: null
  *   B. draft.cardId is a KNOWN active card         -> card_id: draft.cardId
- *   C. credit, no draft.cardId, but originalRawCardId is a non-null id
+ *   C. card payment, no draft.cardId, but originalRawCardId is a non-null id
  *      that is NOT among the known active cards    -> OMIT card_id
  *      (preserve the dangling deleted-card link)
  *   D. anything else (explicit clear of an active card / never had one /
@@ -156,6 +185,8 @@ export interface TransactionUpdateRow {
   payment_method: PaymentMethod | null;
   /** Omitted entirely when preserving a dangling deleted-card link (§5-C). */
   card_id?: string | null;
+  source_asset_id: string | null;
+  destination_asset_id: string | null;
   installment_months: number | null;
   splits: TransactionSplit[] | null;
 }
@@ -164,13 +195,18 @@ function resolveUpdateCardId(
   draft: NewTransactionDraft,
   ctx: BuildTransactionUpdateContext,
 ): { omit: true } | { omit: false; value: string | null } {
-  // A. not a credit purchase any more -> clear.
-  if (draft.paymentMethod !== 'credit') return { omit: false, value: null };
+  // A. not a card (신용/체크) EXPENSE any more (incl. 지출 -> 수입) -> clear.
+  if (
+    draft.type !== 'expense' ||
+    (draft.paymentMethod !== 'credit' && draft.paymentMethod !== 'debit')
+  ) {
+    return { omit: false, value: null };
+  }
   // B. an explicitly selected, currently-known card -> use it.
   if (draft.cardId && ctx.knownCardIds.has(draft.cardId)) {
     return { omit: false, value: draft.cardId };
   }
-  // C. still credit, no resolvable selection, but the row already links to
+  // C. still a card payment, no resolvable selection, but the row already links to
   //    a card that simply isn't in the active set (soft-deleted) -> keep it.
   const raw = ctx.originalRawCardId;
   if (!draft.cardId && raw != null && !ctx.knownCardIds.has(raw)) {
@@ -184,13 +220,16 @@ export function buildTransactionUpdate(
   draft: NewTransactionDraft,
   ctx: BuildTransactionUpdateContext,
 ): TransactionUpdateRow {
+  const link = paymentLinkColumns(draft.type, draft);
   const base: TransactionUpdateRow = {
     type: draft.type,
     category: draft.category,
     amount: draft.amount,
     memo: draft.memo,
     date: draft.date,
-    payment_method: draft.paymentMethod ?? null,
+    payment_method: link.payment_method,
+    source_asset_id: link.source_asset_id,
+    destination_asset_id: link.destination_asset_id,
     installment_months: draft.installment?.months ?? null,
     splits: draft.splits && draft.splits.length > 0 ? draft.splits : null,
   };

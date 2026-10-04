@@ -15,7 +15,35 @@
  * year boundaries (12월 → 다음 해 1월) are exact without `Date.setMonth` loops.
  */
 
-import type { CreditCard, Transaction } from '@/store/types';
+import type { CardType, CreditCard, Transaction } from '@/store/types';
+
+export const CARD_TYPE_OPTIONS: { value: CardType; label: string }[] = [
+  { value: 'credit', label: '신용카드' },
+  { value: 'debit', label: '체크카드' },
+];
+
+/**
+ * A card's type; anything but an explicit 'debit' is a 신용카드 (cards
+ * registered before the type existed were all credit cards).
+ */
+export function cardTypeOf(card: Pick<CreditCard, 'cardType'>): CardType {
+  return card.cardType === 'debit' ? 'debit' : 'credit';
+}
+
+/**
+ * The 출금 계좌 to record on a NEW transaction paid with `card` — the
+ * card's linked account right now, or undefined (신용카드 / nothing
+ * linked). Whatever creates a 체크카드 transaction — the input form today,
+ * a recurring-rule materializer later — copies this value into
+ * `Transaction.sourceAssetId` at save time, so re-linking the card never
+ * rewrites the account recorded on past transactions.
+ */
+export function debitSourceAssetId(
+  card: Pick<CreditCard, 'cardType' | 'linkedAssetId'> | undefined,
+): string | undefined {
+  if (!card || cardTypeOf(card) !== 'debit') return undefined;
+  return card.linkedAssetId || undefined;
+}
 
 /** Sentinel key for card charges whose `cardId` is missing or unknown. */
 export const UNASSIGNED_CARD_ID = '__unassigned__';
@@ -151,7 +179,8 @@ export interface CardBilling {
 /**
  * "사용월 기준 예상 카드값" for the month containing `ref` (default: now).
  * Only `type === 'expense'` && `paymentMethod === 'credit'` transactions
- * count. A `cardId` that no longer matches any registered card falls into
+ * count — a 체크카드 ('debit') purchase is an immediate expense, never a
+ * card bill. A `cardId` that no longer matches any registered card falls into
  * `unassigned` — the source transaction is never dropped.
  */
 export function cardBillingForMonth(

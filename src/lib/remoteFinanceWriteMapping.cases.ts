@@ -31,6 +31,8 @@ const ALLOWED_KEYS: (keyof TransactionInsertRow)[] = [
   'date',
   'payment_method',
   'card_id',
+  'source_asset_id',
+  'destination_asset_id',
   'installment_months',
   'splits',
   'tags',
@@ -226,6 +228,8 @@ const UPDATE_ALLOWED_KEYS: (keyof TransactionUpdateRow)[] = [
   'date',
   'payment_method',
   'card_id',
+  'source_asset_id',
+  'destination_asset_id',
   'installment_months',
   'splits',
 ];

@@ -129,6 +129,10 @@ export interface RemoteCustomCategory {
 export interface RemoteCard {
   id: string;
   name: string;
+  /** 결제수단 연결 BATCH — 'credit' | 'debit' (DB default 'credit'). */
+  card_type: string;
+  /** 체크카드 출금 계좌 (public.assets id); NULL for 신용카드 / unlinked. */
+  linked_asset_id: string | null;
   color_bg: string | null;
   color_fg: string | null;
   payment_day: number | null;
@@ -156,6 +160,11 @@ export interface RemoteRecurringRule {
   day_of_week: number | null;
   active: boolean;
   last_run: string | null;
+  /** 결제수단 연결 BATCH — same meaning as the transaction columns; NULL on legacy rules. */
+  payment_method: string | null;
+  card_id: string | null;
+  source_asset_id: string | null;
+  destination_asset_id: string | null;
   created_at: string;
   /**
    * STEP 16-G2-D2 — routed to `recurringMeta`, NOT the RecurringRule domain
@@ -236,7 +245,13 @@ export interface RemoteLoan {
 export interface RemoteAsset {
   id: string;
   name: string;
-  type: 'cash' | 'bank' | 'savings' | 'investment' | 'other';
+  type: 'cash' | 'bank' | 'savings' | 'investment' | 'real_estate' | 'other';
+  /**
+   * 자산 관리 BATCH 2 — optional detail columns
+   * (20261002001500_assets_subtype_institution.sql). NULL on legacy rows.
+   */
+  subtype: string | null;
+  institution: string | null;
   balance: number;
   created_at: string;
   /**
@@ -280,6 +295,12 @@ export interface RemoteTransaction {
   from_planned: string | null;
   payment_method: string | null;
   card_id: string | null;
+  /** 결제수단 연결 BATCH — 이체 출금 계좌 (public.assets id), NULL otherwise. */
+  source_asset_id: string | null;
+  /** 결제수단 연결 BATCH — 수입 입금처 (public.assets id), NULL otherwise. */
+  destination_asset_id: string | null;
+  /** 20261004001900 — does this row move account balances (false = pre-sync row). */
+  asset_balance_applied: boolean;
   installment_months: number | null;
   splits: unknown;
   tags: string[] | null;
@@ -385,12 +406,12 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('cards')
-      .select('id,name,color_bg,color_fg,payment_day,closing_day,created_at,created_by,updated_at')
+      .select('id,name,card_type,linked_asset_id,color_bg,color_fg,payment_day,closing_day,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
       .from('recurring_rules')
-      .select('id,type,name,amount,category,frequency,day_of_month,day_of_week,active,last_run,created_at,created_by,updated_at')
+      .select('id,type,name,amount,category,frequency,day_of_month,day_of_week,active,last_run,payment_method,card_id,source_asset_id,destination_asset_id,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
@@ -415,13 +436,13 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('assets')
-      .select('id,name,type,balance,created_at,created_by,updated_at')
+      .select('id,name,type,subtype,institution,balance,created_at,created_by,updated_at')
       .eq('household_id', householdId)
       .is('deleted_at', null),
     supabase
       .from('transactions')
       .select(
-        'id,type,category,amount,memo,date,from_recurring,from_planned,payment_method,card_id,installment_months,splits,tags,member_id,created_by,updated_at',
+        'id,type,category,amount,memo,date,from_recurring,from_planned,payment_method,card_id,source_asset_id,destination_asset_id,asset_balance_applied,installment_months,splits,tags,member_id,created_by,updated_at',
       )
       .eq('household_id', householdId)
       .is('deleted_at', null),

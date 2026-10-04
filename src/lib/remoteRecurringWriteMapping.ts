@@ -34,9 +34,19 @@
  * is ever meaningful, and the other is written as an explicit `null` on
  * both INSERT and UPDATE so switching 매월 <-> 매주 always clears the stale
  * value (STEP 16-G2-D2 §3).
+ *
+ * 결제수단 / 입금처 (결제수단 연결 BATCH): payment_method / card_id /
+ * source_asset_id / destination_asset_id, kept or NULL-ed by the SAME rules
+ * transactions use (src/lib/paymentLink.ts). INSERT always sends all four.
+ * UPDATE sends them only when the draft carries `paymentMethod` (a value or
+ * an explicit `null` = "none") — a draft without the key (an offline
+ * UPDATE queued by a build that predates this) leaves the stored link as is.
  */
 import type { TxnType } from '@/data/categories';
-import type { Frequency } from '@/store/types';
+import { paymentLinkColumns } from '@/lib/paymentLink';
+import type { Frequency, PaymentMethod } from '@/store/types';
+
+const PAYMENT_METHODS: readonly PaymentMethod[] = ['cash', 'debit', 'credit', 'transfer', 'other'];
 
 /**
  * What the recurring-rule form produces. Purely the user-editable shape —
@@ -55,6 +65,24 @@ export interface NewRecurringDraft {
   dayOfMonth: number | null;
   /** Read only when `frequency === 'weekly'`. Integer 0 (일) – 6 (토). */
   dayOfWeek: number | null;
+  /** 결제수단 (지출) / 입금 방식 (수입). `null` = none; absent = "not edited" (see header). */
+  paymentMethod?: PaymentMethod | null;
+  /** 신용/체크카드 (지출). A 체크카드 rule stores the card only — no account snapshot. */
+  cardId?: string;
+  /** 이체 출금 계좌 (지출). */
+  sourceAssetId?: string;
+  /** 입금처 계좌 (수입, 'transfer'). */
+  destinationAssetId?: string;
+}
+
+/** The payment-link columns for a draft (paymentLink.ts rules). */
+function recurringLinkColumns(draft: NewRecurringDraft) {
+  return paymentLinkColumns(draft.type, {
+    paymentMethod: draft.paymentMethod ?? undefined,
+    cardId: draft.cardId,
+    sourceAssetId: draft.sourceAssetId,
+    destinationAssetId: draft.destinationAssetId,
+  });
 }
 
 const isInt = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n);
@@ -79,6 +107,10 @@ export function isValidRecurringDraft(draft: NewRecurringDraft): boolean {
   } else {
     if (!isInt(draft.dayOfWeek) || draft.dayOfWeek < 0 || draft.dayOfWeek > 6) return false;
   }
+  if (draft.paymentMethod != null && !PAYMENT_METHODS.includes(draft.paymentMethod)) return false;
+  for (const id of [draft.cardId, draft.sourceAssetId, draft.destinationAssetId]) {
+    if (id !== undefined && (typeof id !== 'string' || id.length === 0)) return false;
+  }
   return true;
 }
 
@@ -100,6 +132,10 @@ export interface RecurringInsertRow {
   frequency: Frequency;
   day_of_month: number | null;
   day_of_week: number | null;
+  payment_method: PaymentMethod | null;
+  card_id: string | null;
+  source_asset_id: string | null;
+  destination_asset_id: string | null;
 }
 
 export function buildRecurringInsert(
@@ -117,6 +153,7 @@ export function buildRecurringInsert(
     frequency: draft.frequency,
     day_of_month: monthly ? draft.dayOfMonth : null,
     day_of_week: monthly ? null : draft.dayOfWeek,
+    ...recurringLinkColumns(draft),
   };
 }
 
@@ -132,6 +169,11 @@ export interface RecurringUpdateRow {
   frequency: Frequency;
   day_of_month: number | null;
   day_of_week: number | null;
+  /* The four link columns travel together — all present or all omitted. */
+  payment_method?: PaymentMethod | null;
+  card_id?: string | null;
+  source_asset_id?: string | null;
+  destination_asset_id?: string | null;
 }
 
 export function buildRecurringUpdate(draft: NewRecurringDraft): RecurringUpdateRow {
@@ -143,5 +185,6 @@ export function buildRecurringUpdate(draft: NewRecurringDraft): RecurringUpdateR
     frequency: draft.frequency,
     day_of_month: monthly ? draft.dayOfMonth : null,
     day_of_week: monthly ? null : draft.dayOfWeek,
+    ...(draft.paymentMethod !== undefined ? recurringLinkColumns(draft) : {}),
   };
 }

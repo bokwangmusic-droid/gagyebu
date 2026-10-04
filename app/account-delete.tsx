@@ -699,7 +699,18 @@ function InfoList({ items }: { items: string[] }) {
     >
       {items.map((item) => (
         <View key={item} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
-          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.primaryStrong }}>•</Text>
+          {/* Fixed-size dot instead of a "•" glyph, so its position no longer
+              depends on font metrics: marginTop (20 - 5) / 2 centres it on
+              the FIRST line box (lineHeight 20) of the text beside it. */}
+          <View
+            style={{
+              width: 5,
+              height: 5,
+              borderRadius: 2.5,
+              marginTop: 7.5,
+              backgroundColor: colors.primaryStrong,
+            }}
+          />
           <Text style={{ flex: 1, fontFamily: fontFamily.regular, fontSize: 13, lineHeight: 20, color: colors.textSub }}>
             {item}
           </Text>

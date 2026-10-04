@@ -67,6 +67,55 @@ export function splitPayment(
   return { interestPart, principalPart };
 }
 
+export interface LoanProjection {
+  totalPrincipal: number; // 총 원금
+  totalInterest: number; // 예상 총 이자
+  totalRepayment: number; // 예상 총 상환액 = 원금 + 이자
+}
+
+/**
+ * Whole-term totals, summed over the month-by-month schedule (NOT
+ * `scheduledPayment * termMonths`, which drifts by the per-month rounding
+ * and is simply wrong for the two non-level styles).
+ *
+ * Each month reuses the existing engine on the running balance:
+ *  - amortizing      -> `splitPayment` of the fixed `scheduledPayment`
+ *  - equal_principal -> `equalPrincipalSlice` + that month's interest
+ *  - bullet          -> that month's interest only (slice is 0)
+ * The LAST month repays whatever principal is left, so the principal total
+ * always equals `principal` exactly and the rounding remainder is absorbed
+ * there. Fixed-rate projection, same assumption as `scheduledPayment`.
+ */
+export function projectLoanTotals(
+  principal: number,
+  annualRatePct: number,
+  termMonths: number,
+  repayType: LoanRepayType,
+): LoanProjection {
+  if (principal <= 0 || termMonths <= 0) {
+    return { totalPrincipal: 0, totalInterest: 0, totalRepayment: 0 };
+  }
+  const level = scheduledPayment(principal, annualRatePct, termMonths, repayType);
+  const slice = equalPrincipalSlice(principal, termMonths, repayType);
+  let remaining = principal;
+  let totalInterest = 0;
+  for (let m = 1; m <= termMonths; m++) {
+    let interestPart: number;
+    let principalPart: number;
+    if (repayType === 'amortizing') {
+      ({ interestPart, principalPart } = splitPayment(remaining, annualRatePct, level));
+    } else {
+      // One month's interest on the current balance (the 'bullet' projection).
+      interestPart = scheduledPayment(remaining, annualRatePct, termMonths, 'bullet');
+      principalPart = Math.min(remaining, slice);
+    }
+    if (m === termMonths) principalPart = remaining;
+    totalInterest += interestPart;
+    remaining -= principalPart;
+  }
+  return { totalPrincipal: principal, totalInterest, totalRepayment: principal + totalInterest };
+}
+
 /**
  * Scheduled payoff date = startDate + termMonths. Uses the `Date(year, month,
  * day)` constructor (which normalises month overflow) plus a last-day clamp,

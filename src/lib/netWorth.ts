@@ -15,12 +15,40 @@
  * 수준에서 보장되므로, 여기서 다시 deletedAt을 걸러낼 필요도, 걸러낼 방법도
  * 없다.
  */
+import { ASSET_TYPE_OPTIONS, normalizeAssetType } from '@/lib/asset';
 import { viewLoan } from '@/lib/loan';
-import type { Asset, Loan } from '@/store/types';
+import type { Asset, AssetType, Loan } from '@/store/types';
 
 /** 활성 Asset 잔액의 합. */
 export function calculateTotalAssets(assets: readonly Asset[]): number {
   return assets.reduce((sum, a) => sum + a.balance, 0);
+}
+
+export interface AssetTypeTotal {
+  type: AssetType;
+  total: number;
+  count: number;
+}
+
+/**
+ * 자산 종류별 합계 — `ASSET_TYPE_OPTIONS` 표시 순서, 합계가 0인 종류는 제외.
+ * (거래 자동 반영으로 계좌 잔액이 음수가 될 수 있으므로 음수 합계도 표시한다.)
+ * 알 수 없는 종류는 `normalizeAssetType`으로 기타 자산에 합산하므로, 반환된
+ * `total`의 합은 항상 `calculateTotalAssets(assets)`와 같다.
+ */
+export function summarizeAssetsByType(assets: readonly Asset[]): AssetTypeTotal[] {
+  const byType = new Map<AssetType, AssetTypeTotal>();
+  for (const a of assets) {
+    const type = normalizeAssetType(a.type);
+    const cur = byType.get(type) ?? { type, total: 0, count: 0 };
+    cur.total += a.balance;
+    cur.count += 1;
+    byType.set(type, cur);
+  }
+  return ASSET_TYPE_OPTIONS.flatMap((o) => {
+    const t = byType.get(o.value);
+    return t && t.total !== 0 ? [t] : [];
+  });
 }
 
 /** 활성 Loan의 남은 원금(`viewLoan(...).remaining`) 합. 완납 대출은 0으로 반영. */

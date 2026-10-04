@@ -367,7 +367,9 @@ export async function runCoordinatorGoalMovementCases(): Promise<{
     );
   }
 
-  // 15 — insufficient (discovered on replay) -> reason-less terminal (flattened, like 'invalid')
+  // 15 — insufficient (discovered on replay) -> terminal with reason "insufficient"
+  //      preserved (STEP 16-H2-G6: runOp keeps it so pendingGoalLabel can show
+  //      "인출 가능한 금액이 부족해요"; only 'invalid' is still flattened)
   {
     const h = makeHarness();
     await h.coord.hydrate();
@@ -382,8 +384,8 @@ export async function runCoordinatorGoalMovementCases(): Promise<{
     await settle();
     const st = h.coord.getState().goalMovement;
     check(
-      '15 insufficient -> terminal-failed with NO stored reason (flattened, mirrors invalid)',
-      st.failedIds.has('gm-1') && st.failedReasons.get('gm-1') === undefined,
+      '15 insufficient -> terminal-failed with reason "insufficient" preserved',
+      st.failedIds.has('gm-1') && st.failedReasons.get('gm-1') === 'insufficient',
       JSON.stringify({ failed: [...st.failedIds], reason: st.failedReasons.get('gm-1') }),
     );
   }

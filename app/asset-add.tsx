@@ -1,7 +1,7 @@
 import * as Haptics from 'expo-haptics';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Alert, Keyboard, Pressable, Text, View } from 'react-native';
+import { Alert, Keyboard, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { FinanceLoadState } from '@/components/FinanceLoadState';
@@ -10,7 +10,14 @@ import { ChipSelect, Field, HeaderTextButton, TextField } from '@/components/ui/
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
-import { ASSET_TYPE_OPTIONS } from '@/lib/asset';
+import {
+  ASSET_INSTITUTION_MAX,
+  ASSET_TYPE_OPTIONS,
+  BANK_INSTITUTION_OPTIONS,
+  assetInstitutionMode,
+  assetSubtypeOptions,
+  describeAssetInstitution,
+} from '@/lib/asset';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum } from '@/lib/format';
 import { uid } from '@/lib/id';
@@ -39,6 +46,13 @@ import { fontFamily, tabularNums } from '@/theme/typography';
 const OFFLINE_MESSAGE = '오프라인 상태예요. 인터넷 연결 후 다시 시도해주세요.';
 
 type NumFieldKey = 'balance';
+
+/** 상세 종류 Field label per type (only types that have subtype options). */
+const SUBTYPE_FIELD_LABEL: Partial<Record<AssetType, string>> = {
+  savings: '상품 종류',
+  investment: '투자 종류',
+  real_estate: '부동산 종류',
+};
 
 /** Integer digit entry — same rules as loan-add's 원금 입력. */
 function applyIntDigit(cur: string, k: string, maxLen: number): string {
@@ -174,9 +188,36 @@ function AssetForm({ mode }: { mode: FormMode }) {
   const assetIdRef = useRef(uid('asset'));
 
   const [name, setName] = useState(editing?.name ?? '');
-  const [type, setType] = useState<AssetType>(editing?.type ?? 'cash');
-  const [balance, setBalance] = useState(editing ? String(editing.balance) : '');
+  const [type, setType] = useState<AssetType>(editing?.type ?? 'bank');
+  // 상세정보 (자산 관리 BATCH 2). '' = not chosen. A legacy asset has neither.
+  // For 투자 the institution is free text; a leftover bank code is shown by
+  // its name so the field never displays a raw code.
+  const [subtype, setSubtype] = useState(editing?.subtype ?? '');
+  const [institution, setInstitution] = useState(
+    editing?.institution
+      ? assetInstitutionMode(editing.type) === 'text'
+        ? describeAssetInstitution(editing.institution)
+        : editing.institution
+      : '',
+  );
+  // Digits only (the NumPad has no minus key) + a separate sign. A balance can
+  // go below 0 through 체크카드/이체 spending (DB balance sync), and an edit
+  // must never silently flip −10,000 into 10,000.
+  const [balance, setBalance] = useState(editing ? String(Math.abs(editing.balance)) : '');
+  const [negative, setNegative] = useState(!!editing && editing.balance < 0);
+  const showSignToggle = negative || (!!editing && editing.balance < 0);
   const [activeField, setActiveField] = useState<NumFieldKey | null>(null);
+
+  const subtypeOptions = assetSubtypeOptions(type);
+  const institutionMode = assetInstitutionMode(type);
+
+  /** A different type has different detail choices — never carry them over. */
+  const changeType = (next: AssetType) => {
+    if (next === type) return;
+    setSubtype('');
+    if (assetInstitutionMode(next) !== institutionMode) setInstitution('');
+    setType(next);
+  };
 
   const submittingRef = useRef(false);
   const [submitting, setSubmitting] = useState(false);
@@ -184,11 +225,26 @@ function AssetForm({ mode }: { mode: FormMode }) {
   const [deleting, setDeleting] = useState(false);
   const busy = submitting || deleting;
 
-  const canSave = name.trim().length > 0;
+  // 상세 종류 / 금융기관(은행계좌·예·적금)은 필수. 단, 상세정보가 없던 기존
+  // 자산을 같은 종류 그대로 수정할 때는 비워 둔 채로도 저장할 수 있다 —
+  // 금액만 고치려는 기존 사용자에게 새 입력을 강제하지 않는다.
+  const sameTypeAsOriginal = editing?.type === type;
+  const needSubtype =
+    subtypeOptions.length > 0 && !subtype && !(sameTypeAsOriginal && !editing?.subtype);
+  const needInstitution =
+    institutionMode === 'select' && !institution && !(sameTypeAsOriginal && !editing?.institution);
 
+  const canSave = name.trim().length > 0 && !needSubtype && !needInstitution;
+
+  // The NumPad is a ModalScreen footer, so opening it shrinks the scroll
+  // viewport. With the detail fields the form can now be taller than that
+  // viewport; 현재 금액 is the LAST field, so scrolling to the end is exactly
+  // what keeps it visible (loan-add.tsx needs per-field maths, this doesn't).
+  const scrollRef = useRef<ScrollView>(null);
   const openField = (f: NumFieldKey) => {
     Keyboard.dismiss();
     setActiveField(f);
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
   };
   const onKey = (k: string) => {
     if (activeField === 'balance') setBalance((v) => applyIntDigit(v, k, 12));
@@ -198,9 +254,18 @@ function AssetForm({ mode }: { mode: FormMode }) {
   const buildDraft = (): NewAssetDraft | null => {
     const nm = name.trim();
     if (nm.length === 0) return null;
-    const bal = parseNum(balance);
-    if (!Number.isInteger(bal) || bal < 0) return null;
-    return { name: nm, type, balance: bal };
+    const magnitude = parseNum(balance);
+    if (!Number.isInteger(magnitude) || magnitude < 0) return null;
+    const bal = negative && magnitude > 0 ? -magnitude : magnitude;
+    if (needSubtype || needInstitution) return null;
+    // Only the details this type uses; the mapper sends NULL for the rest.
+    return {
+      name: nm,
+      type,
+      subtype: subtypeOptions.length > 0 && subtype ? subtype : null,
+      institution: institutionMode !== 'none' && institution.trim() ? institution.trim() : null,
+      balance: bal,
+    };
   };
 
   const save = async () => {
@@ -340,6 +405,7 @@ function AssetForm({ mode }: { mode: FormMode }) {
       title={isEdit ? '자산 수정' : '자산 추가'}
       closeIcon="x"
       onClose={() => router.back()}
+      scrollRef={scrollRef}
       right={
         <HeaderTextButton
           label={submitting ? '저장 중…' : '저장'}
@@ -374,28 +440,60 @@ function AssetForm({ mode }: { mode: FormMode }) {
           </View>
         )}
 
+        <Field label="자산 종류">
+          <ChipSelect value={type} onChange={changeType} options={ASSET_TYPE_OPTIONS} />
+        </Field>
+
+        {/* 상세정보 — 선택한 종류에 필요한 입력만 보여준다 (현금/기타 자산은 없음). */}
+        {institutionMode === 'select' && (
+          <Field label="금융기관">
+            <ChipSelect value={institution} onChange={setInstitution} options={BANK_INSTITUTION_OPTIONS} />
+          </Field>
+        )}
+        {subtypeOptions.length > 0 && (
+          <Field label={SUBTYPE_FIELD_LABEL[type] ?? '상세 종류'}>
+            <ChipSelect value={subtype} onChange={setSubtype} options={subtypeOptions} />
+          </Field>
+        )}
+        {institutionMode === 'text' && (
+          <Field label="금융기관 · 증권사 (선택)">
+            <TextField
+              value={institution}
+              onChangeText={setInstitution}
+              onFocus={() => setActiveField(null)}
+              placeholder="예: 키움증권, 토스증권, 업비트"
+              maxLength={ASSET_INSTITUTION_MAX}
+            />
+          </Field>
+        )}
+
         <Field label="자산 이름">
           <TextField
             value={name}
             onChangeText={setName}
             onFocus={() => setActiveField(null)}
-            placeholder="예: 지갑 현금, 월급통장, 삼성전자 주식"
+            placeholder="예: 생활비통장, 비상금 적금, 삼성전자 주식"
             maxLength={30}
-            autoFocus={!isEdit}
           />
-        </Field>
-
-        <Field label="자산 종류">
-          <ChipSelect value={type} onChange={setType} options={ASSET_TYPE_OPTIONS} />
         </Field>
 
         <Field label="현재 금액">
           <NumFieldRow
-            value={balance ? fmt(Number(balance)) : ''}
+            value={balance ? `${negative && Number(balance) > 0 ? '−' : ''}${fmt(Number(balance))}` : ''}
             suffix="원"
             active={activeField === 'balance'}
             onPress={() => openField('balance')}
           />
+          {showSignToggle && (
+            <Pressable onPress={() => setNegative((v) => !v)} hitSlop={6} style={{ marginTop: 6 }}>
+              <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>
+                {negative ? '마이너스(−) 잔액이에요 · ' : '플러스 잔액이에요 · '}
+                <Text style={{ fontFamily: fontFamily.bold, color: colors.primaryStrong }}>
+                  {negative ? '플러스로 바꾸기' : '마이너스로 바꾸기'}
+                </Text>
+              </Text>
+            </Pressable>
+          )}
         </Field>
       </View>
     </ModalScreen>

@@ -25,6 +25,8 @@ const INSERT_ALLOWED_KEYS: (keyof CardInsertRow)[] = [
   'id',
   'household_id',
   'name',
+  'card_type',
+  'linked_asset_id',
   'color_bg',
   'color_fg',
   'payment_day',
@@ -37,6 +39,8 @@ const FORBIDDEN_KEYS = ['created_by', 'created_at', 'updated_at', 'deleted_at'];
 /** Every column allowed in a card PATCH body (no id / household_id here). */
 const UPDATE_ALLOWED_KEYS: (keyof CardUpdateRow)[] = [
   'name',
+  'card_type',
+  'linked_asset_id',
   'color_bg',
   'color_fg',
   'payment_day',

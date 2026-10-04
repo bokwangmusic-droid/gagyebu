@@ -34,7 +34,13 @@ import type {
   RemoteRecurringMeta,
   RemoteTransactionMeta,
 } from '@/lib/remoteFinanceMapping';
-import { composeFinance } from '@/lib/offlineQueue';
+import { pendingAssetBalanceDeltas } from '@/lib/assetBalance';
+import {
+  composeFinance,
+  type PendingTransactionCreate,
+  type PendingTransactionDelete,
+  type PendingTransactionUpdate,
+} from '@/lib/offlineQueue';
 import {
   buildPendingBudgetOps,
   buildPendingCategoryOps,
@@ -139,6 +145,16 @@ export interface FinanceReadResult {
   assets: Asset[];
   /** asset id -> remote-only metadata (updatedAt concurrency token + createdBy). 전체자산/순자산 STEP 4. `{}` while not ready. */
   assetMeta: Record<string, RemoteAssetMeta>;
+  /**
+   * 결제수단 연결 BATCH — DISPLAY-ONLY balance deltas (asset id -> won) for
+   * transaction writes still queued offline (src/lib/assetBalance.ts
+   * `pendingAssetBalanceDeltas`). The real balance change happens in the DB
+   * trigger when the write lands; this only lets a screen show it early.
+   * Kept SEPARATE from `assets` on purpose: `assets[].balance` stays the raw
+   * server value, so the asset edit form never uploads an overlaid number.
+   * Empty map when nothing is pending.
+   */
+  assetBalanceOverlay: ReadonlyMap<string, number>;
   customCats: CustomCatMap;
   notes: string;
   catOrder: CatOrderMap;
@@ -434,6 +450,7 @@ const EMPTY_SLICES = {
   loanPaymentMeta: {} as Record<string, RemoteLoanPaymentMeta>,
   assets: [] as Asset[],
   assetMeta: {} as Record<string, RemoteAssetMeta>,
+  assetBalanceOverlay: new Map() as ReadonlyMap<string, number>,
   customCats: DEFAULT_CUSTOM_CATS,
   notes: '',
   catOrder: DEFAULT_CAT_ORDER,
@@ -753,6 +770,20 @@ export function useFinanceRead(): FinanceReadResult {
         loanPaymentMeta: data.loanPaymentMeta,
         assets: data.assets,
         assetMeta: data.assetMeta,
+        // Relative to the authoritative server rows, so a write the server
+        // already applied contributes 0 (never double-counted).
+        assetBalanceOverlay:
+          hydrationReady && providerOps.length > 0
+            ? pendingAssetBalanceDeltas(
+                data.transactions,
+                (id) => data.transactionMeta[id]?.balanceApplied === true,
+                providerOps.filter(
+                  (o): o is PendingTransactionCreate | PendingTransactionUpdate | PendingTransactionDelete =>
+                    o.entity === 'transaction',
+                ),
+                providerFailedIds,
+              )
+            : new Map(),
         customCats: data.customCats,
         notes: data.notes,
         catOrder: data.catOrder,

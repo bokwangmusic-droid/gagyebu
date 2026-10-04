@@ -38,8 +38,25 @@ export interface Transaction {
   /* ---- extension fields — all optional; absent = current behaviour ---- */
   /** Payment instrument. Foundation for card / 할부 tracking. */
   paymentMethod?: PaymentMethod;
-  /** Which registered card was used. Only meaningful when `paymentMethod === 'credit'`. */
+  /**
+   * Which registered card was used. Meaningful when `paymentMethod` is
+   * 'credit' (a 신용카드) or 'debit' (a 체크카드).
+   */
   cardId?: string;
+  /**
+   * 출금 계좌 — the `Asset` (은행계좌) a 'transfer' expense was paid from, or
+   * (for 'debit') the account the 체크카드 was linked to WHEN this
+   * transaction was saved. The DB balance-sync trigger (20261004001900)
+   * takes the amount out of this account — the client never writes the
+   * balance itself. Absent on legacy rows and for other methods.
+   */
+  sourceAssetId?: string;
+  /**
+   * 입금처 — the `Asset` (은행계좌) an income landed in ('transfer'); the DB
+   * trigger adds the amount to it. A 현금 income is `paymentMethod: 'cash'`
+   * with no asset. Absent on legacy rows and on every expense.
+   */
+  destinationAssetId?: string;
   /** Present = 할부; absent = 일시불. Never materialised as separate rows. */
   installment?: TransactionInstallment;
   /**
@@ -53,14 +70,26 @@ export interface Transaction {
   tags?: string[];
 }
 
+/** 신용카드 | 체크카드. */
+export type CardType = 'credit' | 'debit';
+
 /**
- * A credit card the user registered. `closingDay` / `paymentDay` are stored
- * for display only in the MVP — card billing is computed on the purchase
- * month, not on carrier-specific 이용기간 windows.
+ * A card the user registered — 신용카드 or 체크카드 (`cardType`; absent =
+ * 신용카드, the meaning every card had before the type existed).
+ * `closingDay` / `paymentDay` are stored for display only in the MVP and
+ * only apply to 신용카드 — card billing is computed on the purchase month,
+ * not on carrier-specific 이용기간 windows.
  */
 export interface CreditCard {
   id: string;
   name: string;
+  cardType?: CardType;
+  /**
+   * 체크카드's 출금 은행계좌 (an `Asset` id). Only meaningful for a 'debit'
+   * card. Copied into `Transaction.sourceAssetId` when a 체크카드 purchase is
+   * saved — past transactions never re-read it.
+   */
+  linkedAssetId?: string;
   /** Optional accent colour ({ bg, color } from CAT_COLOR_PALETTE). */
   color?: { bg: string; color: string };
   /** 결제일 1–31 (표시 전용). */
@@ -97,6 +126,16 @@ export interface RecurringRule {
   active: boolean;
   createdAt: string;
   lastRun?: string;
+  /*
+   * 결제수단 / 입금처 for the payments this rule describes — same meaning and
+   * rules as the matching `Transaction` fields (src/lib/paymentLink.ts).
+   * All absent on legacy rules. A 체크카드 rule stores only `cardId`; the
+   * card's account is resolved when a transaction is created from it.
+   */
+  paymentMethod?: PaymentMethod;
+  cardId?: string;
+  sourceAssetId?: string;
+  destinationAssetId?: string;
 }
 
 export interface PlannedExpense {
@@ -140,11 +179,11 @@ export interface Loan {
   createdAt: string;
 }
 
-export type AssetType = 'cash' | 'bank' | 'savings' | 'investment' | 'other';
+export type AssetType = 'cash' | 'bank' | 'savings' | 'investment' | 'real_estate' | 'other';
 
 /**
- * A manually-entered held-asset balance (전체자산/순자산 STEP 1/2) — 현금/
- * 은행계좌/예적금/투자/기타. `balance` is entered by hand; there is no link
+ * A manually-entered held-asset balance (전체자산/순자산 STEP 1/2) — 은행계좌/
+ * 예·적금/투자/현금/부동산/기타 자산. `balance` is entered by hand; there is no link
  * to `Transaction` yet (that is a later STEP — see src/lib/netWorth.ts).
  * Same shape convention as `Loan`/`CreditCard`/`Goal`: `householdId`/
  * `createdBy`/`updatedAt`/`deletedAt` are remote-sync concerns, not part of
@@ -154,6 +193,10 @@ export interface Asset {
   id: string;
   name: string;
   type: AssetType;
+  /** 상세 종류 code (예금/적금, 국내주식/ETF, 아파트 …) — see src/lib/asset.ts. Absent on legacy rows. */
+  subtype?: string;
+  /** 금융기관 — bank/savings: code, investment: free text. Absent on legacy rows. */
+  institution?: string;
   balance: number;
   createdAt: string;
 }

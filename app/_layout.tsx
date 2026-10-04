@@ -102,6 +102,7 @@ const HOUSEHOLD_READY_SCREENS = [
   'loan-add',
   'loan-payment',
   'asset-add',
+  'asset-detail',
   'categories',
   'backup',
   'account-delete',
@@ -731,6 +732,7 @@ function RootNav() {
         <Stack.Screen name="loan-payment" options={MODAL} />
         <Stack.Screen name="assets" options={MODAL} />
         <Stack.Screen name="asset-add" options={MODAL} />
+        <Stack.Screen name="asset-detail" options={MODAL} />
         <Stack.Screen name="cards" options={MODAL} />
         <Stack.Screen name="card-add" options={MODAL} />
         <Stack.Screen name="categories" options={MODAL} />

@@ -118,6 +118,8 @@ function isSameCardRequest(
     existing.created_by === expectedUserId &&
     existing.household_id === row.household_id &&
     existing.name === row.name &&
+    existing.card_type === row.card_type &&
+    ((existing.linked_asset_id as string | null) ?? null) === row.linked_asset_id &&
     ((existing.color_bg as string | null) ?? null) === row.color_bg &&
     ((existing.color_fg as string | null) ?? null) === row.color_fg &&
     ((existing.payment_day as number | null) ?? null) === row.payment_day &&
@@ -132,6 +134,10 @@ function cardFieldsMatch(
 ): boolean {
   return (
     existing.name === row.name &&
+    // card_type absent from the PATCH = "keep the stored type" -> never a mismatch.
+    (!('card_type' in row) || existing.card_type === row.card_type) &&
+    (!('linked_asset_id' in row) ||
+      ((existing.linked_asset_id as string | null) ?? null) === row.linked_asset_id) &&
     ((existing.color_bg as string | null) ?? null) === row.color_bg &&
     ((existing.color_fg as string | null) ?? null) === row.color_fg &&
     ((existing.payment_day as number | null) ?? null) === row.payment_day &&
@@ -169,7 +175,7 @@ export async function createCard(args: {
   if (error?.code === '23505') {
     const { data: existing, error: readErr } = await supabase
       .from('cards')
-      .select('id,household_id,created_by,name,color_bg,color_fg,payment_day,closing_day')
+      .select('id,household_id,created_by,name,card_type,linked_asset_id,color_bg,color_fg,payment_day,closing_day')
       .eq('household_id', args.householdId)
       .eq('id', args.id)
       .maybeSingle();
@@ -235,7 +241,7 @@ export async function updateCard(args: {
   // 0 rows — reconcile against the current row (no updated_at / deleted_at filter).
   const { data: existing, error: readErr } = await supabase
     .from('cards')
-    .select('id,name,color_bg,color_fg,payment_day,closing_day,deleted_at,updated_at')
+    .select('id,name,card_type,linked_asset_id,color_bg,color_fg,payment_day,closing_day,deleted_at,updated_at')
     .eq('household_id', args.householdId)
     .eq('id', args.id)
     .maybeSingle();

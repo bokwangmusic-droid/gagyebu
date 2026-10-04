@@ -12,6 +12,7 @@
  */
 import {
   equalPrincipalSlice,
+  projectLoanTotals,
   scheduledPayment,
   splitPayment,
 } from '@/lib/loan';
@@ -103,6 +104,44 @@ export function runLoanCases(): { results: LoanCaseResult[]; passed: number; fai
     }
     check('split invariants: parts >= 0, principal <= remaining, sum <= amount', ok);
   }
+
+  /* ---- projectLoanTotals · whole-term totals from the schedule ---- */
+  {
+    // 원금균등 1.2M @12% 12mo: interest 12,000 + 11,000 + … + 1,000 = 78,000.
+    const t = projectLoanTotals(1_200_000, 12, 12, 'equal_principal');
+    check('totals · equal_principal 1.2M @12% 12mo -> interest 78,000', t.totalInterest === 78_000 && t.totalRepayment === 1_278_000, `${t.totalInterest}/${t.totalRepayment}`);
+  }
+  {
+    // 만기일시 1.2M @12% 12mo: 12,000 interest x 12, principal at maturity.
+    const t = projectLoanTotals(1_200_000, 12, 12, 'bullet');
+    check('totals · bullet 1.2M @12% 12mo -> interest 144,000', t.totalInterest === 144_000 && t.totalRepayment === 1_344_000, `${t.totalInterest}/${t.totalRepayment}`);
+  }
+  {
+    // 원리금균등: schedule sum stays within the per-month rounding of level x term.
+    const t = projectLoanTotals(1_000_000, 10, 12, 'amortizing');
+    const level = scheduledPayment(1_000_000, 10, 12, 'amortizing');
+    check('totals · amortizing 1M @10% 12mo ~= level x term', Math.abs(t.totalRepayment - level * 12) <= 12, `${t.totalRepayment} vs ${level * 12}`);
+  }
+  {
+    // Invariants across styles: principal total exact, repayment = principal + interest.
+    let ok = true;
+    for (const type of ['amortizing', 'equal_principal', 'bullet'] as const) {
+      for (const [pr, rate, term] of [
+        [1_000_000, 10, 12],
+        [1_000_000, 4.25, 36],
+        [123_457, 7.3, 7],
+        [50_000_000, 3.9, 120],
+        [1_200_000, 0, 12],
+        [1_000, 12, 1],
+      ] as [number, number, number][]) {
+        const t = projectLoanTotals(pr, rate, term, type);
+        if (t.totalPrincipal !== pr || t.totalInterest < 0 || t.totalRepayment !== pr + t.totalInterest) ok = false;
+        if (rate === 0 && t.totalInterest !== 0) ok = false;
+      }
+    }
+    check('totals invariants: principal exact, repayment = principal + interest, r=0 -> no interest', ok);
+  }
+  eq('totals · term 0 -> all zero', projectLoanTotals(1_200_000, 12, 0, 'amortizing').totalRepayment, 0);
 
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };

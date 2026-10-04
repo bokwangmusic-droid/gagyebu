@@ -12,7 +12,14 @@
  * fixture below is therefore implicitly "active"; there is no separate
  * case for it.
  */
-import { calculateNetWorth, calculateTotalAssets, calculateTotalDebt, summarizeNetWorth } from '@/lib/netWorth';
+import { ASSET_TYPE_OPTIONS, describeAssetType, normalizeAssetType } from '@/lib/asset';
+import {
+  calculateNetWorth,
+  calculateTotalAssets,
+  calculateTotalDebt,
+  summarizeAssetsByType,
+  summarizeNetWorth,
+} from '@/lib/netWorth';
 import type { Asset, Loan } from '@/store/types';
 
 export interface NetWorthCaseResult {
@@ -109,6 +116,59 @@ export function runNetWorthCases(): { results: NetWorthCaseResult[]; passed: num
       JSON.stringify(s),
     );
   }
+
+  // 8. 종류별 합계: 같은 종류끼리 합산, 표시 순서(은행계좌 -> … -> 기타 자산),
+  //    0원 종류 제외, 합계의 합 === 총자산.
+  {
+    const assets = [
+      makeAsset('cash', 150_000, 'cash'),
+      makeAsset('stock', 8_400_000, 'investment'),
+      makeAsset('bank1', 2_000_000, 'bank'),
+      makeAsset('bank2', 350_000, 'bank'),
+      makeAsset('savings', 5_000_000, 'savings'),
+      makeAsset('apt', 300_000_000, 'real_estate'),
+      makeAsset('empty-other', 0, 'other'),
+    ];
+    const by = summarizeAssetsByType(assets);
+    check(
+      '종류별 합계 · 순서/합산/0원 제외',
+      JSON.stringify(by.map((t) => [t.type, t.total, t.count])) ===
+        JSON.stringify([
+          ['bank', 2_350_000, 2],
+          ['savings', 5_000_000, 1],
+          ['investment', 8_400_000, 1],
+          ['cash', 150_000, 1],
+          ['real_estate', 300_000_000, 1],
+        ]),
+      JSON.stringify(by),
+    );
+    eq('종류별 합계의 합 === 총자산', by.reduce((s, t) => s + t.total, 0), calculateTotalAssets(assets));
+  }
+
+  // 9. 종류가 없거나 알 수 없는 기존 데이터 -> 기타 자산으로 fallback, 총자산 불변.
+  {
+    const legacy = [
+      { ...makeAsset('no-type', 700_000), type: undefined as unknown as Asset['type'] },
+      { ...makeAsset('unknown', 300_000), type: 'crypto' as unknown as Asset['type'] },
+      makeAsset('bank', 1_000_000, 'bank'),
+    ];
+    const by = summarizeAssetsByType(legacy);
+    check(
+      '종류 없는/모르는 자산 -> 기타 자산에 합산',
+      by.length === 2 && by[0].type === 'bank' && by[1].type === 'other' && by[1].total === 1_000_000 && by[1].count === 2,
+      JSON.stringify(by),
+    );
+    eq('fallback 후에도 총자산 불변', by.reduce((s, t) => s + t.total, 0), calculateTotalAssets(legacy));
+    check(
+      'normalizeAssetType · null/undefined/unknown -> other, 6개 종류는 그대로',
+      normalizeAssetType(null) === 'other' &&
+        normalizeAssetType(undefined) === 'other' &&
+        normalizeAssetType('toString') === 'other' &&
+        ASSET_TYPE_OPTIONS.length === 6 &&
+        ASSET_TYPE_OPTIONS.every((o) => normalizeAssetType(o.value) === o.value && describeAssetType(o.value) === o.label),
+    );
+  }
+  eq('종류별 합계 · 빈 배열 -> 빈 결과', summarizeAssetsByType([]).length, 0);
 
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };

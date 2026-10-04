@@ -183,6 +183,8 @@ function isSameRequest(
     ((existing.member_id as string | null) ?? null) === row.member_id &&
     ((existing.payment_method as string | null) ?? null) === row.payment_method &&
     ((existing.card_id as string | null) ?? null) === row.card_id &&
+    ((existing.source_asset_id as string | null) ?? null) === row.source_asset_id &&
+    ((existing.destination_asset_id as string | null) ?? null) === row.destination_asset_id &&
     ((existing.installment_months as number | null) ?? null) ===
       row.installment_months &&
     splitsEqual(existing.splits, row.splits)
@@ -232,7 +234,7 @@ export async function createTransaction(args: {
     const { data: existing, error: readErr } = await supabase
       .from('transactions')
       .select(
-        'id,household_id,created_by,type,category,amount,memo,date,member_id,payment_method,card_id,installment_months,splits',
+        'id,household_id,created_by,type,category,amount,memo,date,member_id,payment_method,card_id,source_asset_id,destination_asset_id,installment_months,splits',
       )
       .eq('household_id', args.householdId)
       .eq('id', args.id)
@@ -305,6 +307,8 @@ function financialFieldsMatch(
     new Date(existing.date as string).getTime() === new Date(row.date).getTime() &&
     ((existing.payment_method as string | null) ?? null) === row.payment_method &&
     cardIdMatches &&
+    ((existing.source_asset_id as string | null) ?? null) === row.source_asset_id &&
+    ((existing.destination_asset_id as string | null) ?? null) === row.destination_asset_id &&
     ((existing.installment_months as number | null) ?? null) === row.installment_months &&
     splitsEqual(existing.splits, row.splits)
   );
@@ -361,7 +365,7 @@ export async function updateTransaction(args: {
   const { data: existing, error: readErr } = await supabase
     .from('transactions')
     .select(
-      'id,type,category,amount,memo,date,payment_method,card_id,installment_months,splits,deleted_at,updated_at',
+      'id,type,category,amount,memo,date,payment_method,card_id,source_asset_id,destination_asset_id,installment_months,splits,deleted_at,updated_at',
     )
     .eq('household_id', args.householdId)
     .eq('id', args.id)

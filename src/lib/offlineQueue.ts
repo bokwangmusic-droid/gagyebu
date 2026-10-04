@@ -59,9 +59,11 @@
  * read-model / projection change lands in A4.1.
  */
 import type { Category, CustomCatMap } from '@/data/categories';
+import { cardTypeOf } from '@/lib/card';
 import { isValidBudgetDraft, type NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
+import { normalizePaymentLink } from '@/lib/paymentLink';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
   isValidGoalDraft,
@@ -92,6 +94,7 @@ import type {
   CreditCard,
   Goal,
   Loan,
+  PaymentMethod,
   PlannedExpense,
   RecurringRule,
   Transaction,
@@ -680,6 +683,8 @@ function isValidDraft(p: unknown): p is NewTransactionDraft {
   if (!isNonEmptyString(d.date)) return false;
   if (d.paymentMethod !== undefined && !PAYMENT_METHODS.has(d.paymentMethod as string)) return false;
   if (d.cardId !== undefined && typeof d.cardId !== 'string') return false;
+  if (d.sourceAssetId !== undefined && typeof d.sourceAssetId !== 'string') return false;
+  if (d.destinationAssetId !== undefined && typeof d.destinationAssetId !== 'string') return false;
   if (d.installment !== undefined) {
     const inst = d.installment as Record<string, unknown>;
     if (inst == null || !isFiniteNumber(inst.months)) return false;
@@ -707,6 +712,8 @@ function isValidCardDraft(p: unknown): p is NewCardDraft {
   if (p == null || typeof p !== 'object') return false;
   const d = p as Record<string, unknown>;
   if (!isNonEmptyString(d.name)) return false;
+  if (d.cardType !== undefined && d.cardType !== 'credit' && d.cardType !== 'debit') return false;
+  if (d.linkedAssetId !== undefined && typeof d.linkedAssetId !== 'string') return false;
   if (d.color !== undefined) {
     const c = d.color as Record<string, unknown>;
     if (c == null || typeof c !== 'object') return false;
@@ -891,6 +898,21 @@ function isValidRecurringPayload(p: unknown): p is NewRecurringDraft {
     frequency: d.frequency,
     dayOfMonth: d.dayOfMonth as number | null,
     dayOfWeek: d.dayOfWeek as number | null,
+    // 결제수단 / 입금처 — all optional (absent on drafts queued by older builds).
+    ...(d.paymentMethod !== undefined ? { paymentMethod: d.paymentMethod as PaymentMethod | null } : {}),
+    ...(d.cardId !== undefined ? { cardId: d.cardId as string } : {}),
+    ...(d.sourceAssetId !== undefined ? { sourceAssetId: d.sourceAssetId as string } : {}),
+    ...(d.destinationAssetId !== undefined ? { destinationAssetId: d.destinationAssetId as string } : {}),
+  });
+}
+
+/** A recurring draft's payment link, normalized exactly like the write mapper. */
+function recurringDraftLink(d: NewRecurringDraft) {
+  return normalizePaymentLink(d.type, {
+    paymentMethod: d.paymentMethod ?? undefined,
+    cardId: d.cardId,
+    sourceAssetId: d.sourceAssetId,
+    destinationAssetId: d.destinationAssetId,
   });
 }
 
@@ -2078,6 +2100,8 @@ function draftEqual(a: NewTransactionDraft, b: NewTransactionDraft): boolean {
     new Date(a.date).getTime() !== new Date(b.date).getTime() ||
     (a.paymentMethod ?? null) !== (b.paymentMethod ?? null) ||
     (a.cardId ?? null) !== (b.cardId ?? null) ||
+    (a.sourceAssetId ?? null) !== (b.sourceAssetId ?? null) ||
+    (a.destinationAssetId ?? null) !== (b.destinationAssetId ?? null) ||
     (a.installment?.months ?? null) !== (b.installment?.months ?? null)
   ) {
     return false;
@@ -2093,10 +2117,12 @@ function draftEqual(a: NewTransactionDraft, b: NewTransactionDraft): boolean {
   );
 }
 
-/** Structural equality of two card drafts (name / colour / days). */
+/** Structural equality of two card drafts (name / type / colour / days). */
 function cardDraftEqual(a: NewCardDraft, b: NewCardDraft): boolean {
   return (
     a.name === b.name &&
+    (a.cardType ?? null) === (b.cardType ?? null) &&
+    (a.linkedAssetId ?? null) === (b.linkedAssetId ?? null) &&
     (a.color?.bg ?? null) === (b.color?.bg ?? null) &&
     (a.color?.color ?? null) === (b.color?.color ?? null) &&
     (a.paymentDay ?? null) === (b.paymentDay ?? null) &&
@@ -2138,7 +2164,12 @@ function recurringEditableEqual(a: NewRecurringDraft, b: NewRecurringDraft): boo
     a.category === b.category &&
     a.frequency === b.frequency &&
     a.dayOfMonth === b.dayOfMonth &&
-    a.dayOfWeek === b.dayOfWeek
+    a.dayOfWeek === b.dayOfWeek &&
+    (a.paymentMethod === undefined) === (b.paymentMethod === undefined) &&
+    (a.paymentMethod ?? null) === (b.paymentMethod ?? null) &&
+    (a.cardId ?? null) === (b.cardId ?? null) &&
+    (a.sourceAssetId ?? null) === (b.sourceAssetId ?? null) &&
+    (a.destinationAssetId ?? null) === (b.destinationAssetId ?? null)
   );
 }
 
@@ -2428,6 +2459,8 @@ function createDraftToDomain(op: PendingTransactionCreate | PendingTransactionUp
     date: d.date,
     ...(d.paymentMethod !== undefined ? { paymentMethod: d.paymentMethod } : {}),
     ...(d.cardId !== undefined ? { cardId: d.cardId } : {}),
+    ...(d.sourceAssetId !== undefined ? { sourceAssetId: d.sourceAssetId } : {}),
+    ...(d.destinationAssetId !== undefined ? { destinationAssetId: d.destinationAssetId } : {}),
     ...(d.installment !== undefined ? { installment: d.installment } : {}),
     ...(d.splits !== undefined ? { splits: d.splits } : {}),
   };
@@ -2444,6 +2477,8 @@ function createDraftToDomain(op: PendingTransactionCreate | PendingTransactionUp
  * `originalRawCardId`, and the post-flush refresh reconciles any difference.
  */
 function applyUpdateDraft(row: Transaction, d: NewTransactionDraft): Transaction {
+  // Same link rules as buildTransactionUpdate (src/lib/paymentLink.ts).
+  const link = normalizePaymentLink(d.type, d);
   return {
     ...row,
     type: d.type,
@@ -2451,8 +2486,10 @@ function applyUpdateDraft(row: Transaction, d: NewTransactionDraft): Transaction
     amount: d.amount,
     memo: d.memo,
     date: d.date,
-    paymentMethod: d.paymentMethod,
-    cardId: d.cardId,
+    paymentMethod: link.paymentMethod,
+    cardId: link.cardId,
+    sourceAssetId: link.sourceAssetId,
+    destinationAssetId: link.destinationAssetId,
     installment: d.installment,
     splits: d.splits && d.splits.length > 0 ? d.splits : undefined,
   };
@@ -2463,6 +2500,7 @@ function createSyntheticMeta(op: PendingTransactionCreate): RemoteTransactionMet
     updatedAt: op.enqueuedAt,
     createdBy: op.scope.userId,
     rawCardId: op.payload.cardId ?? null,
+    balanceApplied: true, // a new row: the server trigger applies it on insert
   };
 }
 
@@ -2494,7 +2532,13 @@ export function serverRowConfirmsUpdate(
   if ((serverRow.memo ?? '') !== (draft.memo ?? '')) return false;
   if (new Date(serverRow.date).getTime() !== new Date(draft.date).getTime()) return false;
   if ((serverRow.installment?.months ?? null) !== (draft.installment?.months ?? null)) return false;
-  if ((serverRow.paymentMethod ?? null) !== (draft.paymentMethod ?? null)) return false;
+  // payment_method + 출금/입금 계좌: the read model keeps the accounts
+  // un-collapsed, so compare strictly against what buildTransactionUpdate
+  // would have written (same normalization).
+  const link = normalizePaymentLink(draft.type, draft);
+  if ((serverRow.paymentMethod ?? null) !== (link.paymentMethod ?? null)) return false;
+  if ((serverRow.sourceAssetId ?? null) !== (link.sourceAssetId ?? null)) return false;
+  if ((serverRow.destinationAssetId ?? null) !== (link.destinationAssetId ?? null)) return false;
 
   const sa = serverRow.splits ?? [];
   const sb = draft.splits ?? [];
@@ -2523,6 +2567,8 @@ function cardDraftToDomain(op: PendingCardCreate | PendingCardUpdate): CreditCar
   return {
     id: op.entityId,
     name: d.name,
+    ...(d.cardType !== undefined ? { cardType: d.cardType } : {}),
+    ...(d.cardType === 'debit' && d.linkedAssetId ? { linkedAssetId: d.linkedAssetId } : {}),
     ...(d.color !== undefined ? { color: d.color } : {}),
     ...(d.paymentDay !== undefined ? { paymentDay: d.paymentDay } : {}),
     ...(d.closingDay !== undefined ? { closingDay: d.closingDay } : {}),
@@ -2537,6 +2583,14 @@ function applyCardUpdate(row: CreditCard, d: NewCardDraft): CreditCard {
   return {
     ...row,
     name: d.name,
+    // No type in the draft = "unchanged" (buildCardUpdate omits card_type
+    // and linked_asset_id together).
+    ...(d.cardType !== undefined
+      ? {
+          cardType: d.cardType,
+          linkedAssetId: d.cardType === 'debit' ? d.linkedAssetId || undefined : undefined,
+        }
+      : {}),
     color: d.color,
     paymentDay: d.paymentDay,
     closingDay: d.closingDay,
@@ -2553,6 +2607,11 @@ function applyCardUpdate(row: CreditCard, d: NewCardDraft): CreditCard {
  */
 export function serverCardConfirmsUpdate(serverRow: CreditCard, draft: NewCardDraft): boolean {
   if (serverRow.name !== draft.name) return false;
+  if (draft.cardType !== undefined) {
+    if (cardTypeOf(serverRow) !== draft.cardType) return false;
+    const wantLinked = draft.cardType === 'debit' ? draft.linkedAssetId || null : null;
+    if ((serverRow.linkedAssetId ?? null) !== wantLinked) return false;
+  }
   if ((serverRow.color?.bg ?? null) !== (draft.color?.bg ?? null)) return false;
   if ((serverRow.color?.color ?? null) !== (draft.color?.color ?? null)) return false;
   if ((serverRow.paymentDay ?? null) !== (draft.paymentDay ?? null)) return false;
@@ -3140,6 +3199,7 @@ function recurringDraftToDomain(op: PendingRecurringCreate | PendingRecurringUpd
     dayOfWeek: d.dayOfWeek ?? undefined,
     active: true,
     createdAt: op.enqueuedAt,
+    ...recurringDraftLink(d),
   };
 }
 
@@ -3148,7 +3208,7 @@ function recurringDraftToDomain(op: PendingRecurringCreate | PendingRecurringUpd
  *  (its own separate action — a full edit never touches it) are preserved
  *  from `row`. */
 function applyRecurringFullUpdate(row: RecurringRule, d: NewRecurringDraft): RecurringRule {
-  return {
+  const updated: RecurringRule = {
     ...row,
     name: d.name,
     amount: d.amount,
@@ -3156,6 +3216,16 @@ function applyRecurringFullUpdate(row: RecurringRule, d: NewRecurringDraft): Rec
     frequency: d.frequency,
     dayOfMonth: d.dayOfMonth ?? undefined,
     dayOfWeek: d.dayOfWeek ?? undefined,
+  };
+  // No `paymentMethod` key = the PATCH leaves the stored link alone.
+  if (d.paymentMethod === undefined) return updated;
+  const link = recurringDraftLink(d);
+  return {
+    ...updated,
+    paymentMethod: link.paymentMethod,
+    cardId: link.cardId,
+    sourceAssetId: link.sourceAssetId,
+    destinationAssetId: link.destinationAssetId,
   };
 }
 
@@ -3179,13 +3249,21 @@ export function serverRecurringConfirmsUpdate(
   serverRow: RecurringRule,
   draft: NewRecurringDraft,
 ): boolean {
-  return (
+  const scheduleMatches =
     serverRow.name === draft.name.trim() &&
     Number(serverRow.amount) === Number(draft.amount) &&
     serverRow.category === draft.category &&
     serverRow.frequency === draft.frequency &&
     (serverRow.dayOfMonth ?? null) === draft.dayOfMonth &&
-    (serverRow.dayOfWeek ?? null) === draft.dayOfWeek
+    (serverRow.dayOfWeek ?? null) === draft.dayOfWeek;
+  if (!scheduleMatches) return false;
+  if (draft.paymentMethod === undefined) return true; // link not part of this write
+  const link = recurringDraftLink(draft);
+  return (
+    (serverRow.paymentMethod ?? null) === (link.paymentMethod ?? null) &&
+    (serverRow.cardId ?? null) === (link.cardId ?? null) &&
+    (serverRow.sourceAssetId ?? null) === (link.sourceAssetId ?? null) &&
+    (serverRow.destinationAssetId ?? null) === (link.destinationAssetId ?? null)
   );
 }
 

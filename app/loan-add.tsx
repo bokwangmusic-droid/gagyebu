@@ -13,7 +13,13 @@ import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey } from '@/lib/format';
-import { describeRepayType, formatYearMonth, payoffDate, scheduledPayment } from '@/lib/loan';
+import {
+  describeRepayType,
+  formatYearMonth,
+  payoffDate,
+  projectLoanTotals,
+  scheduledPayment,
+} from '@/lib/loan';
 import { uid } from '@/lib/id';
 import type { RemoteLoanMeta } from '@/lib/remoteFinanceMapping';
 import type { NewLoanDraft } from '@/lib/remoteLoanWriteMapping';
@@ -276,6 +282,7 @@ function LoanForm({ mode }: { mode: FormMode }) {
   const n = parseNum(term);
   const day = Math.min(31, Math.max(1, parseNum(paymentDay) || 1));
   const monthly = p > 0 && n > 0 ? scheduledPayment(p, r, n, repayType) : 0;
+  const totals = projectLoanTotals(p, r, n, repayType);
 
   const principalTooLow = isEdit && p > 0 && p < currentPaid;
   const canSave = name.trim().length > 0 && p > 0 && n > 0 && !principalTooLow;
@@ -665,7 +672,11 @@ function LoanForm({ mode }: { mode: FormMode }) {
             }}
           >
             <Text style={{ fontFamily: fontFamily.semibold, fontSize: 11, color: colors.primaryStrong }}>
-              {repayType === 'equal_principal' ? '첫 달 예상 납입액' : '예상'}
+              {repayType === 'equal_principal'
+                ? '첫 달 예상 납입액'
+                : repayType === 'bullet'
+                  ? '예상 월 이자'
+                  : '예상 월 상환액'}
             </Text>
             <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginTop: 4 }}>
               <Text
@@ -677,7 +688,12 @@ function LoanForm({ mode }: { mode: FormMode }) {
                 {repayType === 'equal_principal' ? '원' : '원 / 월'}
               </Text>
             </View>
-            <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, marginTop: 6 }}>
+            <View style={{ marginTop: spacing.sm, gap: 3 }}>
+              <SummaryRow label="총 원금" value={totals.totalPrincipal} />
+              <SummaryRow label="예상 총 이자" value={totals.totalInterest} />
+              <SummaryRow label="예상 총 상환액" value={totals.totalRepayment} strong />
+            </View>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub, marginTop: spacing.sm }}>
               {describeRepayType(repayType)}
               {repayType === 'bullet' ? ' · 매달 이자만, 원금은 만기 상환' : ''}
               {repayType === 'equal_principal' ? ' · 매달 원금은 같고 이자가 줄어 납입액이 감소해요' : ''}
@@ -692,6 +708,25 @@ function LoanForm({ mode }: { mode: FormMode }) {
         <View style={{ height: activeField ? NUMPAD_SCROLL_CLEARANCE : 0 }} />
       </View>
     </ModalScreen>
+  );
+}
+
+/** Compact label / amount row for the 예상 card's whole-term totals. */
+function SummaryRow({ label, value, strong }: { label: string; value: number; strong?: boolean }) {
+  return (
+    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' }}>
+      <Text style={{ fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub }}>{label}</Text>
+      <Text
+        style={{
+          fontFamily: strong ? fontFamily.bold : fontFamily.semibold,
+          fontSize: 12,
+          color: strong ? colors.primaryStrong : colors.text,
+          ...tabularNums,
+        }}
+      >
+        {fmt(value)}원
+      </Text>
+    </View>
   );
 }
 

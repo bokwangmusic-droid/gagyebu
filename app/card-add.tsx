@@ -6,11 +6,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { FinanceLoadState } from '@/components/FinanceLoadState';
 import { ReadOnlyRouteNotice } from '@/components/ReadOnlyRouteNotice';
-import { Field, HeaderTextButton, TextField } from '@/components/ui/controls';
+import { ChipSelect, Field, HeaderTextButton, TextField } from '@/components/ui/controls';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { NumPad } from '@/components/ui/NumPad';
 import { useToast } from '@/components/ui/Toast';
 import { CAT_COLOR_PALETTE } from '@/data/categories';
+import { describeAccount } from '@/lib/asset';
+import { CARD_TYPE_OPTIONS, cardTypeOf } from '@/lib/card';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { parseNum } from '@/lib/format';
 import { uid } from '@/lib/id';
@@ -22,7 +24,7 @@ import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
 import { usePendingWrites } from '@/store/pendingFinance';
 import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
-import type { CreditCard } from '@/store/types';
+import type { CardType, CreditCard } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily } from '@/theme/typography';
 
@@ -53,19 +55,27 @@ function applyDayKey(cur: string, k: string): string {
  * `string | string[]`, so both are handled.
  */
 export default function CardAddRoute() {
-  const params = useLocalSearchParams<{ id?: string | string[] }>();
+  const params = useLocalSearchParams<{ id?: string | string[]; type?: string | string[] }>();
   const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
+  // Optional `?type=debit` preselects 체크카드 for a new card (the input
+  // screen's 「체크」 panel opens the form this way). Anything else -> 신용카드.
+  const typeParam = Array.isArray(params.type) ? params.type[0] : params.type;
 
   if (idParam) {
     if (!REMOTE_FINANCE_WRITE.cardEdit) return <ReadOnlyRouteNotice title="카드 수정" />;
     return <CardFormRoute editId={idParam} />;
   }
   if (!REMOTE_FINANCE_WRITE.cardCreate) return <ReadOnlyRouteNotice title="카드 등록" />;
-  return <CardForm key="create" mode={{ kind: 'create' }} />;
+  return (
+    <CardForm
+      key="create"
+      mode={{ kind: 'create', initialType: typeParam === 'debit' ? 'debit' : 'credit' }}
+    />
+  );
 }
 
 type FormMode =
-  | { kind: 'create' }
+  | { kind: 'create'; initialType: CardType }
   | { kind: 'edit'; card: CreditCard; meta: RemoteCardMeta };
 
 /**
@@ -181,7 +191,7 @@ function CardForm({ mode }: { mode: FormMode }) {
   const { activeHousehold } = useHousehold();
   // Household finance READ values (status/refresh) come ONLY from the
   // remote read-only source — never useStore().
-  const { status, error, refresh } = useFinanceRead();
+  const { status, error, assets, refresh } = useFinanceRead();
   // STEP 16-H2-C2-A2: durable offline fallback for a card CREATE / UPDATE /
   // soft DELETE whose direct write hit a TRANSPORT failure (offline). Never
   // used for a server/terminal verdict.
@@ -199,6 +209,26 @@ function CardForm({ mode }: { mode: FormMode }) {
   const cardIdRef = useRef(uid('card'));
 
   const [name, setName] = useState(editing?.name ?? '');
+  const [cardType, setCardType] = useState<CardType>(
+    editing ? cardTypeOf(editing) : mode.kind === 'create' ? mode.initialType : 'credit',
+  );
+  const isDebit = cardType === 'debit';
+  // 체크카드 출금 계좌. '' = 연결 안 함. Re-linking only affects NEW
+  // transactions — past ones keep the account copied when they were saved.
+  const [linkedAssetId, setLinkedAssetId] = useState(
+    editing && cardTypeOf(editing) === 'debit' ? editing.linkedAssetId ?? '' : '',
+  );
+  // Choices: active 은행계좌 only, plus the card's current account if it is
+  // still active but no longer a bank account. A soft-deleted account is
+  // never offered — it only shows up as the fallback notice below.
+  const accountOptions = assets
+    .filter((a) => a.type === 'bank' || a.id === linkedAssetId)
+    .map((a) => ({ value: a.id, label: describeAccount(a) }));
+  const linkedAssetMissing = !!linkedAssetId && !assets.some((a) => a.id === linkedAssetId);
+  // A 체크카드 needs an ACTIVE 출금 계좌: its purchases move that account's
+  // balance (DB balance sync), so there is no "연결 안 함" for debit. A legacy
+  // unlinked (or deleted-account) 체크카드 still opens; saving asks for one.
+  const debitNeedsAccount = isDebit && (!linkedAssetId || linkedAssetMissing);
   const [colorIdx, setColorIdx] = useState(() => {
     if (!editing?.color) return 0;
     const i = CAT_COLOR_PALETTE.findIndex(
@@ -230,20 +260,24 @@ function CardForm({ mode }: { mode: FormMode }) {
   };
 
   const trimmedName = name.trim();
-  const canSave = trimmedName.length > 0;
+  const canSave = trimmedName.length > 0 && !debitNeedsAccount;
 
   /** Draft-state -> NewCardDraft, or null when the form isn't valid. */
   const buildDraft = (): NewCardDraft | null => {
     // Defensive re-validation — do NOT lean on DB CHECK for UX.
     if (trimmedName.length === 0) return null;
     if (trimmedName.length > 20) return null;
-    const pd = paymentDay ? parseNum(paymentDay) : undefined;
-    const cd = closingDay ? parseNum(closingDay) : undefined;
+    // 결제일·마감일 are 신용카드-only; a 체크카드 saves none (an edit that turns
+    // a credit card into a debit card clears them).
+    const pd = !isDebit && paymentDay ? parseNum(paymentDay) : undefined;
+    const cd = !isDebit && closingDay ? parseNum(closingDay) : undefined;
     if (pd !== undefined && (pd < 1 || pd > 31)) return null;
     if (cd !== undefined && (cd < 1 || cd > 31)) return null;
     const palette = CAT_COLOR_PALETTE[colorIdx];
     return {
       name: trimmedName,
+      cardType,
+      linkedAssetId: isDebit && linkedAssetId ? linkedAssetId : undefined,
       color: palette ? { bg: palette.bg, color: palette.color } : undefined,
       paymentDay: pd,
       closingDay: cd,
@@ -499,12 +533,46 @@ function CardForm({ mode }: { mode: FormMode }) {
           </View>
         )}
 
+        <Field label="카드 종류">
+          <ChipSelect
+            value={cardType}
+            onChange={(t) => {
+              setCardType(t);
+              if (t === 'debit') setActiveField(null); // day fields disappear
+            }}
+            options={CARD_TYPE_OPTIONS}
+          />
+        </Field>
+
+        {isDebit && (
+          <Field label="출금 계좌" hint="이 카드로 쓴 지출만큼 이 계좌 잔액이 줄어들어요">
+            <ChipSelect value={linkedAssetId} onChange={setLinkedAssetId} options={accountOptions} />
+            {linkedAssetMissing ? (
+              <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.expenseText, marginTop: 6 }}>
+                삭제된 계좌에 연결된 체크카드예요. 출금 계좌를 다시 선택해 주세요.
+              </Text>
+            ) : !linkedAssetId && accountOptions.length > 0 ? (
+              <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.expenseText, marginTop: 6 }}>
+                체크카드는 출금 계좌를 선택해야 저장할 수 있어요.
+              </Text>
+            ) : null}
+            {accountOptions.length === 0 && (
+              <Pressable onPress={() => router.push('/asset-add')} hitSlop={6} style={{ marginTop: 6 }}>
+                <Text style={{ fontFamily: fontFamily.medium, fontSize: 11, color: colors.textSub }}>
+                  등록된 은행계좌가 없어요.{' '}
+                  <Text style={{ fontFamily: fontFamily.bold, color: colors.primaryStrong }}>계좌 등록하기</Text>
+                </Text>
+              </Pressable>
+            )}
+          </Field>
+        )}
+
         <Field label="카드 이름">
           <TextField
             value={name}
             onChangeText={setName}
             onFocus={() => setActiveField(null)}
-            placeholder="예: 현대카드, 삼성카드"
+            placeholder={isDebit ? '예: KB 노리 체크카드' : '예: 현대카드, 삼성카드'}
             maxLength={20}
             autoFocus={!isEdit}
           />
@@ -543,25 +611,29 @@ function CardForm({ mode }: { mode: FormMode }) {
           </View>
         </Field>
 
-        <Field label="결제일 (선택)" hint="매월 카드값이 빠져나가는 날 · 표시용">
-          <NumFieldRow
-            value={paymentDay}
-            suffix="일"
-            placeholder="1~31"
-            active={activeField === 'paymentDay'}
-            onPress={() => openField('paymentDay')}
-          />
-        </Field>
+        {!isDebit && (
+          <>
+            <Field label="결제일 (선택)" hint="매월 카드값이 빠져나가는 날 · 표시용">
+              <NumFieldRow
+                value={paymentDay}
+                suffix="일"
+                placeholder="1~31"
+                active={activeField === 'paymentDay'}
+                onPress={() => openField('paymentDay')}
+              />
+            </Field>
 
-        <Field label="마감일 (선택)" hint="이번 STEP에서는 표시만 하고 계산에는 쓰지 않아요">
-          <NumFieldRow
-            value={closingDay}
-            suffix="일"
-            placeholder="1~31"
-            active={activeField === 'closingDay'}
-            onPress={() => openField('closingDay')}
-          />
-        </Field>
+            <Field label="마감일 (선택)" hint="이번 STEP에서는 표시만 하고 계산에는 쓰지 않아요">
+              <NumFieldRow
+                value={closingDay}
+                suffix="일"
+                placeholder="1~31"
+                active={activeField === 'closingDay'}
+                onPress={() => openField('closingDay')}
+              />
+            </Field>
+          </>
+        )}
 
         <Text
           style={{
@@ -573,8 +645,9 @@ function CardForm({ mode }: { mode: FormMode }) {
             marginBottom: spacing.xxl,
           }}
         >
-          예상 카드값은 카드사 실제 청구일이 아니라 「사용월」 기준으로 계산해요.
-          실제 청구서 금액과 다를 수 있어요.
+          {isDebit
+            ? '체크카드 지출은 바로 지출로 기록되고, 예상 카드값·할부에는 포함되지 않아요.'
+            : '예상 카드값은 카드사 실제 청구일이 아니라 「사용월」 기준으로 계산해요.\n실제 청구서 금액과 다를 수 있어요.'}
         </Text>
       </View>
     </ModalScreen>

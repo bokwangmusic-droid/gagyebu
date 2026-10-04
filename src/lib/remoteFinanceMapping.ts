@@ -32,6 +32,8 @@
  * semantics for that state, not a new one invented here.
  */
 import type { CatOrderMap, CustomCatMap, IconKey } from '@/data/categories';
+import { normalizeAssetDetail, normalizeAssetType } from '@/lib/asset';
+import { normalizePaymentLink } from '@/lib/paymentLink';
 import type { RemoteFinanceRaw } from '@/services/remoteFinance';
 import type {
   Asset,
@@ -71,6 +73,12 @@ export interface RemoteTransactionMeta {
   updatedAt: string;
   createdBy: string | null;
   rawCardId: string | null;
+  /**
+   * `transactions.asset_balance_applied` (20261004001900): whether this row
+   * moves account balances. false for rows created before balance sync.
+   * Only read by the display-only pending-balance overlay.
+   */
+  balanceApplied?: boolean;
 }
 
 /**
@@ -311,6 +319,11 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
   const cards: CreditCard[] = raw.cards.map((c) => ({
     id: c.id,
     name: c.name,
+    // Anything but an explicit 'debit' is a 신용카드 (the column's default).
+    cardType: c.card_type === 'debit' ? 'debit' : 'credit',
+    // Only a 체크카드 carries a 출금 계좌; kept as stored even if that asset
+    // was soft-deleted (the UI shows a "삭제된 계좌" fallback).
+    ...(c.card_type === 'debit' && c.linked_asset_id ? { linkedAssetId: c.linked_asset_id } : {}),
     color: c.color_bg && c.color_fg ? { bg: c.color_bg, color: c.color_fg } : undefined,
     paymentDay: c.payment_day ?? undefined,
     closingDay: c.closing_day ?? undefined,
@@ -371,6 +384,11 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     fromPlanned: t.from_planned ?? undefined,
     paymentMethod: (t.payment_method as PaymentMethod | null) ?? undefined,
     cardId: t.card_id && cardIds.has(t.card_id) ? t.card_id : undefined,
+    // Kept as stored (no "dangling -> undefined" collapse, unlike cardId):
+    // a soft-deleted account stays linked, and an edit carries it through
+    // unchanged, so there is no separate raw value to preserve in meta.
+    sourceAssetId: t.source_asset_id ?? undefined,
+    destinationAssetId: t.destination_asset_id ?? undefined,
     installment: t.installment_months != null ? { months: t.installment_months } : undefined,
     splits: Array.isArray(t.splits) ? (t.splits as TransactionSplit[]) : undefined,
     tags: t.tags ?? undefined,
@@ -388,6 +406,7 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
       // Raw DB card_id, WITHOUT the "dangling -> undefined" collapse the
       // read-model `cardId` above gets. STEP 16-G2-C2 §4.
       rawCardId: t.card_id,
+      balanceApplied: t.asset_balance_applied === true,
     };
   }
 
@@ -413,6 +432,15 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     active: r.active,
     createdAt: r.created_at,
     lastRun: r.last_run ?? undefined,
+    // Payment link kept as stored, but only the fields that fit the rule's
+    // type + method (src/lib/paymentLink.ts); a link to a soft-deleted
+    // card/account is kept and shown with a fallback label.
+    ...normalizePaymentLink(r.type, {
+      paymentMethod: (r.payment_method as PaymentMethod | null) ?? undefined,
+      cardId: r.card_id ?? undefined,
+      sourceAssetId: r.source_asset_id ?? undefined,
+      destinationAssetId: r.destination_asset_id ?? undefined,
+    }),
   }));
 
   // Parallel to `recurring`, keyed by id. `updatedAt` stored verbatim — an
@@ -479,13 +507,22 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
     loanMeta[l.id] = { updatedAt: l.updated_at, createdBy: l.created_by };
   }
 
-  const assets: Asset[] = raw.assets.map((a) => ({
-    id: a.id,
-    name: a.name,
-    type: a.type,
-    balance: a.balance,
-    createdAt: a.created_at,
-  }));
+  const assets: Asset[] = raw.assets.map((a) => {
+    // Unknown / missing stored type -> 기타 자산, never a broken row.
+    const type = normalizeAssetType(a.type);
+    // Legacy rows (no detail) and a detail that no longer fits `type` both
+    // map to "no detail" — the keys are then left off the domain object.
+    const detail = normalizeAssetDetail(type, a.subtype, a.institution);
+    return {
+      id: a.id,
+      name: a.name,
+      type,
+      ...(detail.subtype ? { subtype: detail.subtype } : {}),
+      ...(detail.institution ? { institution: detail.institution } : {}),
+      balance: a.balance,
+      createdAt: a.created_at,
+    };
+  });
 
   // Parallel to `assets`, keyed by id. `updatedAt` stored verbatim — an
   // opaque concurrency token, never formatted/re-parsed (전체자산/순자산 STEP 4).

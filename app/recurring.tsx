@@ -14,6 +14,7 @@ import { useToast } from '@/components/ui/Toast';
 import { getCat, type TxnType } from '@/data/categories';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
+import { describePaymentLink } from '@/lib/paymentLink';
 import { attemptedActiveLabel, pendingRecurringRowLabel } from '@/lib/pendingRecurringLabel';
 import { describeSchedule } from '@/lib/recurring';
 import type { EnqueueOutcome } from '@/services/offlineQueue/coordinator';
@@ -45,6 +46,8 @@ export default function RecurringList() {
     recurringManagementRows,
     pendingRecurringOps,
     customCats,
+    cards,
+    assets,
     refresh,
   } = useFinanceRead();
   const pending = usePendingWrites();
@@ -414,6 +417,18 @@ export default function RecurringList() {
                   <Text style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}>
                     {describeSchedule(r)} · {r.active ? '활성' : '정지'}
                   </Text>
+                  {/* 결제수단 / 입금처 — one muted line, only when recorded. */}
+                  {(() => {
+                    const pay = describePaymentLink(r.type, r, cards, assets);
+                    return pay ? (
+                      <Text
+                        numberOfLines={1}
+                        style={{ fontFamily: fontFamily.regular, fontSize: 10, lineHeight: 12, color: colors.textMuted, ...noPad }}
+                      >
+                        {pay}
+                      </Text>
+                    ) : null;
+                  })()}
                 </View>
                 <Text
                   style={{

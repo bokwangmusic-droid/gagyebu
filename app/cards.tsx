@@ -10,10 +10,13 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import {
   cardBillingForMonth,
+  cardTypeOf,
+  debitSourceAssetId,
   installmentPlan,
   resolveCardKey,
   UNASSIGNED_CARD_ID,
 } from '@/lib/card';
+import { describeAccount } from '@/lib/asset';
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt } from '@/lib/format';
 import { pendingCardRowLabel } from '@/lib/pendingCardLabel';
@@ -21,11 +24,15 @@ import type { FinanceReadResult } from '@/store/financeRead';
 import { useFinanceRead } from '@/store/financeRead';
 import { colors, gradients, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad, tabularNums } from '@/theme/typography';
-import type { CreditCard, Transaction } from '@/store/types';
+import type { Asset, CreditCard, Transaction } from '@/store/types';
 
 interface CardRow {
   id: string;
   name: string;
+  /** 체크카드 rows show no billing / 할부 — a debit purchase is never a card bill. */
+  isDebit?: boolean;
+  /** 체크카드 출금 계좌 line: account label, '삭제된 계좌', or undefined (none linked). */
+  accountLabel?: string;
   color?: { bg: string; color: string };
   paymentDay?: number;
   /** 사용월 기준 이번 달 예상 청구액. */
@@ -47,6 +54,7 @@ interface CardRow {
 function buildRows(
   txns: Transaction[],
   cards: CreditCard[],
+  assets: Asset[],
   managementRows: CreditCard[],
   pendingCardOps: FinanceReadResult['pendingCardOps'],
   now: Date,
@@ -73,6 +81,13 @@ function buildRows(
     return {
       id: c.id,
       name: c.name,
+      isDebit: cardTypeOf(c) === 'debit',
+      accountLabel: (() => {
+        const linked = debitSourceAssetId(c);
+        if (!linked) return undefined;
+        const a = assets.find((x) => x.id === linked);
+        return a ? describeAccount(a) : '삭제된 계좌';
+      })(),
       color: c.color,
       paymentDay: c.paymentDay,
       monthCharge: billing.byCard[c.id] ?? 0,
@@ -108,13 +123,14 @@ export default function CardsList() {
     cardManagementRows,
     pendingCardOps,
     transactions,
+    assets,
     refresh,
   } = useFinanceRead();
   const financeRefresh = useRemoteFinanceRefreshControl();
 
   const { rows, unassigned, total } = useMemo(
-    () => buildRows(transactions, cards, cardManagementRows, pendingCardOps, new Date()),
-    [transactions, cards, cardManagementRows, pendingCardOps],
+    () => buildRows(transactions, cards, assets, cardManagementRows, pendingCardOps, new Date()),
+    [transactions, cards, assets, cardManagementRows, pendingCardOps],
   );
 
   if (status !== 'ready') {
@@ -241,9 +257,15 @@ function CardItem({ row, onPress }: { row: CardRow; onPress?: () => void }) {
           <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 14, color: colors.textMuted, ...noPad }}>
             {isUnassigned
               ? '삭제됐거나 지정되지 않은 카드'
-              : row.paymentDay
-                ? `매월 ${row.paymentDay}일 결제 예정`
-                : '결제일 미설정'}
+              : row.isDebit
+                ? row.accountLabel === '삭제된 계좌'
+                  ? '체크카드 · 삭제된 계좌에 연결된 체크카드예요'
+                  : row.accountLabel
+                    ? `체크카드 · ${row.accountLabel}`
+                    : '체크카드 · 출금 계좌 미연결'
+                : row.paymentDay
+                  ? `신용카드 · 매월 ${row.paymentDay}일 결제 예정`
+                  : '신용카드 · 결제일 미설정'}
           </Text>
           {/* STEP 16-H2-C2-A2 §20: a small muted secondary line for an
               un-sent offline card op — never a banner / red alert. */}
@@ -266,25 +288,32 @@ function CardItem({ row, onPress }: { row: CardRow; onPress?: () => void }) {
         )}
       </View>
 
-      <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginTop: spacing.md }}>
-        <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub }}>
-          사용월 기준 예상
-        </Text>
-        <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 18, color: colors.text, ...tabularNums }}>
-          {fmt(row.monthCharge)}
-        </Text>
-        <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textFaint }}>원</Text>
-      </View>
+      {/* 체크카드: no 청구 예정액 / 할부 — those are 신용카드-only concepts. Still
+          shown if a card switched to 체크 keeps older 「신용」 charges, so the
+          rows always add up to the header total. */}
+      {(!row.isDebit || row.monthCharge > 0 || row.activeInstallments > 0) && (
+        <>
+          <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4, marginTop: spacing.md }}>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textSub }}>
+              사용월 기준 예상
+            </Text>
+            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 18, color: colors.text, ...tabularNums }}>
+              {fmt(row.monthCharge)}
+            </Text>
+            <Text style={{ fontFamily: fontFamily.regular, fontSize: 11, color: colors.textFaint }}>원</Text>
+          </View>
 
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: spacing.sm }}>
-        <Chip
-          label="진행 중 할부"
-          value={row.activeInstallments > 0 ? `${row.activeInstallments}건` : '없음'}
-        />
-        {row.remainingInstallment > 0 && (
-          <Chip label="남은 할부" value={`${fmt(row.remainingInstallment)}원`} />
-        )}
-      </View>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: spacing.sm }}>
+            <Chip
+              label="진행 중 할부"
+              value={row.activeInstallments > 0 ? `${row.activeInstallments}건` : '없음'}
+            />
+            {row.remainingInstallment > 0 && (
+              <Chip label="남은 할부" value={`${fmt(row.remainingInstallment)}원`} />
+            )}
+          </View>
+        </>
+      )}
     </>
   );
 

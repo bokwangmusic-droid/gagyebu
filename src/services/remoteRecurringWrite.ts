@@ -133,7 +133,11 @@ function isSameCreateRow(
     existing.category === row.category &&
     existing.frequency === row.frequency &&
     existing.day_of_month === row.day_of_month &&
-    existing.day_of_week === row.day_of_week
+    existing.day_of_week === row.day_of_week &&
+    (existing.payment_method ?? null) === row.payment_method &&
+    (existing.card_id ?? null) === row.card_id &&
+    (existing.source_asset_id ?? null) === row.source_asset_id &&
+    (existing.destination_asset_id ?? null) === row.destination_asset_id
   );
 }
 
@@ -148,7 +152,13 @@ function recurringFieldsMatch(
     existing.category === row.category &&
     existing.frequency === row.frequency &&
     existing.day_of_month === row.day_of_month &&
-    existing.day_of_week === row.day_of_week
+    existing.day_of_week === row.day_of_week &&
+    // Link columns absent from the PATCH = "left as stored" -> never a mismatch.
+    (!('payment_method' in row) ||
+      ((existing.payment_method ?? null) === row.payment_method &&
+        (existing.card_id ?? null) === row.card_id &&
+        (existing.source_asset_id ?? null) === row.source_asset_id &&
+        (existing.destination_asset_id ?? null) === row.destination_asset_id))
   );
 }
 
@@ -182,7 +192,7 @@ export async function createRecurring(args: {
     const { data: existing, error: readErr } = await supabase
       .from('recurring_rules')
       .select(
-        'id,household_id,created_by,type,name,amount,category,frequency,day_of_month,day_of_week,active,deleted_at',
+        'id,household_id,created_by,type,name,amount,category,frequency,day_of_month,day_of_week,payment_method,card_id,source_asset_id,destination_asset_id,active,deleted_at',
       )
       .eq('household_id', args.householdId)
       .eq('id', args.id)
@@ -261,7 +271,7 @@ export async function updateRecurring(args: {
   // 0 rows — reconcile against the authoritative row.
   const { data: existing, error: readErr } = await supabase
     .from('recurring_rules')
-    .select('name,amount,category,frequency,day_of_month,day_of_week,deleted_at,updated_at')
+    .select('name,amount,category,frequency,day_of_month,day_of_week,payment_method,card_id,source_asset_id,destination_asset_id,deleted_at,updated_at')
     .eq('household_id', args.householdId)
     .eq('id', args.id)
     .maybeSingle();

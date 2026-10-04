@@ -119,6 +119,8 @@ function isSameAssetRequest(
     existing.household_id === row.household_id &&
     existing.name === row.name &&
     existing.type === row.type &&
+    (existing.subtype ?? null) === row.subtype &&
+    (existing.institution ?? null) === row.institution &&
     Number(existing.balance) === row.balance
   );
 }
@@ -131,6 +133,8 @@ function assetFieldsMatch(
   return (
     existing.name === row.name &&
     existing.type === row.type &&
+    (existing.subtype ?? null) === row.subtype &&
+    (existing.institution ?? null) === row.institution &&
     Number(existing.balance) === row.balance
   );
 }
@@ -168,7 +172,7 @@ export async function createAsset(args: {
   if (error?.code === '23505') {
     const { data: existing, error: readErr } = await supabase
       .from('assets')
-      .select('id,household_id,created_by,name,type,balance,deleted_at')
+      .select('id,household_id,created_by,name,type,subtype,institution,balance,deleted_at')
       .eq('household_id', args.householdId)
       .eq('id', args.id)
       .maybeSingle();
@@ -233,7 +237,7 @@ export async function updateAsset(args: {
   // 0 rows — reconcile against the current row (no updated_at / deleted_at filter).
   const { data: existing, error: readErr } = await supabase
     .from('assets')
-    .select('id,name,type,balance,deleted_at,updated_at')
+    .select('id,name,type,subtype,institution,balance,deleted_at,updated_at')
     .eq('household_id', args.householdId)
     .eq('id', args.id)
     .maybeSingle();
