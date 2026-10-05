@@ -10,7 +10,10 @@
     "ios": {
       "bundleIdentifier": "com.ijcompany.ledger",
       "supportsTablet": false,
-      "usesAppleSignIn": true
+      "usesAppleSignIn": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "com.ijcompany.ledger",
