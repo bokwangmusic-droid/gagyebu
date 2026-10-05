@@ -9,6 +9,7 @@ import {
   Keyboard,
   KeyboardAvoidingView,
   type LayoutChangeEvent,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -655,6 +656,8 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   const creditScrollArmRef = useRef(false);
   const installmentScrollArmRef = useRef(false);
   const pendingDirectScrollRef = useRef(false);
+  // "체크" / "이체" chip -> handlePayDetailPanelLayout (bottom-align above pad)
+  const payDetailScrollArmRef = useRef(false);
   // Measured, cached-fresh geometry (all from plain onLayout events):
   const paySectionYRef = useRef(0); // paySection.y in the scroll content
   const creditPanelYRef = useRef(0); // creditPanel.y in paySection
@@ -781,6 +784,29 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   /** 신용카드 panel onLayout — caches its offset within paySection. */
   const handleCreditPanelLayout = (e: LayoutChangeEvent) => {
     creditPanelYRef.current = e.nativeEvent.layout.y;
+  };
+
+  /** 체크카드 / 출금 계좌 panel onLayout. Unlike "신용", picking 체크/이체 keeps
+   *  the number pad open, so the panel that just mounted under the chips
+   *  lands below the pad-shrunk viewport. When armed (a direct 체크/이체 tap),
+   *  BOTTOM-align the panel just above the pad — the smallest scroll that
+   *  uncovers it — but never further than top-aligning the 결제수단 section,
+   *  so a panel taller than the viewport still shows from its heading down. */
+  const handlePayDetailPanelLayout = (e: LayoutChangeEvent) => {
+    if (!payDetailScrollArmRef.current) return;
+    payDetailScrollArmRef.current = false;
+    const viewportH = formViewportHeightRef.current;
+    if (viewportH <= 0) return;
+    const { y: panelY, height: panelH } = e.nativeEvent.layout;
+    const panelBottom = paySectionYRef.current + panelY + panelH;
+    const y = Math.min(
+      panelBottom - viewportH + CREDIT_SCROLL_HEADROOM,
+      paySectionYRef.current - CREDIT_SCROLL_HEADROOM,
+    );
+    if (y <= 0) return; // already fully visible from the top of the form
+    requestAnimationFrame(() => {
+      formScrollRef.current?.scrollTo({ y, animated: true });
+    });
   };
 
   /** 할부 상세 block onLayout — caches its y + height; when the "할부" intent
@@ -1544,6 +1570,16 @@ function TransactionForm({ mode }: { mode: FormMode }) {
                           // about to render is brought into view.
                           creditScrollArmRef.current = true;
                         }
+                        // -> 체크 / 이체 by a DIRECT user tap: the pad stays
+                        // open, so arm the one-shot scroll that lifts the
+                        // detail panel about to render above it. Any other
+                        // tap disarms a stale intent. iOS only — this was
+                        // an iOS-reported issue; on Android the ref never
+                        // arms, so handlePayDetailPanelLayout stays a no-op.
+                        payDetailScrollArmRef.current =
+                          Platform.OS === 'ios' &&
+                          !active &&
+                          (pm.value === 'debit' || pm.value === 'transfer');
                       }}
                       style={[styles.payChip, active && styles.payChipOn]}
                     >
@@ -1696,7 +1732,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
 
               {/* 체크카드 — 즉시 지출: no 할부, never part of the 예상 카드값. */}
               {paymentMethod === 'debit' && (
-                <View style={styles.creditPanel}>
+                <View style={styles.creditPanel} onLayout={handlePayDetailPanelLayout}>
                   <Text style={styles.creditLabel}>체크카드</Text>
                   <View style={styles.payChipRow}>
                     {debitCards.map((c) => {
@@ -1753,7 +1789,7 @@ function TransactionForm({ mode }: { mode: FormMode }) {
 
               {/* 이체 — 출금 계좌; the DB trigger takes the amount out of it on save. */}
               {paymentMethod === 'transfer' && (
-                <View style={styles.creditPanel}>
+                <View style={styles.creditPanel} onLayout={handlePayDetailPanelLayout}>
                   <Text style={styles.creditLabel}>출금 계좌</Text>
                   <View style={styles.payChipRow}>
                     {accounts.map((a) => {
@@ -2275,8 +2311,10 @@ const styles = StyleSheet.create({
     // "too flat" — total vertical padding kept the same as before (14),
     // just made symmetric (was 10/4, now 7/7) so the text doesn't sag
     // toward the bottom of the card.
-    paddingTop: 7,
-    paddingBottom: 7,
+    // iOS: the amount's line box is 12px taller there (see `amount.lineHeight`),
+    // so the padding gives those 12px back — the card stays 58px tall on both.
+    paddingTop: Platform.OS === 'ios' ? 1 : 7,
+    paddingBottom: Platform.OS === 'ios' ? 1 : 7,
     // 1px transparent border kept in the base style so toggling the active
     // state never shifts the layout by a pixel.
     borderRadius: radii.lg,
@@ -2307,7 +2345,15 @@ const styles = StyleSheet.create({
     ...noPad,
     // BATCH: lineHeight trimmed to match fontSize exactly (was 46, a 2px
     // excess) so the glyph box has no residual offset to center within.
-    lineHeight: 44,
+    //
+    // iOS: `includeFontPadding` / `textAlignVertical` are Android-only, so
+    // nothing re-centres the glyph inside a 44px box there. Noto Sans KR's
+    // own line box is ≈1.45em (≈64px at 44) and iOS keeps the descent
+    // (≈13px) at the bottom of whatever lineHeight it is given — leaving
+    // ≈31px above the baseline for digits that are ≈32px tall, so their tops
+    // were drawn outside the Text's bounds and clipped. 56 leaves ≈11px
+    // above / ≈13px below the digits.
+    lineHeight: Platform.OS === 'ios' ? 56 : 44,
     textAlignVertical: 'center',
   },
   unit: {
