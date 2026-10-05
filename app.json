@@ -8,7 +8,9 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "bundleIdentifier": "com.ijcompany.ledger",
+      "supportsTablet": false,
+      "usesAppleSignIn": true
     },
     "android": {
       "package": "com.ijcompany.ledger",
@@ -33,7 +35,8 @@
           "backgroundColor": "#FAF6EE"
         }
       ],
-      "expo-status-bar"
+      "expo-status-bar",
+      "expo-apple-authentication"
     ],
     "experiments": {
       "typedRoutes": true

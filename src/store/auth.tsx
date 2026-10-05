@@ -20,6 +20,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { Platform } from 'react-native';
 
 import { clearPersistedSupabaseAuth, supabase } from '@/lib/supabase';
 
@@ -65,6 +66,15 @@ export type SignUpResult =
   | { ok: true; needsEmailConfirmation: boolean }
   | { ok: false; message: string };
 
+/**
+ * `canceled: true` = the user dismissed Apple's own sheet — not an error, so
+ * the caller must stay silent (no toast) instead of showing `message`.
+ */
+export type AppleSignInResult =
+  | { ok: true }
+  | { ok: false; canceled: true }
+  | { ok: false; canceled: false; message: string };
+
 interface AuthContextValue {
   session: Session | null;
   user: User | null;
@@ -97,6 +107,16 @@ interface AuthContextValue {
    * here.
    */
   signInWithKakao(): Promise<AuthActionResult>;
+  /**
+   * iOS-only native Sign in with Apple. Unlike `signInWithKakao` there is no
+   * browser round-trip: Apple's sheet returns an identity token in-process,
+   * which `supabase.auth.signInWithIdToken({ provider: 'apple' })` exchanges
+   * for a session — so `{ok:true}` here DOES mean signed in, and the existing
+   * `onAuthStateChange` subscription + app/_layout.tsx's AuthGate take over
+   * from there (no navigation from the caller). Sign-up and sign-in are the
+   * same call: Supabase creates the auth.users row on first use.
+   */
+  signInWithApple(): Promise<AppleSignInResult>;
   signOut(): Promise<void>;
   /**
    * AUTH-F2-B — local-only session cleanup AFTER the delete-account Edge
@@ -172,6 +192,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState(false);
   const mountedRef = useRef(true);
+  // Bumped whenever signInWithApple writes the profile row itself, so a
+  // profile fetch that started BEFORE that write (the session effect below
+  // races it on a fresh sign-in) can't land afterwards and put the old name
+  // back.
+  const profileWriteSeqRef = useRef(0);
 
   // ---- restore + subscribe ----
   useEffect(() => {
@@ -215,6 +240,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     let cancelled = false;
+    const writeSeqAtStart = profileWriteSeqRef.current;
     setProfileLoading(true);
     (async () => {
       const { data, error } = await supabase
@@ -223,6 +249,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .eq('id', uid)
         .maybeSingle();
       if (cancelled) return;
+      // A newer authoritative row was already adopted while this was in flight.
+      if (profileWriteSeqRef.current !== writeSeqAtStart) return;
       if (error || !data) {
         setProfile(null);
         setProfileError(true);
@@ -292,6 +320,120 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return { ok: false, message: '카카오 로그인 페이지를 열지 못했어요. 잠시 후 다시 시도해주세요' };
     }
     return { ok: true };
+  }, []);
+
+  /**
+   * Sign in with Apple — see the interface doc above for the flow.
+   *
+   * Both native modules are imported lazily, inside the iOS-only branch:
+   * `expo-crypto` resolves its native module eagerly at import time, so a
+   * top-level import here would run on Android at app start too — including
+   * on an already-shipped binary that predates these modules and receives
+   * this JS as an OTA update.
+   *
+   * Nonce: Apple embeds whatever nonce it is given into the identity token
+   * verbatim, and Supabase verifies `sha256(nonce it receives) === token's
+   * nonce claim`. So Apple gets the SHA-256 hex digest and Supabase gets the
+   * raw value — the raw nonce never leaves this function except to Supabase.
+   */
+  const signInWithApple: AuthContextValue['signInWithApple'] = useCallback(async () => {
+    const unavailable: AppleSignInResult = {
+      ok: false,
+      canceled: false,
+      message: '이 기기에서는 Apple 로그인을 사용할 수 없어요',
+    };
+    if (Platform.OS !== 'ios') return unavailable;
+
+    try {
+      const AppleAuthentication = await import('expo-apple-authentication');
+      const Crypto = await import('expo-crypto');
+      if (!(await AppleAuthentication.isAvailableAsync())) return unavailable;
+
+      const rawNonce = Crypto.randomUUID();
+      const hashedNonce = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        rawNonce,
+      );
+
+      const credential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+        nonce: hashedNonce,
+      });
+      if (!credential.identityToken) {
+        return {
+          ok: false,
+          canceled: false,
+          message: 'Apple 로그인 정보를 받지 못했어요. 잠시 후 다시 시도해주세요',
+        };
+      }
+
+      const { data, error } = await supabase.auth.signInWithIdToken({
+        provider: 'apple',
+        token: credential.identityToken,
+        nonce: rawNonce,
+      });
+      if (error) return { ok: false, canceled: false, message: describeAuthError(error) };
+
+      // Apple hands over the name ONLY on the very first authorization (and
+      // only if the user shares it) — every later sign-in has it null, so
+      // this is the one chance to record it. The session is already live at
+      // this point; nothing below may turn a successful sign-in into a
+      // failure.
+      let appleName = '';
+      if (credential.fullName) {
+        try {
+          appleName = AppleAuthentication.formatFullName(credential.fullName).trim();
+        } catch {
+          appleName = [credential.fullName.familyName, credential.fullName.givenName]
+            .filter(Boolean)
+            .join('')
+            .trim();
+        }
+      }
+      const user = data.user;
+      if (appleName && user) {
+        // Only replace a name the handle_new_user() trigger auto-filled
+        // (email local-part, or '나'). Apple re-sends fullName if the user
+        // revokes and re-authorizes the app, and that must not clobber a name
+        // they have since chosen themselves in the profile tab. Same
+        // self-only RLS path as updateDisplayName; the extra `.in(...)` makes
+        // check-and-write a single atomic statement.
+        const autoFilledNames = ['나'];
+        const emailLocalPart = user.email?.split('@')[0];
+        if (emailLocalPart) autoFilledNames.push(emailLocalPart);
+        try {
+          const { data: row } = await supabase
+            .from('profiles')
+            .update({ display_name: appleName })
+            .eq('id', user.id)
+            .in('display_name', autoFilledNames)
+            .select('id, display_name')
+            .maybeSingle();
+          if (row && mountedRef.current) {
+            profileWriteSeqRef.current += 1;
+            setProfile({ id: row.id, displayName: row.display_name });
+            setProfileError(false);
+            setProfileLoading(false);
+          }
+        } catch {
+          // Best-effort: the name stays editable from the profile tab.
+        }
+      }
+
+      return { ok: true };
+    } catch (e) {
+      if ((e as { code?: unknown } | null)?.code === 'ERR_REQUEST_CANCELED') {
+        return { ok: false, canceled: true };
+      }
+      return {
+        ok: false,
+        canceled: false,
+        message: 'Apple 로그인에 실패했어요. 잠시 후 다시 시도해주세요',
+      };
+    }
   }, []);
 
   const signOut = useCallback(async () => {
@@ -426,6 +568,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signUp,
       signIn,
       signInWithKakao,
+      signInWithApple,
       signOut,
       clearLocalSessionAfterAccountDeletion,
       resetPasswordForEmail,
@@ -441,6 +584,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signUp,
       signIn,
       signInWithKakao,
+      signInWithApple,
       signOut,
       clearLocalSessionAfterAccountDeletion,
       resetPasswordForEmail,

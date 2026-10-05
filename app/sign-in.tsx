@@ -1,3 +1,4 @@
+import * as AppleAuthentication from 'expo-apple-authentication';
 import { useRouter } from 'expo-router';
 import { useRef, useState } from 'react';
 import { Platform, Pressable, Text, TextInput, View } from 'react-native';
@@ -14,7 +15,7 @@ import { fontFamily } from '@/theme/typography';
 export default function SignIn() {
   const router = useRouter();
   const toast = useToast();
-  const { signIn, signInWithKakao } = useAuth();
+  const { signIn, signInWithKakao, signInWithApple } = useAuth();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -38,6 +39,25 @@ export default function SignIn() {
     kakaoSubmittingRef.current = false;
     setKakaoSubmitting(false);
     if (!result.ok) {
+      toast.show(result.message);
+    }
+  };
+
+  // Sign in with Apple (iOS only) — same ref-guard pattern as Kakao above.
+  // Unlike Kakao, `{ok:true}` here already means a live session, so AuthGate
+  // navigates on its own; a user-cancelled sheet is not an error and stays
+  // silent.
+  const [appleSubmitting, setAppleSubmitting] = useState(false);
+  const appleSubmittingRef = useRef(false);
+
+  const onApplePress = async () => {
+    if (appleSubmittingRef.current) return;
+    appleSubmittingRef.current = true;
+    setAppleSubmitting(true);
+    const result = await signInWithApple();
+    appleSubmittingRef.current = false;
+    setAppleSubmitting(false);
+    if (!result.ok && !result.canceled) {
       toast.show(result.message);
     }
   };
@@ -175,6 +195,25 @@ export default function SignIn() {
             {kakaoSubmitting ? '카카오 로그인 여는 중...' : '카카오로 로그인'}
           </Text>
         </Pressable>
+
+        {/* Sign in with Apple — iOS 전용. Apple 공식 시스템 버튼이라 문구는
+            기기 언어에 맞춰 자동 표기되고(한국어: "Apple로 로그인"), 색/라운드는
+            style이 아닌 buttonStyle/cornerRadius로만 지정해야 한다. 네이티브
+            버튼에는 disabled prop이 없어 진행 중에는 감싼 View로 터치를 막는다. */}
+        {Platform.OS === 'ios' ? (
+          <View
+            pointerEvents={appleSubmitting ? 'none' : 'auto'}
+            style={{ marginTop: 10, opacity: appleSubmitting ? 0.6 : 1 }}
+          >
+            <AppleAuthentication.AppleAuthenticationButton
+              buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+              buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+              cornerRadius={radii.xl}
+              style={{ width: '100%', height: 48 }}
+              onPress={() => void onApplePress()}
+            />
+          </View>
+        ) : null}
       </View>
 
       <Pressable
