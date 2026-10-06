@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import { useMemo } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Platform, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { FinanceLoadState } from '@/components/FinanceLoadState';
@@ -229,7 +229,25 @@ export default function HomeScreen() {
             <AppIcon name="chev-right" size={16} color={colors.textFaint} />
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, marginTop: 2 }}>
-            <Text style={{ fontFamily: fontFamily.extrabold, fontSize: 34, lineHeight: 34, letterSpacing: -1, color: colors.text, ...noPad, ...tabularNums }}>
+            <Text
+              style={{
+                fontFamily: fontFamily.extrabold,
+                fontSize: 34,
+                // iOS-only clipping fix: `includeFontPadding` (noPad below) is
+                // Android-only, so nothing re-centres the glyph inside the
+                // lineHeight box on iOS — same root cause already fixed for
+                // the input screen's amount text (see `amount` style in
+                // app/input.tsx). lineHeight:34 (== fontSize) left no
+                // headroom above the baseline, clipping extrabold Noto Sans
+                // KR digits' tops. Android keeps 34 — noPad already trims
+                // its font padding tightly there, and it isn't broken.
+                lineHeight: Platform.OS === 'ios' ? 44 : 34,
+                letterSpacing: -1,
+                color: colors.text,
+                ...noPad,
+                ...tabularNums,
+              }}
+            >
               {fmt(expense)}
             </Text>
             <Text style={{ fontFamily: fontFamily.medium, fontSize: 16, color: colors.textSub, ...noPad }}>원</Text>

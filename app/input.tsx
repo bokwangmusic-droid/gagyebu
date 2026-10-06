@@ -658,11 +658,26 @@ function TransactionForm({ mode }: { mode: FormMode }) {
   const pendingDirectScrollRef = useRef(false);
   // "체크" / "이체" chip -> handlePayDetailPanelLayout (bottom-align above pad)
   const payDetailScrollArmRef = useRef(false);
+  // iOS ONLY — 메모 입력칸 focus -> keyboard-above-결제수단 fix. The system
+  // keyboard (unlike the in-app number pad) isn't a normal-flow sibling, so
+  // nothing shrinks the ScrollView for it on its own; a KeyboardAvoidingView
+  // now wraps the scroll+keypad area (iOS-only, see the render below) so the
+  // keyboard DOES shrink the ScrollView natively, same as the pad does. This
+  // arms on a direct 메모 focus (armed only when 결제수단 section exists, i.e.
+  // type === 'expense') and is consumed by the NEXT viewport-shrink layout —
+  // the keyboard sliding in — to bottom-align the 결제수단 chip row above it,
+  // exactly like `scrollInstallmentAbovePad` does for the pad. Android never
+  // arms this (KeyboardAvoidingView is a no-op there), so it's a true no-op.
+  const memoKeyboardScrollArmRef = useRef(false);
   // Measured, cached-fresh geometry (all from plain onLayout events):
   const paySectionYRef = useRef(0); // paySection.y in the scroll content
   const creditPanelYRef = useRef(0); // creditPanel.y in paySection
   const installmentBlockYRef = useRef(0); // 할부 상세 block.y in creditPanel
   const installmentBlockHeightRef = useRef(0); // 할부 상세 block height
+  // 결제수단 button row (칩 row) — y within paySection + its own height, used
+  // by `scrollPayRowAboveKeyboard` only (see above).
+  const payMethodRowYRef = useRef(0);
+  const payMethodRowHeightRef = useRef(0);
   const formViewportHeightRef = useRef(0); // ScrollView's own visible height
   // 메모 입력칸 first-open reveal — see `maybeRevealMemoRowOnce` below.
   const memoRowYRef = useRef(0); // memoRow.y directly in the scroll content
@@ -707,13 +722,42 @@ function TransactionForm({ mode }: { mode: FormMode }) {
     formScrollRef.current?.scrollTo({ y: Math.max(0, y), animated: true });
   };
 
+  /** iOS only: bottom-align the 결제수단 button row just above the system
+   *  keyboard, armed by a direct 메모 focus (`memoKeyboardScrollArmRef`) and
+   *  consumed once the KeyboardAvoidingView has already shrunk the
+   *  ScrollView for the keyboard — same measured, no-fixed-pixel approach as
+   *  `scrollInstallmentAbovePad`. A no-op for 수입 (paySectionYRef never
+   *  measured there, since 결제수단 section doesn't render) or before the row
+   *  itself has been measured. */
+  const scrollPayRowAboveKeyboard = () => {
+    const viewportH = formViewportHeightRef.current;
+    const rowH = payMethodRowHeightRef.current;
+    const paySectionY = paySectionYRef.current;
+    if (viewportH <= 0 || rowH <= 0 || paySectionY <= 0) return;
+    const rowBottom = paySectionY + payMethodRowYRef.current + rowH;
+    const y =
+      rowH + CREDIT_SCROLL_HEADROOM * 2 <= viewportH
+        ? rowBottom - viewportH + CREDIT_SCROLL_HEADROOM // bottom-align
+        : paySectionY - CREDIT_SCROLL_HEADROOM; // row bigger than viewport (never happens)
+    if (y <= 0) return; // already fully visible — do nothing
+    formScrollRef.current?.scrollTo({ y: Math.max(0, y), animated: true });
+  };
+
   /** ScrollView onLayout — records its real visible height. When a "직접"
    *  scroll is pending (set only by a direct 직접 tap while the pad was
    *  closed), this fires right after the pad mounts and shrinks the
-   *  ScrollView, so the measured height is already the post-shrink one. */
+   *  ScrollView, so the measured height is already the post-shrink one.
+   *  Same for a 메모-focus keyboard scroll (iOS only; see
+   *  `memoKeyboardScrollArmRef`) — the KeyboardAvoidingView around the
+   *  scroll+keypad area shrinks the ScrollView for the system keyboard the
+   *  same way, firing this same onLayout. */
   const handleFormScrollLayout = (e: LayoutChangeEvent) => {
     formViewportHeightRef.current = e.nativeEvent.layout.height;
     maybeRevealMemoRowOnce();
+    if (memoKeyboardScrollArmRef.current) {
+      memoKeyboardScrollArmRef.current = false;
+      requestAnimationFrame(scrollPayRowAboveKeyboard);
+    }
     if (!pendingDirectScrollRef.current) return;
     pendingDirectScrollRef.current = false;
     requestAnimationFrame(scrollInstallmentAbovePad);
@@ -1216,7 +1260,31 @@ function TransactionForm({ mode }: { mode: FormMode }) {
       </View>
 
       {/* One vertical scroll for the whole form — only the header above and the
-          keypad below stay fixed. */}
+          keypad below stay fixed.
+
+          iOS BUG FIX (메모 입력 중 결제수단 버튼 가림): the custom number pad is a
+          normal-flow sibling of the ScrollView, so opening it already
+          flex-shrinks the ScrollView and the existing onLayout-driven
+          auto-scroll machinery handles it. The SYSTEM keyboard (memo field)
+          is not — iOS never natively resizes this view for it the way
+          Android's windowSoftInputMode does, so without help the keyboard
+          simply overlaid the 결제수단 buttons.
+
+          ANDROID RENDER-TREE PARITY: Android is mid Google Play production
+          review on the pre-existing tree (root > header > ScrollView,
+          numPad/collapsedBar) and must not gain ANY new node there — not
+          even a disabled KeyboardAvoidingView, which still mounts a real
+          native View regardless of `enabled`. The IIFE below builds the
+          exact same `content` (a Fragment — no native node of its own) on
+          both platforms; only iOS wraps it in a KeyboardAvoidingView (which
+          shrinks the ScrollView for the system keyboard the same way the
+          numPad already does, reusing the same measured auto-scroll path:
+          see `scrollPayRowAboveKeyboard`, `memoKeyboardScrollArmRef`).
+          Android's branch returns `content` bare, so its native tree is
+          byte-for-byte what it was before this fix. */}
+      {(() => {
+        const content = (
+          <>
       <ScrollView
         ref={formScrollRef}
         style={styles.formScroll}
@@ -1349,7 +1417,18 @@ function TransactionForm({ mode }: { mode: FormMode }) {
           <TextInput
             value={memo}
             onChangeText={setMemo}
-            onFocus={() => setPadVisible(false)}
+            onFocus={() => {
+              setPadVisible(false);
+              // iOS only: arm the keyboard-above-결제수단 scroll (no-op for
+              // 수입, where there's no 결제수단 section to reveal). See
+              // `memoKeyboardScrollArmRef`'s doc comment above.
+              if (Platform.OS === 'ios' && type === 'expense') {
+                memoKeyboardScrollArmRef.current = true;
+              }
+            }}
+            onBlur={() => {
+              memoKeyboardScrollArmRef.current = false;
+            }}
             keyboardType="default"
             placeholder="메모 (선택)"
             placeholderTextColor={colors.textMuted}
@@ -1548,7 +1627,13 @@ function TransactionForm({ mode }: { mode: FormMode }) {
           {type === 'expense' && (
             <View style={styles.paySection} onLayout={handlePaySectionLayout}>
               <Text style={styles.catLabel}>결제수단 (선택)</Text>
-              <View style={styles.payMethodRow}>
+              <View
+                style={styles.payMethodRow}
+                onLayout={(e) => {
+                  payMethodRowYRef.current = e.nativeEvent.layout.y;
+                  payMethodRowHeightRef.current = e.nativeEvent.layout.height;
+                }}
+              >
                 {PAY_METHODS.map((pm) => {
                   const active = paymentMethod === pm.value;
                   return (
@@ -1984,6 +2069,16 @@ function TransactionForm({ mode }: { mode: FormMode }) {
           </Pressable>
         </View>
       )}
+          </>
+        );
+        return Platform.OS === 'ios' ? (
+          <KeyboardAvoidingView style={styles.formArea} behavior="padding">
+            {content}
+          </KeyboardAvoidingView>
+        ) : (
+          content
+        );
+      })()}
 
       {/* Date sheet */}
       <CalendarSheet
@@ -2294,6 +2389,10 @@ const styles = StyleSheet.create({
   // The whole form scrolls as one; `formContent` reserves room at the bottom so
   // the last field (결제수단 / 카드 / 할부) clears the fixed keypad and can be
   // pulled fully into view, not just left half-hidden behind it.
+  // Wraps the ScrollView + keypad/collapsed-bar area in a KeyboardAvoidingView
+  // (iOS-only behavior, see the render) — purely a layout pass-through, so it
+  // must take the same flex:1 the ScrollView used to claim directly from root.
+  formArea: { flex: 1 },
   formScroll: { flex: 1 },
   formContent: { flexGrow: 1, paddingTop: spacing.xs, paddingBottom: 32 },
 
