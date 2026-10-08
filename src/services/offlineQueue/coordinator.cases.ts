@@ -2294,6 +2294,148 @@ export async function runCoordinatorCases(): Promise<{
     );
   }
 
+  /* ============ household finance reset — clearPendingForHousehold ============ */
+
+  // HR1 — removes ONLY the target `${userId}:${householdId}` records; the same
+  // user's other household and another account's records stay durable.
+  {
+    const A2: CoordinatorScope = { userId: 'u-A', householdId: 'h-A2' };
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCreate(() => Promise.resolve(TRANSPORT));
+    await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr1-a', payload: draft() });
+    await h.coord.enqueueTransactionCreate({ scope: A2, entityId: 'txn-hr1-a2', payload: draft() });
+    await h.coord.enqueueTransactionCreate({ scope: B, entityId: 'txn-hr1-b', payload: draft() });
+    await settle();
+    const out = await h.coord.clearPendingForHousehold(A.userId, A.householdId);
+    const dump = h.storage.dump() ?? '';
+    check(
+      'HR1 clearPendingForHousehold drops only the target scope from durable storage',
+      out.ok === true &&
+        !dump.includes('txn-hr1-a"') &&
+        dump.includes('txn-hr1-a2') &&
+        dump.includes('txn-hr1-b') &&
+        h.coord.getState().pendingCount === 0,
+      `ok=${out.ok} pending=${h.coord.getState().pendingCount} dump=${dump.length}`,
+    );
+  }
+
+  // HR2 — terminal-failed marker + lastError of the purged scope are cleared
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCreate(() => Promise.resolve({ ok: false, message: 'rejected' }));
+    await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr2', payload: draft() });
+    await settle();
+    const before = h.coord.getState();
+    await h.coord.clearPendingForHousehold(A.userId, A.householdId);
+    const after = h.coord.getState();
+    check(
+      'HR2 clearPendingForHousehold clears the failed marker / lastError with the records',
+      before.failedIds.has('txn-hr2') &&
+        after.failedIds.size === 0 &&
+        after.failedReasons.size === 0 &&
+        after.lastError === null &&
+        after.scopeOps.length === 0,
+      `beforeFailed=${before.failedIds.has('txn-hr2')} afterFailed=${after.failedIds.size} lastError=${after.lastError}`,
+    );
+  }
+
+  // HR3 — a purged CREATE is never sent afterwards, even once the server is reachable
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCreate(() => Promise.resolve(TRANSPORT));
+    await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr3', payload: draft() });
+    await settle();
+    await h.coord.clearPendingForHousehold(A.userId, A.householdId);
+    const sentBefore = h.createLog.length;
+    h.setCreate((args) => {
+      h.createLog.push({ id: args.id, householdId: args.householdId, expectedUserId: args.expectedUserId, knownCardIds: args.knownCardIds });
+      h.serverPut(args.id, args.draft);
+      return Promise.resolve({ ok: true, id: args.id });
+    });
+    h.coord.requestFlush();
+    h.runTimers();
+    await settle(6);
+    check(
+      'HR3 purged record is not replayed onto the reset household',
+      h.createLog.length === sentBefore && !h.server.has('txn-hr3'),
+      `sent ${sentBefore}->${h.createLog.length} onServer=${h.server.has('txn-hr3')}`,
+    );
+  }
+
+  // HR4 — the freeze is lifted afterwards: a NEW write enqueues and flushes normally
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    await h.coord.clearPendingForHousehold(A.userId, A.householdId);
+    const enq = await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr4', payload: draft() });
+    await settle(6);
+    check(
+      'HR4 queue accepts and sends new writes after a household purge',
+      enq.ok === true && h.createLog.some((c) => c.id === 'txn-hr4'),
+      `enq=${JSON.stringify(enq)} sent=${h.createLog.map((c) => c.id)}`,
+    );
+  }
+
+  // HR5 — persist failure: reports failure, keeps the records, still lifts the freeze
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCreate(() => Promise.resolve(TRANSPORT));
+    await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr5', payload: draft() });
+    await settle();
+    h.storage.failSet(1);
+    const out = await h.coord.clearPendingForHousehold(A.userId, A.householdId);
+    const enq = await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr5b', payload: draft() });
+    check(
+      'HR5 persist failure -> { ok:false }, records kept, queue usable again',
+      out.ok === false &&
+        (h.storage.dump() ?? '').includes('txn-hr5') &&
+        h.coord.getState().pendingIds.has('txn-hr5') &&
+        enq.ok === true,
+      `out=${JSON.stringify(out)} enq=${JSON.stringify(enq)}`,
+    );
+  }
+
+  // HR6 — never lifts an account-deletion freeze it did not take itself
+  {
+    const h = makeHarness();
+    await h.coord.hydrate();
+    await h.coord.pauseForAccountDeletion();
+    await h.coord.clearPendingForHousehold(A.userId, A.householdId);
+    const frozen = await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr6', payload: draft() });
+    h.coord.resumeAfterAccountDeletionFailure();
+    const resumed = await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr6b', payload: draft() });
+    check(
+      'HR6 account-deletion freeze survives a household purge; its own resume still works',
+      frozen.ok === false && resumed.ok === true,
+      `frozen=${JSON.stringify(frozen)} resumed=${JSON.stringify(resumed)}`,
+    );
+  }
+
+  // HR7 — clearPendingForAccount is unchanged: still drops every household of the user
+  {
+    const A2: CoordinatorScope = { userId: 'u-A', householdId: 'h-A2' };
+    const h = makeHarness();
+    await h.coord.hydrate();
+    h.setCreate(() => Promise.resolve(TRANSPORT));
+    await h.coord.enqueueTransactionCreate({ scope: A, entityId: 'txn-hr7-a', payload: draft() });
+    await h.coord.enqueueTransactionCreate({ scope: A2, entityId: 'txn-hr7-a2', payload: draft() });
+    await h.coord.enqueueTransactionCreate({ scope: B, entityId: 'txn-hr7-b', payload: draft() });
+    await settle();
+    const out = await h.coord.clearPendingForAccount('u-A');
+    const dump = h.storage.dump() ?? '';
+    check(
+      'HR7 clearPendingForAccount still removes all of the user\'s households, keeps other accounts',
+      out.ok === true &&
+        !dump.includes('txn-hr7-a') &&
+        dump.includes('txn-hr7-b'),
+      `ok=${out.ok} dump=${dump.length}`,
+    );
+  }
+
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };
 }

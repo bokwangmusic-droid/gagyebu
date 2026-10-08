@@ -330,6 +330,8 @@ export interface RemoteHouseholdSettings {
   notes: string;
   cat_order_expense: string[];
   cat_order_income: string[];
+  /** Set by `reset_household_finance_data()` on every household-wide reset; `null` = never reset. */
+  data_reset_at: string | null;
 }
 
 export interface RemoteFinanceRaw {
@@ -453,7 +455,7 @@ export async function fetchHouseholdFinanceSnapshot(
       .is('deleted_at', null),
     supabase
       .from('household_settings')
-      .select('notes,cat_order_expense,cat_order_income')
+      .select('notes,cat_order_expense,cat_order_income,data_reset_at')
       .eq('household_id', householdId)
       .maybeSingle(),
     supabase
@@ -498,4 +500,30 @@ export async function fetchHouseholdFinanceSnapshot(
       goalMovementsCount: goalMovementsRes.count ?? 0,
     },
   };
+}
+
+export type HouseholdResetMarkerResult = { ok: true; value: string | null } | { ok: false };
+
+/**
+ * The household's current `household_settings.data_reset_at`, and nothing
+ * else — the offline queue reads this right before a flush pass
+ * (src/services/offlineQueue/coordinator.ts) to make sure the household was
+ * not reset since this device last looked. SELECT-only, one row, one column.
+ * A missing row (not a member any more / bootstrap row gone) is a failure,
+ * never "null": the caller must not send on an answer it cannot trust.
+ */
+export async function fetchHouseholdResetMarker(
+  householdId: string,
+): Promise<HouseholdResetMarkerResult> {
+  try {
+    const { data, error } = await supabase
+      .from('household_settings')
+      .select('data_reset_at')
+      .eq('household_id', householdId)
+      .maybeSingle();
+    if (error || !data) return { ok: false };
+    return { ok: true, value: (data as { data_reset_at: string | null }).data_reset_at ?? null };
+  } catch {
+    return { ok: false };
+  }
 }

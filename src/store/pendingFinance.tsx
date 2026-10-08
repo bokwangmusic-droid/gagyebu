@@ -21,11 +21,16 @@ import {
   useMemo,
   useReducer,
   useRef,
+  useState,
   type ReactNode,
 } from 'react';
 import { AppState, type AppStateStatus } from 'react-native';
 
 import type { Category } from '@/data/categories';
+import {
+  RESET_MARKERS_STORAGE_KEY,
+  createResetMarkerStore,
+} from '@/lib/householdResetMarker';
 import type { PendingWrite } from '@/lib/offlineQueue';
 import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
@@ -35,6 +40,7 @@ import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMa
 import type { NewLoanDraft, NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
+import { loadItem, saveItem } from '@/lib/storage';
 import {
   createPendingWriteCoordinator,
   type ClearPendingOutcome,
@@ -44,6 +50,7 @@ import {
   type Hydration,
   type PendingOpKind,
 } from '@/services/offlineQueue/coordinator';
+import { fetchHouseholdResetMarker } from '@/services/remoteFinance';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
@@ -325,6 +332,8 @@ interface PendingFinanceValue {
   pauseForAccountDeletion: () => Promise<void>;
   resumeAfterAccountDeletionFailure: () => void;
   clearPendingForAccount: (userId: string) => Promise<ClearPendingOutcome>;
+  /** Household finance reset — drop every pending record of one `${userId}:${householdId}` scope. */
+  clearPendingForHousehold: (userId: string, householdId: string) => Promise<ClearPendingOutcome>;
 }
 
 const PendingFinanceContext = createContext<PendingFinanceValue | null>(null);
@@ -340,12 +349,25 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
     userId && householdId ? { userId, householdId } : null;
   const scopeKey = scope ? `${scope.userId}:${scope.householdId}` : null;
 
-  const remoteReady =
+  const snapshotTrusted =
     !!rf.data &&
     !!userId &&
     !!householdId &&
     rf.loadedForUserId === userId &&
     rf.loadedForHouseholdId === householdId;
+
+  // Household finance reset gate. A trusted snapshot is only "ready" for the
+  // queue once its `data_reset_at` has been checked against this device's
+  // remembered marker (and the scope's stale queue purged if it changed) —
+  // see the reset-marker effect below. Keyed by scope + marker value, so an
+  // ordinary same-marker refresh never drops readiness, while a marker that
+  // changes mid-session drops it in the same render the new snapshot lands.
+  const dataResetAt = rf.data?.dataResetAt ?? null;
+  const resetCheckKey =
+    scopeKey && snapshotTrusted ? `${scopeKey}|${dataResetAt ?? ''}` : null;
+  const [resetCheckedKey, setResetCheckedKey] = useState<string | null>(null);
+
+  const remoteReady = resetCheckKey !== null && resetCheckedKey === resetCheckKey;
 
   // ---- live refs (read at use-time by the coordinator, never captured) ----
   const scopeRef = useRef<CoordinatorScope | null>(scope);
@@ -442,6 +464,13 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       getServerLoans: () => serverLoansRef.current,
       requestRefresh: () => refreshRef.current(),
       onChange: () => forceRender(),
+      // Household finance reset guard: one marker store shared by the
+      // snapshot path (effect below) and the pre-flush server check.
+      fetchResetMarker: fetchHouseholdResetMarker,
+      resetMarkers: createResetMarkerStore({
+        load: () => loadItem<unknown>(RESET_MARKERS_STORAGE_KEY, null),
+        save: (markers) => saveItem(RESET_MARKERS_STORAGE_KEY, markers),
+      }),
     });
   }
   const coord = coordRef.current;
@@ -459,8 +488,42 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopeKey]);
 
-  // ---- Trigger A/B: hydrated + valid scope + remote snapshot trusted ----
   const hydration = coord.getState().hydration;
+
+  // ---- household finance reset marker (src/lib/householdResetMarker.ts) ----
+  // Runs for every trusted snapshot whose marker hasn't been checked yet.
+  // `coord.syncResetMarker` does the work (first sight -> store the baseline,
+  // even a null one; NEWER marker -> purge the scope's durable queue, then
+  // remember it, then request a refresh; an OLDER one is a stale snapshot
+  // and changes nothing). Only after it reports success is
+  // the snapshot marked ready, which is what lets the flusher send anything.
+  // A failed purge remembers nothing and leaves the snapshot not-ready, so
+  // the stale records are never sent; the next snapshot (`rf.data` change)
+  // retries. The coordinator repeats the same check against the SERVER
+  // before every flush pass, for the case this effect cannot see: a device
+  // still holding an old snapshot when the network comes back.
+  const resetCheckInFlightRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!resetCheckKey || !userId || !householdId) return;
+    if (resetCheckedKey === resetCheckKey) return;
+    if (hydration !== 'ready') return;
+    if (resetCheckInFlightRef.current === resetCheckKey) return;
+    resetCheckInFlightRef.current = resetCheckKey;
+    const checkKey = resetCheckKey;
+    void (async () => {
+      try {
+        const synced = await coord.syncResetMarker(userId, householdId, dataResetAt);
+        if (!synced.ok) return;
+        // A stale key is harmless: `remoteReady` only matches the live one.
+        setResetCheckedKey(checkKey);
+      } finally {
+        if (resetCheckInFlightRef.current === checkKey) resetCheckInFlightRef.current = null;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetCheckKey, resetCheckedKey, hydration, rf.data]);
+
+  // ---- Trigger A/B: hydrated + valid scope + remote snapshot trusted ----
   useEffect(() => {
     if (scopeKey && remoteReady && hydration === 'ready') {
       coord.requestFlush();
@@ -605,6 +668,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       pauseForAccountDeletion: coord.pauseForAccountDeletion,
       resumeAfterAccountDeletionFailure: coord.resumeAfterAccountDeletionFailure,
       clearPendingForAccount: coord.clearPendingForAccount,
+      clearPendingForHousehold: coord.clearPendingForHousehold,
     }),
     // state is a fresh object each render; that's exactly when something changed
     [state, coord],

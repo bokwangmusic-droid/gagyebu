@@ -68,6 +68,11 @@ import {
   type PendingWrite,
 } from '@/lib/offlineQueue';
 import type { Category } from '@/data/categories';
+import {
+  resetMarkerKey,
+  type ResetMarkerDecision,
+  type ResetMarkerStore,
+} from '@/lib/householdResetMarker';
 import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
 import type { NewCustomCategoryDraft } from '@/lib/remoteCategoryWriteMapping';
@@ -83,6 +88,7 @@ import {
 } from '@/services/offlineQueue/persistence';
 import {
   createWriteQueueFlusher,
+  type FlushGate,
   type FlushScope,
 } from '@/services/offlineQueue/flusher';
 import { runPendingWrite, type RunOpDeps } from '@/services/offlineQueue/runOp';
@@ -259,6 +265,18 @@ export interface CoordinatorDeps {
   requestRefresh: () => Promise<void>;
   /** Ask the React shell to re-read `getState()`. */
   onChange: () => void;
+  /**
+   * Household finance reset guard (src/lib/householdResetMarker.ts). When
+   * BOTH are supplied, every flush pass that has something to send first
+   * reads the household's current `data_reset_at` from the server and
+   * compares it with this device's remembered marker — see
+   * `preflightResetMarker`. Omitting either one disables the guard (the
+   * pre-existing behaviour; what the older `.cases.ts` harnesses run with).
+   */
+  fetchResetMarker?: (
+    householdId: string,
+  ) => Promise<{ ok: true; value: string | null } | { ok: false }>;
+  resetMarkers?: ResetMarkerStore;
   /** Test injections — forwarded to `runPendingWrite`. */
   createTransaction?: RunOpDeps['createTransaction'];
   updateTransaction?: RunOpDeps['updateTransaction'];
@@ -561,6 +579,28 @@ export interface PendingWriteCoordinator {
    * any other account that may have used this device.
    */
   clearPendingForAccount(userId: string): Promise<ClearPendingOutcome>;
+  /**
+   * Household finance reset — durably discard every pending record of ONE
+   * `${userId}:${householdId}` scope (its writes were made against data the
+   * reset has wiped), leaving every other account / household's records
+   * alone. Freezes the queue for the duration and restores the live scope
+   * itself afterwards, on success and on failure.
+   */
+  clearPendingForHousehold(userId: string, householdId: string): Promise<ClearPendingOutcome>;
+  /**
+   * Reconcile a `data_reset_at` value the caller just read from a trusted
+   * snapshot with this device's remembered marker: first sight records the
+   * baseline, a NEWER marker purges the scope's queue (then records it and
+   * requests a refresh), an unchanged or OLDER (stale snapshot) one does
+   * nothing and keeps the remembered marker. `ok: false` means a
+   * needed purge did not complete — the marker is NOT recorded, so the next
+   * call (or the next flush pass) detects the reset again.
+   */
+  syncResetMarker(
+    userId: string,
+    householdId: string,
+    incoming: string | null,
+  ): Promise<{ ok: boolean; decision: ResetMarkerDecision }>;
   dispose(): void;
   getState(): CoordinatorState;
 }
@@ -672,6 +712,7 @@ export function createPendingWriteCoordinator(
         ...(deps.addLoanPayment ? { addLoanPayment: deps.addLoanPayment } : {}),
         ...(deps.softDeleteLoanPayment ? { softDeleteLoanPayment: deps.softDeleteLoanPayment } : {}),
       }),
+    beforePass: (fs: FlushScope) => preflightResetMarker(fs),
     onPass: async (result) => {
       if (disposed) return;
       let changed = false;
@@ -1703,6 +1744,152 @@ export function createPendingWriteCoordinator(
     return { ok: true };
   }
 
+  async function clearPendingForHousehold(
+    userId: string,
+    householdId: string,
+  ): Promise<ClearPendingOutcome> {
+    if (disposed) return { ok: false, reason: 'disposed' };
+    if (!userId || !householdId) return { ok: false, reason: 'persist' };
+
+    // An account-deletion attempt may already hold the freeze; it then owns
+    // the resume too (`resumeAfterAccountDeletionFailure()` or sign-out).
+    const alreadyFrozen = blockNewWrites;
+    // Same freeze as account deletion: no new enqueue, and any runOp already
+    // in flight leaves the flusher before records are removed under it.
+    await pauseForAccountDeletion();
+    try {
+      if (hydration !== 'ready' || !controller.isHydrated()) {
+        const loaded = await controller.hydrate(deps.storage);
+        if (!loaded.ok) return { ok: false, reason: 'hydrate' };
+        hydration = 'ready';
+      }
+
+      const out = await controller.mutate(
+        (cur) => ({
+          next: cur.filter(
+            (record) =>
+              !(record.scope.userId === userId && record.scope.householdId === householdId),
+          ),
+          result: 0,
+        }),
+        deps.storage,
+      );
+      if (out.blockedNotHydrated) return { ok: false, reason: 'hydrate' };
+      if (!out.persist.ok) return { ok: false, reason: 'persist' };
+
+      reconcileAgain = false;
+      return { ok: true };
+    } finally {
+      if (!alreadyFrozen && !disposed) {
+        // `pauseForAccountDeletion()` nulled `scope`, so this is a genuine
+        // transition: it clears ack/failed/lastError and re-derives the
+        // failed markers from whatever records remain. The explicit unblock
+        // covers a signed-out live scope (null -> null is a no-op there).
+        blockNewWrites = false;
+        setScope(deps.getScope());
+      }
+    }
+  }
+
+  /* ------------------ household finance reset marker ------------------ */
+
+  /** `${userId}:${householdId}` -> the purge already running for it (dedupe). */
+  const resetPurges = new Map<string, Promise<ClearPendingOutcome>>();
+
+  /**
+   * Purge one scope's queue because its household was reset, then remember
+   * the new marker and ask for a fresh snapshot. Strictly in that order: the
+   * marker is recorded only after the durable purge succeeded, so a failed
+   * purge is simply detected again later. Concurrent callers for the same
+   * scope (snapshot path + flush preflight) share ONE run.
+   */
+  function purgeForReset(
+    userId: string,
+    householdId: string,
+    incoming: string | null,
+  ): Promise<ClearPendingOutcome> {
+    const key = resetMarkerKey(userId, householdId);
+    const running = resetPurges.get(key);
+    if (running) return running;
+    const run = (async (): Promise<ClearPendingOutcome> => {
+      const out = await clearPendingForHousehold(userId, householdId);
+      // Failed: records and marker both kept, so a later pass re-detects the
+      // reset. Not retried from here — see `preflightResetMarker`'s first line.
+      if (!out.ok) return out;
+      await deps.resetMarkers?.record(key, incoming);
+      void Promise.resolve()
+        .then(() => deps.requestRefresh())
+        .catch(() => undefined);
+      return out;
+    })().finally(() => {
+      resetPurges.delete(key);
+    });
+    resetPurges.set(key, run);
+    return run;
+  }
+
+  async function syncResetMarker(
+    userId: string,
+    householdId: string,
+    incoming: string | null,
+  ): Promise<{ ok: boolean; decision: ResetMarkerDecision }> {
+    const store = deps.resetMarkers;
+    if (!store) return { ok: true, decision: 'unchanged' };
+    if (disposed) return { ok: false, decision: 'unchanged' };
+    const key = resetMarkerKey(userId, householdId);
+    const decision = await store.decide(key, incoming);
+    if (decision === 'bootstrap') await store.record(key, incoming);
+    if (decision !== 'purge') return { ok: true, decision };
+    const out = await purgeForReset(userId, householdId, incoming);
+    return { ok: out.ok, decision };
+  }
+
+  /**
+   * The flusher's `beforePass` gate: ONE `data_reset_at` read per pass that
+   * has something to send, before its first write. A device that was offline
+   * while the household was reset still holds the old snapshot (and so still
+   * looks "remote ready"); without this its queued writes would be replayed
+   * onto the emptied household the moment the network returned.
+   *   - read failed            -> `halt`: send nothing, keep everything,
+   *                               retry through the ordinary backoff.
+   *   - marker unchanged       -> `proceed`.
+   *   - never seen (bootstrap) -> record the baseline, `proceed`.
+   *   - server marker OLDER    -> `proceed` (stale): never a purge, and the
+   *                               remembered marker is not moved back.
+   *   - server marker NEWER    -> `abort` this pass and purge. The purge is
+   *                               NOT awaited here: it waits for the flusher
+   *                               to go idle, i.e. for this very pass to end.
+   * The read and the first write are two requests, so a reset committing in
+   * between is not caught — the window is one round-trip, not closed.
+   */
+  async function preflightResetMarker(fs: FlushScope): Promise<FlushGate> {
+    const store = deps.resetMarkers;
+    if (!deps.fetchResetMarker || !store) return 'proceed';
+    const key = resetMarkerKey(fs.userId, fs.householdId);
+    // A purge for this scope is still unwinding: the flush that
+    // `clearPendingForHousehold` requests when it lifts its freeze lands here
+    // synchronously, before that purge's promise has settled. Only a FAILED
+    // purge leaves anything to send at that point, and halting hands its
+    // retry to the ordinary backoff instead of re-running it in a tight loop.
+    if (resetPurges.has(key)) return 'halt';
+    let res: { ok: true; value: string | null } | { ok: false };
+    try {
+      res = await deps.fetchResetMarker(fs.householdId);
+    } catch {
+      res = { ok: false };
+    }
+    if (disposed) return 'abort';
+    if (!res.ok) return 'halt';
+    const decision = await store.decide(key, res.value);
+    if (decision === 'unchanged' || decision === 'stale') return 'proceed';
+    if (decision === 'bootstrap') {
+      await store.record(key, res.value);
+      return 'proceed';
+    }
+    void purgeForReset(fs.userId, fs.householdId, res.value);
+    return 'abort';
+  }
+
   async function discardPending(queueId: string): Promise<DiscardOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
@@ -1856,6 +2043,8 @@ export function createPendingWriteCoordinator(
     pauseForAccountDeletion,
     resumeAfterAccountDeletionFailure,
     clearPendingForAccount,
+    clearPendingForHousehold,
+    syncResetMarker,
     dispose,
     getState,
   };

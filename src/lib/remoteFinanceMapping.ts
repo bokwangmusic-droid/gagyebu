@@ -270,6 +270,14 @@ export interface RemoteFinanceData {
   customCats: CustomCatMap;
   notes: string;
   catOrder: CatOrderMap;
+  /**
+   * `household_settings.data_reset_at` — changes whenever the household's
+   * finance data is wiped by `reset_household_finance_data()`; `null` =
+   * never reset. Sync metadata only (src/lib/householdResetMarker.ts), never
+   * UI domain. Optional so hand-built snapshots in the `.cases.ts` files
+   * don't have to carry it; the mapper below always sets it.
+   */
+  dataResetAt?: string | null;
 }
 
 export interface RemoteFinanceCounts {
@@ -556,5 +564,6 @@ export function mapRemoteFinanceToReadModel(raw: RemoteFinanceRaw): RemoteFinanc
       expense: raw.householdSettings?.cat_order_expense ?? [],
       income: raw.householdSettings?.cat_order_income ?? [],
     },
+    dataResetAt: raw.householdSettings?.data_reset_at ?? null,
   };
 }

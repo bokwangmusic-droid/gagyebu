@@ -58,7 +58,20 @@ export interface FlusherConfig {
   onPass: (result: FlushPassResult) => void | Promise<void>;
   /** Optional bookkeeping before each attempt (persistence owned by caller). */
   onAttempt?: (op: PendingWrite) => void | Promise<void>;
+  /**
+   * Gate run ONCE per pass, after `getOps` returned a non-empty batch and
+   * before its first `runOp` (never per op, never for an empty batch):
+   *   - `proceed` — send the batch.
+   *   - `halt`    — send nothing; reported as `haltedByTransport` so the
+   *                 caller's ordinary retry/backoff applies. Also what a
+   *                 throwing gate is treated as.
+   *   - `abort`   — send nothing; reported as `aborted` (the caller is
+   *                 dealing with the batch itself, e.g. discarding it).
+   */
+  beforePass?: (scope: FlushScope) => Promise<FlushGate>;
 }
+
+export type FlushGate = 'proceed' | 'halt' | 'abort';
 
 export interface WriteQueueFlusher {
   /** Point at an account/household, or `null` when signed out / no household. */
@@ -130,7 +143,18 @@ export function createWriteQueueFlusher(cfg: FlusherConfig): WriteQueueFlusher {
         let halted = false;
         let aborted = false;
 
-        for (const op of ops) {
+        if (ops.length > 0 && cfg.beforePass) {
+          let gate: FlushGate;
+          try {
+            gate = await cfg.beforePass(myScope);
+          } catch {
+            gate = 'halt';
+          }
+          if (disposed || scopeKey !== myKey || gate === 'abort') aborted = true;
+          else if (gate === 'halt') halted = true;
+        }
+
+        for (const op of halted || aborted ? [] : ops) {
           if (disposed || scopeKey !== myKey) {
             aborted = true;
             break;
