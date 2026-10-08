@@ -211,13 +211,24 @@ export interface ResetMarkerStore {
   decide: (key: string, incoming: string | null) => Promise<ResetMarkerDecision>;
   /** Remember `incoming` as the scope's marker (memory first, then storage). */
   record: (key: string, incoming: string | null) => Promise<void>;
+  /**
+   * Make sure the scope HAS an entry (bootstrapping it with `incoming` when
+   * it has none; an existing entry is never changed) and that the map is on
+   * disk right now. Resolves `false` when that write failed. Unlike
+   * `record`, this is what a caller about to reset the household waits on:
+   * with a durable entry, a restart after the reset sees a NEWER server
+   * marker and purges, instead of bootstrapping past it.
+   */
+  ensureDurable: (key: string, incoming: string | null) => Promise<boolean>;
 }
 
 /**
  * One in-memory copy of the marker map over injected storage, loaded lazily
  * and exactly once. A failed load or save never throws: load falls back to
  * an empty map (every scope bootstraps), save is best-effort — the
- * in-memory map stays authoritative for the rest of the session.
+ * in-memory map stays authoritative for the rest of the session. Only
+ * `ensureDurable` reports whether its save reached storage, so `io.save`
+ * must reject on failure rather than swallow it.
  */
 export function createResetMarkerStore(io: ResetMarkerIO): ResetMarkerStore {
   let markers: ResetMarkerMap | null = null;
@@ -249,5 +260,136 @@ export function createResetMarkerStore(io: ResetMarkerIO): ResetMarkerStore {
         // best-effort; see above
       }
     },
+    ensureDurable: async (key, incoming) => {
+      const current = await ensure();
+      const next = entryOf(current, key)
+        ? current
+        : { ...current, [key]: { initialized: true as const, value: incoming } };
+      markers = next;
+      try {
+        await io.save(next);
+        return true;
+      } catch {
+        return false;
+      }
+    },
   };
 }
+
+/* ------------------------------------------------------------------ *
+ * Reset attempts THIS device started and has no verdict for yet
+ * ------------------------------------------------------------------ */
+
+/**
+ * A reset this device sent whose outcome is not known yet. Written to disk
+ * BEFORE the RPC is called and removed only once the outcome is certain, so
+ * a lost reply — or the app dying mid-call — leaves a durable "do not send
+ * this scope's queue until the server has said what happened".
+ */
+export interface ResetPendingEntry {
+  /** The id the reset RPC was called with; what the server is asked about. */
+  requestId: string;
+}
+
+/** `${userId}:${householdId}` -> the unresolved attempt. */
+export type ResetPendingMap = Record<string, ResetPendingEntry>;
+
+/** AsyncStorage key (under the `gagyebu.` prefix) holding the `ResetPendingMap`. */
+export const RESET_PENDING_STORAGE_KEY = 'householdResetPending';
+
+/** Defensive parse — never throws; malformed entries are dropped. */
+export function parseResetPending(raw: unknown): ResetPendingMap {
+  const out: ResetPendingMap = {};
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) continue;
+    const requestId = (value as { requestId?: unknown }).requestId;
+    if (typeof requestId === 'string' && requestId !== '') out[key] = { requestId };
+  }
+  return out;
+}
+
+export interface ResetPendingIO {
+  load: () => Promise<unknown>;
+  /** Must reject on failure — `set` reports it. */
+  save: (pending: ResetPendingMap) => Promise<void>;
+}
+
+export interface ResetPendingStore {
+  get: (key: string) => Promise<ResetPendingEntry | undefined>;
+  /** Remember the attempt. Resolves `false` (and remembers nothing) when it could not be written. */
+  set: (key: string, entry: ResetPendingEntry) => Promise<boolean>;
+  /**
+   * Forget the attempt, but only if it is still `requestId`'s (a newer
+   * attempt for the same scope is left alone). Memory first, then storage,
+   * best-effort: an entry that survives on disk is asked about again after a
+   * restart, and the server gives the same answer.
+   */
+  clear: (key: string, requestId: string) => Promise<void>;
+}
+
+/** Same shape as `createResetMarkerStore`: one in-memory copy, loaded lazily and once. */
+export function createResetPendingStore(io: ResetPendingIO): ResetPendingStore {
+  let pending: ResetPendingMap | null = null;
+  let loading: Promise<ResetPendingMap> | null = null;
+
+  const ensure = (): Promise<ResetPendingMap> => {
+    if (pending) return Promise.resolve(pending);
+    loading ??= io
+      .load()
+      .then(parseResetPending, () => ({}) as ResetPendingMap)
+      .then((loaded) => {
+        pending = loaded;
+        return loaded;
+      });
+    return loading;
+  };
+
+  return {
+    get: async (key) => {
+      const map = await ensure();
+      return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+    },
+    set: async (key, entry) => {
+      const next = { ...(await ensure()), [key]: entry };
+      try {
+        await io.save(next);
+      } catch {
+        return false;
+      }
+      pending = next;
+      return true;
+    },
+    clear: async (key, requestId) => {
+      const map = await ensure();
+      if (!Object.prototype.hasOwnProperty.call(map, key) || map[key].requestId !== requestId) return;
+      const next = { ...map };
+      delete next[key];
+      pending = next;
+      try {
+        await io.save(next);
+      } catch {
+        // best-effort; see above
+      }
+    },
+  };
+}
+
+/**
+ * The server's serialized answer about one reset attempt
+ * (`get_household_reset_marker_serialized`, migration 20261008002100). It is
+ * only produced once every reset holding the household lock has finished,
+ * and a `committed: false` answer has closed the request for good — so an
+ * `ok: true` value is final. `ok: false` = no answer (transport, timeout).
+ */
+export type ResetVerdictRead =
+  | {
+      ok: true;
+      /** Did the reset carrying this request id commit? */
+      committed: boolean;
+      /** That reset's `data_reset_at`, when it committed. */
+      resetAt: string | null;
+      /** The household's `data_reset_at` right now. */
+      marker: string | null;
+    }
+  | { ok: false };

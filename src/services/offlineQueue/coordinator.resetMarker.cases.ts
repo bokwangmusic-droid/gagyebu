@@ -60,6 +60,8 @@ function makeHarness(opts: {
 }) {
   let queueValue: string | null = null;
   let failQueueSet = 0;
+  /** while set, every durable queue write waits on it (a purge "in flight") */
+  let queueSetGate: Promise<void> | null = null;
   /**
    * Every durable queue write attempt. `clearPendingForHousehold` always
    * performs exactly one (its filter builds a new array), so across a window
@@ -68,21 +70,25 @@ function makeHarness(opts: {
   let queueWrites = 0;
   const storage = {
     getItem: () => Promise.resolve(queueValue),
-    setItem: (_k: string, v: string) => {
+    setItem: async (_k: string, v: string) => {
       queueWrites += 1;
+      if (queueSetGate) await queueSetGate;
       if (failQueueSet > 0) {
         failQueueSet -= 1;
-        return Promise.reject(new Error('disk full'));
+        throw new Error('disk full');
       }
       queueValue = v;
-      return Promise.resolve();
     },
   };
 
   let markerStored: unknown = opts.markers ?? null;
+  let failMarkerSave = false;
+  let markerSaves = 0;
   const resetMarkers = createResetMarkerStore({
     load: () => Promise.resolve(markerStored),
     save: (m) => {
+      markerSaves += 1;
+      if (failMarkerSave) return Promise.reject(new Error('disk full'));
       markerStored = JSON.parse(JSON.stringify(m)) as unknown;
       return Promise.resolve();
     },
@@ -165,6 +171,21 @@ function makeHarness(opts: {
     failQueueSet: (n: number) => {
       failQueueSet = n;
     },
+    /** hold every durable queue write until the returned function is called */
+    gateQueueSet: () => {
+      let open!: () => void;
+      queueSetGate = new Promise<void>((r) => {
+        open = r;
+      });
+      return () => {
+        queueSetGate = null;
+        open();
+      };
+    },
+    failMarkerSave: (b: boolean) => {
+      failMarkerSave = b;
+    },
+    markerSaves: () => markerSaves,
     queueDump: () => queueValue ?? '',
     markerOf: (key: string) =>
       (markerStored as ResetMarkerMap | null)?.[key] as ResetMarkerMap[string] | undefined,
@@ -600,6 +621,121 @@ export async function runCoordinatorResetMarkerCases(): Promise<{
       h.createLog.length === 0 && !h.queueDump().includes('txn-rm20') && h.markerOf(KEY_A)?.value === late,
       `sent=${h.createLog.length} marker=${JSON.stringify(h.markerOf(KEY_A))}`,
     );
+  }
+
+  /* ============================ freeze ownership ============================ */
+
+  const tryEnqueue = (h: ReturnType<typeof makeHarness>, id: string) =>
+    h.coord.enqueueTransactionCreate({ scope: A, entityId: id, payload: draft() });
+
+  // RM21 — an account deletion pauses WHILE a reset purge is mid-write: the purge ending must not thaw it
+  {
+    const h = makeHarness({ markers: seen(T1), server: { 'h-A': T2 } });
+    await h.coord.hydrate();
+    await h.seedOffline(A, ['txn-rm21']);
+    const open = h.gateQueueSet();
+    const purge = h.coord.syncResetMarker(A.userId, A.householdId, T2);
+    await settle();
+    await h.coord.pauseForAccountDeletion(); // arrives during the purge
+    open();
+    const out = await purge;
+    await settle();
+    const frozen = await tryEnqueue(h, 'txn-rm21-a');
+    h.coord.resumeAfterAccountDeletionFailure();
+    const resumed = await tryEnqueue(h, 'txn-rm21-b');
+    check(
+      'RM21 account-delete pause taken during a purge survives that purge finishing; its own resume lifts it',
+      out.ok && !h.queueDump().includes('"txn-rm21"') && frozen.ok === false && resumed.ok === true,
+      `out=${JSON.stringify(out)} frozen=${JSON.stringify(frozen)} resumed=${JSON.stringify(resumed)}`,
+    );
+  }
+
+  // RM22 — two caller-owned freezes + the account one: each release drops only its own
+  {
+    const h = makeHarness({ markers: seen(T1), server: { 'h-A': T1 } });
+    await h.coord.hydrate();
+    const releaseA = await h.coord.freezeQueue();
+    const releaseB = await h.coord.freezeQueue();
+    await h.coord.pauseForAccountDeletion();
+    releaseA();
+    releaseA(); // a double release must not eat someone else's hold
+    const afterA = await tryEnqueue(h, 'txn-rm22-a');
+    h.coord.resumeAfterAccountDeletionFailure();
+    h.coord.resumeAfterAccountDeletionFailure();
+    const afterAccount = await tryEnqueue(h, 'txn-rm22-b');
+    releaseB();
+    const afterB = await tryEnqueue(h, 'txn-rm22-c');
+    check(
+      'RM22 freeze holds are per owner: frozen until the LAST one is released, double release is harmless',
+      afterA.ok === false && afterAccount.ok === false && afterB.ok === true,
+      `${JSON.stringify(afterA)} ${JSON.stringify(afterAccount)} ${JSON.stringify(afterB)}`,
+    );
+  }
+
+  // RM23 — a scope change still lifts the ACCOUNT freeze (sign-in after a deletion), but not a caller-owned one
+  {
+    const h = makeHarness({ markers: seen(T1), server: { 'h-A': T1, 'h-A2': null } });
+    await h.coord.hydrate();
+    await h.seedOffline(A2, ['txn-rm23-a2']);
+    await h.coord.pauseForAccountDeletion();
+    h.setScope(A2);
+    const accountLifted = await h.coord.enqueueTransactionCreate({ scope: A2, entityId: 'txn-rm23-x', payload: draft() });
+    await settle(12);
+    const sentBefore = h.createLog.length;
+
+    const release = await h.coord.freezeQueue();
+    h.setScope(A);
+    const held = await tryEnqueue(h, 'txn-rm23-y');
+    release();
+    const thawed = await tryEnqueue(h, 'txn-rm23-z');
+    await settle(12);
+    check(
+      'RM23 scope change lifts the account freeze as before; under a caller-owned freeze it waits, then the live scope resumes',
+      accountLifted.ok === true &&
+        sentBefore === 2 &&
+        held.ok === false &&
+        thawed.ok === true &&
+        h.createLog[h.createLog.length - 1]?.householdId === 'h-A',
+      `lifted=${JSON.stringify(accountLifted)} sentBefore=${sentBefore} held=${JSON.stringify(held)} thawed=${JSON.stringify(thawed)} sent=${h.createLog.map((c) => c.id)}`,
+    );
+  }
+
+  /* ============================ arming the marker before a reset ============================ */
+
+  // RM24 — not initialized: the baseline is written, so a restart after the reset purges instead of bootstrapping
+  {
+    const h = makeHarness({ server: { 'h-A': null } });
+    await h.coord.hydrate();
+    const armed = await h.coord.ensureResetMarkerBaseline(A.userId, A.householdId, null);
+    const stored = h.markerOf(KEY_A);
+    const decision = (await h.coord.syncResetMarker(A.userId, A.householdId, T1)).decision;
+    check(
+      'RM24 arm on an un-remembered scope -> durable null baseline; the reset that follows is a purge, not a bootstrap',
+      armed === true && stored?.initialized === true && stored.value === null && decision === 'purge',
+      `armed=${armed} stored=${JSON.stringify(stored)} decision=${decision}`,
+    );
+  }
+
+  // RM25 — already remembered: the entry is not changed, but it IS written again (an earlier save may have failed)
+  {
+    const h = makeHarness({ markers: seen(T1), server: { 'h-A': T2 } });
+    await h.coord.hydrate();
+    const before = h.markerSaves();
+    const armed = await h.coord.ensureResetMarkerBaseline(A.userId, A.householdId, T2);
+    check(
+      'RM25 arm on a remembered scope -> value untouched (never moved to the server value), one durable write',
+      armed === true && h.markerOf(KEY_A)?.value === T1 && h.markerSaves() - before === 1,
+      `armed=${armed} marker=${JSON.stringify(h.markerOf(KEY_A))} saves=${h.markerSaves() - before}`,
+    );
+  }
+
+  // RM26 — the write fails: reported, so the caller does not start the reset
+  {
+    const h = makeHarness({ server: { 'h-A': null } });
+    await h.coord.hydrate();
+    h.failMarkerSave(true);
+    const armed = await h.coord.ensureResetMarkerBaseline(A.userId, A.householdId, null);
+    check('RM26 arm with failing storage -> false', armed === false, `armed=${armed}`);
   }
 
   const failed = results.filter((r) => !r.pass).length;

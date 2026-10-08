@@ -18,7 +18,7 @@
  * verifies ownership itself and is the actual guard.
  */
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
@@ -35,6 +35,8 @@ import { resetMarkerReached } from '@/lib/householdResetMarker';
 import { fetchHouseholdResetMarker } from '@/services/remoteFinance';
 import {
   HOUSEHOLD_RESET_MESSAGES,
+  createResetRequestId,
+  fetchHouseholdResetVerdict,
   resetHouseholdFinanceData,
 } from '@/services/remoteHouseholdReset';
 import { useAuth } from '@/store/auth';
@@ -50,6 +52,11 @@ const KEPT_ITEMS = '계정 · 우리집 · 구성원 연결';
 /** How long to wait for the refreshed snapshot to land in React state. */
 const REFRESH_SETTLE_MS = 3000;
 const REFRESH_POLL_MS = 50;
+
+// One runner for the whole app, not one per screen instance: a run outlives
+// its screen (see `mountedRef` below), and a re-opened screen must get
+// `busy` instead of starting a second reset next to it.
+const runReset = createHouseholdResetRunner();
 
 export default function HouseholdReset() {
   const router = useRouter();
@@ -67,7 +74,6 @@ export default function HouseholdReset() {
   const [running, setRunning] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const runningRef = useRef(false);
-  const runReset = useMemo(() => createHouseholdResetRunner(), []);
   // The run keeps going if the screen is dismissed under it (Android
   // hardware back): it must still finish and unfreeze the queue, but must
   // not then pop whatever screen the user is on by now.
@@ -99,8 +105,11 @@ export default function HouseholdReset() {
   const describe = (outcome: HouseholdResetOutcome, serverMessage: string | null): string | null => {
     switch (outcome.kind) {
       case 'done':
-      case 'busy':
         return null;
+      case 'busy':
+        return HOUSEHOLD_RESET_MESSAGES.busy;
+      case 'storage':
+        return HOUSEHOLD_RESET_MESSAGES.storage;
       case 'done-refresh-failed':
         return HOUSEHOLD_RESET_MESSAGES.refreshFailed;
       case 'offline':
@@ -121,16 +130,30 @@ export default function HouseholdReset() {
     setRunning(true);
     setErrorMessage(null);
     let serverMessage: string | null = null;
+    let releaseQueue: (() => void) | null = null;
 
     try {
+      // Names this attempt on the server and on disk — the SAME id for the
+      // arm, the RPC, the serialized check and the settle below.
+      const requestId = await createResetRequestId();
+      if (!requestId) {
+        if (mountedRef.current) setErrorMessage(HOUSEHOLD_RESET_MESSAGES.notStarted);
+        return;
+      }
       const outcome = await runReset({
         readMarker: () => fetchHouseholdResetMarker(householdId),
-        // The account-deletion freeze is a plain queue freeze: no new
-        // enqueue, and the flusher is idle before it resolves.
-        pauseQueue: pending.pauseForAccountDeletion,
-        resumeQueue: pending.resumeAfterAccountDeletionFailure,
+        armMarker: (current) => pending.beginHouseholdReset(userId, householdId, requestId, current),
+        verifyReset: () => fetchHouseholdResetVerdict(householdId, requestId),
+        settle: () => pending.settleHouseholdReset(userId, householdId, requestId),
+        // This run's OWN freeze (no new enqueue, flusher idle before it
+        // resolves): releasing it never lifts an account deletion's, and an
+        // account deletion's resume never lifts this one.
+        pauseQueue: async () => {
+          releaseQueue = await pending.freezeQueue();
+        },
+        resumeQueue: () => releaseQueue?.(),
         callReset: async () => {
-          const res = await resetHouseholdFinanceData(householdId);
+          const res = await resetHouseholdFinanceData(householdId, requestId);
           if (res.ok) return { ok: true, resetAt: res.resetAt };
           serverMessage = res.message;
           return { ok: false, code: res.code, definitive: res.definitive };
@@ -141,6 +164,9 @@ export default function HouseholdReset() {
           await remote.refreshRemoteFinance();
           const deadline = Date.now() + REFRESH_SETTLE_MS;
           for (;;) {
+            // Dismissed mid-run: `snapshotRef` stopped updating with the
+            // last render, so there is nothing left to wait for here.
+            if (!mountedRef.current) return true;
             const now = snapshotRef.current;
             if (now.householdId === householdId && resetMarkerReached(now.marker, resetAt)) return true;
             if (Date.now() >= deadline) return false;

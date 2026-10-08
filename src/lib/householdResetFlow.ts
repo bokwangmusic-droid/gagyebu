@@ -6,25 +6,46 @@
  * Order, and why:
  *   1. read the server marker   — doubles as the online check, and is the
  *                                 "before" value step 4b compares against.
+ *   1b. arm                     — this scope's remembered marker AND this
+ *                                 attempt (its request id) must be on disk
+ *                                 BEFORE anything is deleted. It is what
+ *                                 makes every later failure safe: if the
+ *                                 purge in step 5 fails, or the app dies
+ *                                 mid-call, the scope's queue is not sent
+ *                                 until the server has said what became of
+ *                                 the attempt. Cannot be written ->
+ *                                 `storage`, nothing is started.
  *   2. freeze the offline queue — nothing queued may be sent while the
  *                                 household is being emptied.
  *   3. call the RPC.
  *   4a. server said no          — the transaction was rolled back; unfreeze,
  *                                 report failure. Never a success message.
- *   4b. no verdict (transport)  — the reset may have committed. Read the
- *                                 marker again: a NEWER one means it did.
- *                                 If that read fails too, the outcome is
- *                                 `unconfirmed` — never "data is intact".
- *   5. it committed             — purge this scope's pending queue, and only
- *                                 once that purge is durable remember the
- *                                 new marker (a failed purge leaves the old
- *                                 marker, so the ordinary reset detection
- *                                 purges it later instead).
- *   6. unfreeze, on every path that froze.
+ *   4b. no verdict (transport)  — the reset may have committed, or may still
+ *                                 be RUNNING on the server. Ask the server's
+ *                                 serialized check once, queue still frozen:
+ *                                 it waits for a running reset to end and
+ *                                 closes the request if it has not run, so
+ *                                 its answer is final. Committed -> step 5.
+ *                                 Not committed -> `failed`. No answer ->
+ *                                 `unconfirmed` — never "data is intact" —
+ *                                 and the attempt stays armed (see 6).
+ *   5. it committed             — purge this scope's pending queue (one
+ *                                 retry), and only once that purge is
+ *                                 durable remember the new marker (a failed
+ *                                 purge leaves the old marker, so the
+ *                                 ordinary reset detection purges it later
+ *                                 instead).
+ *   5b. settle the attempt      — only when its outcome is certain AND dealt
+ *                                 with (did not happen, or happened and the
+ *                                 purge is durable).
+ *   6. unfreeze, on every path that froze. An attempt that was not settled
+ *      keeps THIS scope's queue from being sent (the coordinator asks the
+ *      same serialized check before every flush pass, also after a restart)
+ *      — everything else works again.
  *   7. refresh the snapshot and wait until it reflects the reset, so the
  *      caller never navigates back to a stale, still-populated screen.
  */
-import { resetMarkerReached } from '@/lib/householdResetMarker';
+import { resetMarkerReached, type ResetVerdictRead } from '@/lib/householdResetMarker';
 
 /** What the user must type to arm the final button. */
 export const RESET_CONFIRM_PHRASE = '초기화';
@@ -52,6 +73,12 @@ export type ResetCallResult =
 export interface HouseholdResetDeps {
   /** Server `data_reset_at` right now. `ok: false` = offline / unreadable. */
   readMarker: () => Promise<ResetMarkerRead>;
+  /** Durably remember this scope's marker (`current` if it has none yet) and this attempt. `false` = not written. */
+  armMarker: (current: string | null) => Promise<boolean>;
+  /** The server's serialized, final answer about THIS attempt. `ok: false` = no answer. */
+  verifyReset: () => Promise<ResetVerdictRead>;
+  /** The attempt's outcome is certain and dealt with — stop gating the scope on it. */
+  settle: () => Promise<unknown>;
   pauseQueue: () => Promise<void>;
   resumeQueue: () => void;
   callReset: () => Promise<ResetCallResult>;
@@ -69,10 +96,15 @@ export type HouseholdResetOutcome =
   /** Server data deleted, but the snapshot on screen could not be refreshed. */
   | { kind: 'done-refresh-failed'; resetAt: string }
   | { kind: 'offline' }
+  /** This device could not durably arm its reset marker — nothing was started. */
+  | { kind: 'storage' }
   | { kind: 'not-owner' }
   /** The server refused or aborted: nothing was deleted. `code` is the service's error code. */
   | { kind: 'failed'; code: string }
-  /** No verdict and no way to check: the data may or may not have been deleted. */
+  /**
+   * No verdict and the serialized check gave no answer either: the data may
+   * or may not have been deleted. The attempt is still armed.
+   */
   | { kind: 'unconfirmed' }
   /** A run is already in flight (duplicate tap) — nothing was started. */
   | { kind: 'busy' };
@@ -99,6 +131,7 @@ export function createHouseholdResetRunner(): (deps: HouseholdResetDeps) => Prom
     try {
       const before = await safe(deps.readMarker, { ok: false } as ResetMarkerRead);
       if (!before.ok) return { kind: 'offline' };
+      if (!(await safe(() => deps.armMarker(before.value), false))) return { kind: 'storage' };
 
       let resetAt: string | null = null;
       let failure: HouseholdResetOutcome | null = null;
@@ -116,22 +149,30 @@ export function createHouseholdResetRunner(): (deps: HouseholdResetDeps) => Prom
         } else if (res.definitive) {
           failure = res.code === 'NOT_OWNER' ? { kind: 'not-owner' } : { kind: 'failed', code: res.code };
         } else {
-          // No verdict. Did it commit anyway?
-          const after = await safe(deps.readMarker, { ok: false } as ResetMarkerRead);
-          if (!after.ok) {
+          // No verdict. Did it commit anyway — or is it still about to?
+          const verdict = await safe(deps.verifyReset, { ok: false } as ResetVerdictRead);
+          if (!verdict.ok) {
             failure = { kind: 'unconfirmed' };
-          } else if (after.value != null && !resetMarkerReached(before.value, after.value)) {
-            resetAt = after.value; // marker moved forward -> the reset did commit
+          } else if (verdict.committed && verdict.resetAt != null) {
+            resetAt = verdict.resetAt;
+          } else if (verdict.marker != null && !resetMarkerReached(before.value, verdict.marker)) {
+            // Not this attempt, but the household WAS reset since step 1
+            // (another device): the queue is just as stale.
+            resetAt = verdict.marker;
           } else {
-            failure = { kind: 'failed', code: res.code }; // marker unchanged -> nothing was deleted
+            failure = { kind: 'failed', code: res.code }; // closed without running -> nothing was deleted
           }
         }
 
+        let settled = failure != null && failure.kind !== 'unconfirmed';
         if (resetAt != null) {
-          const cleared = await safe(deps.clearPending, { ok: false });
+          let cleared = await safe(deps.clearPending, { ok: false });
+          if (!cleared.ok) cleared = await safe(deps.clearPending, { ok: false });
           const committedAt = resetAt;
           if (cleared.ok) await safe(() => deps.syncMarker(committedAt), undefined);
+          settled = cleared.ok;
         }
+        if (settled) await safe(deps.settle, undefined);
       } finally {
         deps.resumeQueue();
       }

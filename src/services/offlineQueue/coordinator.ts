@@ -72,6 +72,8 @@ import {
   resetMarkerKey,
   type ResetMarkerDecision,
   type ResetMarkerStore,
+  type ResetPendingStore,
+  type ResetVerdictRead,
 } from '@/lib/householdResetMarker';
 import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
 import type { NewCardDraft } from '@/lib/remoteCardWriteMapping';
@@ -277,6 +279,14 @@ export interface CoordinatorDeps {
     householdId: string,
   ) => Promise<{ ok: true; value: string | null } | { ok: false }>;
   resetMarkers?: ResetMarkerStore;
+  /**
+   * Reset attempts THIS device started and has no verdict for yet, and the
+   * serialized server check that produces one. While a scope has such an
+   * attempt, `preflightResetMarker` sends nothing for it until the check
+   * answers. Omitting either one disables that gate.
+   */
+  resetPending?: ResetPendingStore;
+  checkResetVerdict?: (householdId: string, requestId: string) => Promise<ResetVerdictRead>;
   /** Test injections — forwarded to `runPendingWrite`. */
   createTransaction?: RunOpDeps['createTransaction'];
   updateTransaction?: RunOpDeps['updateTransaction'];
@@ -571,8 +581,17 @@ export interface PendingWriteCoordinator {
    * removed here; this is safe to call before the server deletion request.
    */
   pauseForAccountDeletion(): Promise<void>;
-  /** Restore the live scope after a failed/uncertain delete-account call. */
+  /** Restore the live scope after a failed/uncertain delete-account call.
+   *  Lifts ONLY the account-deletion freeze — see `freezeQueue`. */
   resumeAfterAccountDeletionFailure(): void;
+  /**
+   * The same freeze as `pauseForAccountDeletion()` (no new enqueue, flusher
+   * idle before it resolves) for any OTHER destructive flow, owned by the
+   * caller: the returned function releases this hold and nothing else, and
+   * is safe to call more than once. The queue thaws when the last hold —
+   * this one, an account deletion's, an internal purge's — is gone.
+   */
+  freezeQueue(): Promise<() => void>;
   /**
    * AUTH-F2-B — AFTER confirmed server deletion, durably discard every
    * pending record owned by the deleted user while preserving records from
@@ -583,8 +602,8 @@ export interface PendingWriteCoordinator {
    * Household finance reset — durably discard every pending record of ONE
    * `${userId}:${householdId}` scope (its writes were made against data the
    * reset has wiped), leaving every other account / household's records
-   * alone. Freezes the queue for the duration and restores the live scope
-   * itself afterwards, on success and on failure.
+   * alone. Freezes the queue for the duration under its own hold and drops
+   * only that hold afterwards, on success and on failure.
    */
   clearPendingForHousehold(userId: string, householdId: string): Promise<ClearPendingOutcome>;
   /**
@@ -601,6 +620,34 @@ export interface PendingWriteCoordinator {
     householdId: string,
     incoming: string | null,
   ): Promise<{ ok: boolean; decision: ResetMarkerDecision }>;
+  /**
+   * Before THIS device resets the household: make sure the scope's marker
+   * entry exists (`current` = the server value just read, used only when
+   * there is no entry yet) and is on disk. `false` = it could not be
+   * written, and the caller must not start the reset — after a restart an
+   * un-remembered scope would bootstrap past the reset and replay its queue.
+   */
+  ensureResetMarkerBaseline(
+    userId: string,
+    householdId: string,
+    current: string | null,
+  ): Promise<boolean>;
+  /**
+   * The durable step before THIS device calls the reset RPC:
+   * `ensureResetMarkerBaseline`, then remember `requestId` as an attempt
+   * without a verdict. `false` = something could not be written; the caller
+   * must not call the RPC. From here until `settleHouseholdReset`, no flush
+   * pass sends this scope's queue without first asking the server what
+   * became of `requestId` — in this session and after a restart.
+   */
+  beginHouseholdReset(
+    userId: string,
+    householdId: string,
+    requestId: string,
+    current: string | null,
+  ): Promise<boolean>;
+  /** The attempt's outcome is known and dealt with: stop gating the scope on it. */
+  settleHouseholdReset(userId: string, householdId: string, requestId: string): Promise<void>;
   dispose(): void;
   getState(): CoordinatorState;
 }
@@ -616,6 +663,9 @@ export type ClearPendingOutcome =
 const scopeKeyOf = (s: CoordinatorScope | null): string | null =>
   s ? `${s.userId}:${s.householdId}` : null;
 
+/** The one freeze owner with no handle: `pauseForAccountDeletion()`'s. */
+const ACCOUNT_DELETION_HOLD = Symbol('account-deletion');
+
 export function createPendingWriteCoordinator(
   deps: CoordinatorDeps,
 ): PendingWriteCoordinator {
@@ -630,19 +680,24 @@ export function createPendingWriteCoordinator(
   let scope: CoordinatorScope | null = deps.getScope();
   let lastError: string | null = null;
   /**
-   * AUTH-F2-B — true only while `pauseForAccountDeletion()` has frozen the
-   * queue for a destructive account-deletion attempt. `scope = null` /
-   * `flusher.setScope(null)` alone stop the FLUSHER from sending anything,
-   * but every `enqueueX...` call reaches `enqueue()` with a `CoordinatorScope`
-   * the CALLING SCREEN built for itself (from its own live `useAuth()`/
-   * `useHousehold()` reads — see e.g. app/input.tsx), never this closure's
-   * own `scope` variable. Without this flag, a still-mounted screen (or a
-   * stale in-flight retry) underneath the account-delete modal could still
-   * durably persist a brand-new pending write while deletion is in flight.
-   * Cleared inside `setScope()` — the one re-entry point already used both
-   * by a genuine scope change and by `resumeAfterAccountDeletionFailure()`.
+   * AUTH-F2-B — WHO currently holds the queue frozen. Non-empty while a
+   * destructive flow (account deletion, a household reset, a reset purge) is
+   * in flight. `scope = null` / `flusher.setScope(null)` alone stop the
+   * FLUSHER from sending anything, but every `enqueueX...` call reaches
+   * `enqueue()` with a `CoordinatorScope` the CALLING SCREEN built for itself
+   * (from its own live `useAuth()`/`useHousehold()` reads — see e.g.
+   * app/input.tsx), never this closure's own `scope` variable. Without this,
+   * a still-mounted screen (or a stale in-flight retry) underneath the modal
+   * could still durably persist a brand-new pending write mid-flow.
+   *
+   * One entry PER OWNER, because these flows can overlap (a household reset
+   * keeps running after its screen is dismissed; a reset purge starts on its
+   * own from a snapshot or a flush pass): each owner removes only its own
+   * entry, and the queue thaws when the LAST one is gone — so no flow can
+   * lift a freeze another one still relies on.
    */
-  let blockNewWrites = false;
+  const freezeHolds = new Set<symbol>();
+  const isFrozen = (): boolean => freezeHolds.size > 0;
 
   /** queueId -> op identity: server accepted it, awaiting refresh confirmation.
    *  Keyed by queueId (globally unique) — `entity`/`entityId`/`op` carried
@@ -1109,13 +1164,21 @@ export function createPendingWriteCoordinator(
 
   function setScope(next: CoordinatorScope | null): void {
     if (disposed) return;
-    // AUTH-F2-B: any genuine scope transition (a real sign-in/sign-out or
-    // household switch, OR `resumeAfterAccountDeletionFailure()` restoring
-    // the live scope) is the trusted re-entry point that lifts a prior
-    // `pauseForAccountDeletion()` freeze. A no-op call (same key) below must
-    // NOT be treated as that re-entry — see its early return.
+    // AUTH-F2-B: a genuine scope transition (a real sign-in/sign-out or
+    // household switch) is the trusted re-entry point that lifts a prior
+    // `pauseForAccountDeletion()` freeze — a SUCCESSFUL deletion never
+    // resumes, its freeze ends with the next sign-in. A no-op call (same
+    // key) below must NOT be treated as that re-entry — see its early return.
     if (scopeKeyOf(next) === scopeKeyOf(scope)) return;
-    blockNewWrites = false;
+    freezeHolds.delete(ACCOUNT_DELETION_HOLD);
+    // Another owner (a household reset / purge still in flight) keeps the
+    // queue frozen; its own release restores the then-live scope.
+    if (isFrozen()) return;
+    applyScope(next);
+  }
+
+  function applyScope(next: CoordinatorScope | null): void {
+    if (scopeKeyOf(next) === scopeKeyOf(scope)) return;
     scope = next;
     flusher.setScope(next);
     clearBackoff();
@@ -1132,9 +1195,9 @@ export function createPendingWriteCoordinator(
 
   async function enqueue(record: PendingWrite): Promise<EnqueueOutcome> {
     if (disposed) return { ok: false, reason: 'not-hydrated' };
-    // AUTH-F2-B: refuse ANY new durable write while an account-deletion
-    // attempt has the queue frozen — see `blockNewWrites`'s own doc above.
-    if (blockNewWrites) return { ok: false, reason: 'not-hydrated' };
+    // AUTH-F2-B: refuse ANY new durable write while a destructive flow has
+    // the queue frozen — see `freezeHolds`'s own doc above.
+    if (isFrozen()) return { ok: false, reason: 'not-hydrated' };
     if (hydration !== 'ready' || !controller.isHydrated()) {
       return { ok: false, reason: 'not-hydrated' };
     }
@@ -1684,30 +1747,52 @@ export function createPendingWriteCoordinator(
     );
   }
 
-  async function pauseForAccountDeletion(): Promise<void> {
-    if (disposed) return;
+  /** Freeze the queue on behalf of `owner`; resolves once the flusher is idle. */
+  function holdFreeze(owner: symbol): Promise<void> {
     // Do NOT use setScope(null) here: that method intentionally clears
     // ack/failed bookkeeping for a genuine account/household switch. This
     // is only a temporary write freeze while the current account still owns
     // its durable queue records.
     //
-    // Set FIRST, synchronously, before anything else below: every
+    // Registered FIRST, synchronously, before anything else below: every
     // `enqueueX...` call reaches `enqueue()` with a scope the CALLING
     // SCREEN built for itself, not this closure's `scope` — nulling `scope`
-    // alone does not stop a still-mounted screen underneath the
-    // account-delete modal from durably persisting a new write while this
-    // function's own `await` below is in flight. See `blockNewWrites`'s doc.
-    blockNewWrites = true;
+    // alone does not stop a still-mounted screen underneath the modal from
+    // durably persisting a new write while the caller's `await` on this is
+    // in flight. See `freezeHolds`'s doc.
+    freezeHolds.add(owner);
     scope = null;
     flusher.setScope(null);
     clearBackoff();
     backoffAttempt = 0;
-    await flusher.waitForIdle();
+    return flusher.waitForIdle();
+  }
+
+  /** Drop `owner`'s hold only; the live scope comes back with the LAST one. */
+  function dropFreeze(owner: symbol): void {
+    if (!freezeHolds.delete(owner)) return;
+    if (isFrozen() || disposed) return;
+    // `holdFreeze()` nulled `scope`, so this is a genuine transition: it
+    // clears ack/failed/lastError and re-derives the failed markers from
+    // whatever records remain. (Signed out: null -> null, nothing to do.)
+    applyScope(deps.getScope());
+  }
+
+  async function pauseForAccountDeletion(): Promise<void> {
+    if (disposed) return;
+    await holdFreeze(ACCOUNT_DELETION_HOLD);
   }
 
   function resumeAfterAccountDeletionFailure(): void {
     if (disposed) return;
-    setScope(deps.getScope());
+    dropFreeze(ACCOUNT_DELETION_HOLD);
+  }
+
+  async function freezeQueue(): Promise<() => void> {
+    if (disposed) return () => undefined;
+    const hold = Symbol('queue-freeze');
+    await holdFreeze(hold);
+    return () => dropFreeze(hold);
   }
 
   async function clearPendingForAccount(userId: string): Promise<ClearPendingOutcome> {
@@ -1751,12 +1836,13 @@ export function createPendingWriteCoordinator(
     if (disposed) return { ok: false, reason: 'disposed' };
     if (!userId || !householdId) return { ok: false, reason: 'persist' };
 
-    // An account-deletion attempt may already hold the freeze; it then owns
-    // the resume too (`resumeAfterAccountDeletionFailure()` or sign-out).
-    const alreadyFrozen = blockNewWrites;
     // Same freeze as account deletion: no new enqueue, and any runOp already
-    // in flight leaves the flusher before records are removed under it.
-    await pauseForAccountDeletion();
+    // in flight leaves the flusher before records are removed under it. Held
+    // under this call's OWN entry: an account deletion or a household reset
+    // that froze the queue before — or DURING — this purge keeps its freeze
+    // when the entry below is dropped.
+    const hold = Symbol('household-purge');
+    await holdFreeze(hold);
     try {
       if (hydration !== 'ready' || !controller.isHydrated()) {
         const loaded = await controller.hydrate(deps.storage);
@@ -1780,14 +1866,7 @@ export function createPendingWriteCoordinator(
       reconcileAgain = false;
       return { ok: true };
     } finally {
-      if (!alreadyFrozen && !disposed) {
-        // `pauseForAccountDeletion()` nulled `scope`, so this is a genuine
-        // transition: it clears ack/failed/lastError and re-derives the
-        // failed markers from whatever records remain. The explicit unblock
-        // covers a signed-out live scope (null -> null is a no-op there).
-        blockNewWrites = false;
-        setScope(deps.getScope());
-      }
+      dropFreeze(hold);
     }
   }
 
@@ -1844,12 +1923,46 @@ export function createPendingWriteCoordinator(
     return { ok: out.ok, decision };
   }
 
+  async function ensureResetMarkerBaseline(
+    userId: string,
+    householdId: string,
+    current: string | null,
+  ): Promise<boolean> {
+    const store = deps.resetMarkers;
+    if (!store) return true;
+    if (disposed) return false;
+    return store.ensureDurable(resetMarkerKey(userId, householdId), current);
+  }
+
+  async function beginHouseholdReset(
+    userId: string,
+    householdId: string,
+    requestId: string,
+    current: string | null,
+  ): Promise<boolean> {
+    if (!(await ensureResetMarkerBaseline(userId, householdId, current))) return false;
+    if (!deps.resetPending) return true;
+    return deps.resetPending.set(resetMarkerKey(userId, householdId), { requestId });
+  }
+
+  async function settleHouseholdReset(
+    userId: string,
+    householdId: string,
+    requestId: string,
+  ): Promise<void> {
+    await deps.resetPending?.clear(resetMarkerKey(userId, householdId), requestId);
+  }
+
   /**
    * The flusher's `beforePass` gate: ONE `data_reset_at` read per pass that
    * has something to send, before its first write. A device that was offline
    * while the household was reset still holds the old snapshot (and so still
    * looks "remote ready"); without this its queued writes would be replayed
    * onto the emptied household the moment the network returned.
+   *   - a reset THIS device sent has no verdict yet -> ask the server's
+   *     serialized check first. No answer -> `halt`. It committed -> `abort`
+   *     and purge. It did not (and now never will) -> forget the attempt and
+   *     carry on below.
    *   - read failed            -> `halt`: send nothing, keep everything,
    *                               retry through the ordinary backoff.
    *   - marker unchanged       -> `proceed`.
@@ -1872,6 +1985,37 @@ export function createPendingWriteCoordinator(
     // purge leaves anything to send at that point, and halting hands its
     // retry to the ordinary backoff instead of re-running it in a tight loop.
     if (resetPurges.has(key)) return 'halt';
+
+    const attempt = await deps.resetPending?.get(key);
+    if (attempt && deps.resetPending) {
+      const pending = deps.resetPending;
+      let verdict: ResetVerdictRead;
+      try {
+        verdict = deps.checkResetVerdict
+          ? await deps.checkResetVerdict(fs.householdId, attempt.requestId)
+          : { ok: false };
+      } catch {
+        verdict = { ok: false };
+      }
+      if (disposed) return 'abort';
+      // Unknown is not "did not happen": the reset may still be about to
+      // commit, and a write sent now would land right behind it.
+      if (!verdict.ok) return 'halt';
+      if (verdict.committed && verdict.resetAt != null) {
+        const committedAt = verdict.resetAt;
+        const seen = await store.decide(key, committedAt);
+        if (seen === 'purge' || seen === 'bootstrap') {
+          void purgeForReset(fs.userId, fs.householdId, committedAt).then((out) =>
+            out.ok ? pending.clear(key, attempt.requestId) : undefined,
+          );
+          return 'abort';
+        }
+      }
+      // Not committed — the check closed the request, it never will be — or
+      // committed and already purged for. Either way the attempt is over.
+      await pending.clear(key, attempt.requestId);
+    }
+
     let res: { ok: true; value: string | null } | { ok: false };
     try {
       res = await deps.fetchResetMarker(fs.householdId);
@@ -2042,9 +2186,13 @@ export function createPendingWriteCoordinator(
     requestFlush,
     pauseForAccountDeletion,
     resumeAfterAccountDeletionFailure,
+    freezeQueue,
     clearPendingForAccount,
     clearPendingForHousehold,
     syncResetMarker,
+    ensureResetMarkerBaseline,
+    beginHouseholdReset,
+    settleHouseholdReset,
     dispose,
     getState,
   };

@@ -24,12 +24,15 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState, type AppStateStatus } from 'react-native';
 
 import type { Category } from '@/data/categories';
 import {
   RESET_MARKERS_STORAGE_KEY,
+  RESET_PENDING_STORAGE_KEY,
   createResetMarkerStore,
+  createResetPendingStore,
 } from '@/lib/householdResetMarker';
 import type { PendingWrite } from '@/lib/offlineQueue';
 import type { NewBudgetDraft } from '@/lib/remoteBudgetWriteMapping';
@@ -40,7 +43,7 @@ import type { NewGoalDraft, NewGoalMovementDraft } from '@/lib/remoteGoalWriteMa
 import type { NewLoanDraft, NewLoanPaymentDraft } from '@/lib/remoteLoanWriteMapping';
 import type { NewPlannedExpenseDraft } from '@/lib/remotePlannedWriteMapping';
 import type { NewRecurringDraft } from '@/lib/remoteRecurringWriteMapping';
-import { loadItem, saveItem } from '@/lib/storage';
+import { loadItem, storageKey } from '@/lib/storage';
 import {
   createPendingWriteCoordinator,
   type ClearPendingOutcome,
@@ -51,6 +54,7 @@ import {
   type PendingOpKind,
 } from '@/services/offlineQueue/coordinator';
 import { fetchHouseholdResetMarker } from '@/services/remoteFinance';
+import { fetchHouseholdResetVerdict } from '@/services/remoteHouseholdReset';
 import type { WriteConflictReason } from '@/services/remoteFinanceWrite';
 import { useAuth } from '@/store/auth';
 import { useHousehold } from '@/store/household';
@@ -331,6 +335,8 @@ interface PendingFinanceValue {
   /** AUTH-F2-B destructive-flow queue controls. */
   pauseForAccountDeletion: () => Promise<void>;
   resumeAfterAccountDeletionFailure: () => void;
+  /** A caller-owned queue freeze; the returned function releases only this hold. */
+  freezeQueue: () => Promise<() => void>;
   clearPendingForAccount: (userId: string) => Promise<ClearPendingOutcome>;
   /** Household finance reset — drop every pending record of one `${userId}:${householdId}` scope. */
   clearPendingForHousehold: (userId: string, householdId: string) => Promise<ClearPendingOutcome>;
@@ -340,6 +346,15 @@ interface PendingFinanceValue {
     householdId: string,
     incoming: string | null,
   ) => Promise<{ ok: boolean }>;
+  /** Household finance reset — the durable step before the RPC (marker + this attempt). `false` = not written. */
+  beginHouseholdReset: (
+    userId: string,
+    householdId: string,
+    requestId: string,
+    current: string | null,
+  ) => Promise<boolean>;
+  /** Household finance reset — the attempt's outcome is known and dealt with. */
+  settleHouseholdReset: (userId: string, householdId: string, requestId: string) => Promise<void>;
 }
 
 const PendingFinanceContext = createContext<PendingFinanceValue | null>(null);
@@ -475,7 +490,18 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       fetchResetMarker: fetchHouseholdResetMarker,
       resetMarkers: createResetMarkerStore({
         load: () => loadItem<unknown>(RESET_MARKERS_STORAGE_KEY, null),
-        save: (markers) => saveItem(RESET_MARKERS_STORAGE_KEY, markers),
+        // Not `saveItem`: it swallows a failed write, and the store must be
+        // able to tell whether the map reached the disk.
+        save: (markers) =>
+          AsyncStorage.setItem(storageKey(RESET_MARKERS_STORAGE_KEY), JSON.stringify(markers)),
+      }),
+      // Resets this device sent and has no verdict for: the flusher asks
+      // the serialized server check before sending that scope's queue.
+      checkResetVerdict: fetchHouseholdResetVerdict,
+      resetPending: createResetPendingStore({
+        load: () => loadItem<unknown>(RESET_PENDING_STORAGE_KEY, null),
+        save: (pending) =>
+          AsyncStorage.setItem(storageKey(RESET_PENDING_STORAGE_KEY), JSON.stringify(pending)),
       }),
     });
   }
@@ -673,9 +699,12 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       requestFlush: coord.requestFlush,
       pauseForAccountDeletion: coord.pauseForAccountDeletion,
       resumeAfterAccountDeletionFailure: coord.resumeAfterAccountDeletionFailure,
+      freezeQueue: coord.freezeQueue,
       clearPendingForAccount: coord.clearPendingForAccount,
       clearPendingForHousehold: coord.clearPendingForHousehold,
       syncResetMarker: coord.syncResetMarker,
+      beginHouseholdReset: coord.beginHouseholdReset,
+      settleHouseholdReset: coord.settleHouseholdReset,
     }),
     // state is a fresh object each render; that's exactly when something changed
     [state, coord],
