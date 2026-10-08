@@ -334,6 +334,12 @@ interface PendingFinanceValue {
   clearPendingForAccount: (userId: string) => Promise<ClearPendingOutcome>;
   /** Household finance reset — drop every pending record of one `${userId}:${householdId}` scope. */
   clearPendingForHousehold: (userId: string, householdId: string) => Promise<ClearPendingOutcome>;
+  /** Household finance reset — reconcile a known `data_reset_at` with this device's remembered marker. */
+  syncResetMarker: (
+    userId: string,
+    householdId: string,
+    incoming: string | null,
+  ) => Promise<{ ok: boolean }>;
 }
 
 const PendingFinanceContext = createContext<PendingFinanceValue | null>(null);
@@ -669,6 +675,7 @@ export function PendingWritesProvider({ children }: { children: ReactNode }) {
       resumeAfterAccountDeletionFailure: coord.resumeAfterAccountDeletionFailure,
       clearPendingForAccount: coord.clearPendingForAccount,
       clearPendingForHousehold: coord.clearPendingForHousehold,
+      syncResetMarker: coord.syncResetMarker,
     }),
     // state is a fresh object each render; that's exactly when something changed
     [state, coord],

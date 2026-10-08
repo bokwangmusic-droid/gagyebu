@@ -131,6 +131,16 @@ function orderOf(seen: string | null, incoming: string | null): MarkerOrder {
   return b === a ? 'same' : b > a ? 'newer' : 'older';
 }
 
+/**
+ * Has `current` caught up with `target`? True when `current` is the same
+ * instant as `target` or a newer one — same ordering rule as everything
+ * else here. Used to tell "the snapshot on screen already reflects this
+ * reset" from "it is still the pre-reset one".
+ */
+export function resetMarkerReached(current: string | null, target: string | null): boolean {
+  return orderOf(current, target) !== 'newer';
+}
+
 const entryOf = (markers: ResetMarkerMap, key: string): ResetMarkerEntry | undefined =>
   Object.prototype.hasOwnProperty.call(markers, key) ? markers[key] : undefined;
 

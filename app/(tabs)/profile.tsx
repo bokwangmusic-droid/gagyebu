@@ -19,6 +19,7 @@ import { fmt } from '@/lib/format';
 import { calculateTotalAssets } from '@/lib/netWorth';
 import { useAuth } from '@/store/auth';
 import { useFinanceRead } from '@/store/financeRead';
+import { useHousehold } from '@/store/household';
 import { useStore } from '@/store/store';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
@@ -63,6 +64,11 @@ export default function ProfileScreen() {
   // screens actually display (STEP 16-G1B §20: finance figures always come
   // from remote, never local).
   const remote = useFinanceRead();
+  // "우리집 가계부 데이터 전체 초기화" is owner-only. Hiding the row is a
+  // convenience — app/household-reset.tsx re-checks the role, and the RPC
+  // itself is what actually refuses a non-owner.
+  const { activeHousehold } = useHousehold();
+  const isHouseholdOwner = activeHousehold?.role === 'owner';
   const cardBillTotal = cardBillingForMonth(remote.transactions, remote.cards).total;
   const customCount = remote.customCats.expense.length + remote.customCats.income.length;
 
@@ -434,6 +440,24 @@ export default function ProfileScreen() {
           last
         />
       </SettingsCard>
+
+      {isHouseholdOwner && (
+        <>
+          <SectionLabel>우리집 데이터</SectionLabel>
+          <SettingsCard>
+            <Row
+              icon="warn"
+              iconBg={colors.expenseLight}
+              iconColor={colors.expenseText}
+              title="우리집 가계부 데이터 전체 초기화"
+              titleColor={colors.expenseText}
+              sub="같은 우리집을 사용하는 모든 구성원의 가계부 데이터를 삭제해요."
+              onPress={() => router.push('/household-reset')}
+              last
+            />
+          </SettingsCard>
+        </>
+      )}
 
       <View
         style={{
