@@ -157,13 +157,12 @@ export default function ProfileScreen() {
 
   const confirmReset = () =>
     Alert.alert(
-      '모든 데이터를 삭제할까요?',
-      '지출·수입·예산·목표·반복·대출·카드·메모·커스텀 카테고리·설정이 모두 지워져요.\n\n' +
-        '초기화 직전에 자동 백업이 만들어지지만, 안전을 위해 먼저 「데이터 백업 · 복원」에서 백업해 두세요.',
+      '이 기기 데이터를 초기화할까요?',
+      '이 기기에 저장된 로컬 데이터와 앱 설정이 초기화돼요. 우리집 가계부 데이터는 그대로 남아요.',
       [
         { text: '취소', style: 'cancel' },
         {
-          text: '전부 삭제',
+          text: '초기화',
           style: 'destructive',
           onPress: () => {
             void (async () => {
@@ -188,7 +187,7 @@ export default function ProfileScreen() {
                 return;
               }
               resetAll();
-              toast.show('모든 데이터를 초기화했어요');
+              toast.show('이 기기 데이터를 초기화했어요');
             })();
           },
         },
@@ -455,7 +454,7 @@ export default function ProfileScreen() {
             ...noPad,
           }}
         >
-          초기화하면 이 기기의 로컬 가계부 데이터만 지워져요. 우리집 가계부 데이터에는 영향을 주지 않아요.{'\n'}
+          이 기기에 저장된 임시 데이터와 설정만 초기화해요. 우리집 가계부의 거래·예산·자산 데이터는 삭제되지 않아요.{'\n'}
           먼저 「데이터 백업 · 복원」에서 백업해 두는 것을 권장해요.
         </Text>
         <Pressable
@@ -474,7 +473,7 @@ export default function ProfileScreen() {
         >
           <AppIcon name="warn" size={14} color={colors.expenseText} />
           <Text style={{ fontFamily: fontFamily.semibold, fontSize: 13, color: colors.expenseText }}>
-            모든 데이터 초기화
+            이 기기 데이터 초기화
           </Text>
         </Pressable>
       </View>
