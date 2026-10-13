@@ -2,7 +2,7 @@ import Constants from 'expo-constants';
 import * as Linking from 'expo-linking';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { Alert, Pressable, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, Text, View } from 'react-native';
 
 import { AppIcon } from '@/components/AppIcon';
 import { BottomSheet } from '@/components/ui/BottomSheet';
@@ -426,6 +426,26 @@ export default function ProfileScreen() {
           last
         />
       </SettingsCard>
+
+      {/* 결제 알림 자동입력 STEP 1: Android-only dev / QA entry. The screen
+          only shows the listener's state and what it captured on this
+          device — no transaction is created from it yet. */}
+      {Platform.OS === 'android' && (
+        <>
+          <SectionLabel>실험 기능</SectionLabel>
+          <SettingsCard>
+            <Row
+              icon="bell"
+              iconBg={colors.neutralLight}
+              iconColor={colors.neutralText}
+              title="결제 알림 자동입력 (준비 중)"
+              sub="아직 테스트 단계예요. 거래는 자동으로 만들어지지 않아요."
+              onPress={() => router.push('/payment-notifications')}
+              last
+            />
+          </SettingsCard>
+        </>
+      )}
 
       <SectionLabel>계정</SectionLabel>
       <SettingsCard>

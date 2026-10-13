@@ -107,6 +107,7 @@ const HOUSEHOLD_READY_SCREENS = [
   'backup',
   'account-delete',
   'household-reset',
+  'payment-notifications',
   'guide',
 ];
 
@@ -742,6 +743,7 @@ function RootNav() {
         <Stack.Screen name="backup" options={MODAL} />
         <Stack.Screen name="account-delete" options={MODAL} />
         <Stack.Screen name="household-reset" options={MODAL} />
+        <Stack.Screen name="payment-notifications" options={MODAL} />
         <Stack.Screen name="guide" options={MODAL} />
       </Stack>
     </>

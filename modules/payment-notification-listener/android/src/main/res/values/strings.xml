@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- Shown in the system "notification access" list next to the app name. -->
+  <string name="payment_notification_listener_label">돈돈 결제 알림 읽기</string>
+</resources>

@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <!--
+      Merged into the app manifest by the Android manifest merger (this is a
+      library module), so android/app is never edited by hand.
+
+      exported="true" is required: the SYSTEM binds this service. It is only
+      bindable by a holder of BIND_NOTIFICATION_LISTENER_SERVICE (the system),
+      and only after the user turns notification access on for this app.
+    -->
+    <service
+      android:name="expo.modules.paymentnotificationlistener.PaymentNotificationListenerService"
+      android:exported="true"
+      android:label="@string/payment_notification_listener_label"
+      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+      <intent-filter>
+        <action android:name="android.service.notification.NotificationListenerService" />
+      </intent-filter>
+    </service>
+  </application>
+</manifest>
