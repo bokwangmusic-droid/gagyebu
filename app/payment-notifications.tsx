@@ -1,24 +1,29 @@
 /**
- * "결제 알림 자동입력 (준비 중)" — STEP 1 dev / QA screen for the Android
+ * "결제 알림 자동입력 (준비 중)" — STEP 1–2 dev / QA screen for the Android
  * notification-listener skeleton.
  *
  * What it does: shows the notification-access state, sends the user to the
  * system setting (after an in-app notice), edits the package allowlist and
- * lists what the listener captured on THIS device.
+ * lists what the listener captured on THIS device — each item with a test
+ * preview of the parsed payment candidate (src/lib/paymentNotification/).
  *
- * What it deliberately does not do yet: parse a payment, create or suggest a
- * transaction, link a card, pick a category, or send anything to the server.
+ * What it deliberately does not do yet: create or save a transaction, link a
+ * card, pick a category, or send anything to the server.
  * This file is wiring only — the native calls live in
  * src/services/paymentNotificationListener.ts.
  */
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, AppState, Pressable, Text, View } from 'react-native';
 
 import { Field, TextField } from '@/components/ui/controls';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
 import { DEFAULT_PAYMENT_NOTIFICATION_PACKAGES } from '@/data/paymentNotificationPackages';
+import { fmt } from '@/lib/format';
+import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
+import { parsePaymentNotification } from '@/lib/paymentNotification/registry';
+import { withPaymentRelations } from '@/lib/paymentNotification/relation';
 import {
   CAPTURED_MAX_ENTRIES,
   normalizeAllowedPackages,
@@ -56,6 +61,9 @@ export default function PaymentNotifications() {
   const [captured, setCaptured] = useState<CapturedNotification[]>([]);
   const [packageDraft, setPackageDraft] = useState('');
   const [listOpen, setListOpen] = useState(false);
+
+  // Aligned with `captured`. Display only — nothing is saved or merged.
+  const candidates = useMemo(() => withPaymentRelations(captured.map(parsePaymentNotification)), [captured]);
 
   const reload = useCallback(async () => {
     if (!supported) return;
@@ -199,7 +207,7 @@ export default function PaymentNotifications() {
               />
               {listOpen && captured.length === 0 && <Text style={bodyStyle}>아직 캡처된 알림이 없어요.</Text>}
               {listOpen &&
-                captured.map((item) => (
+                captured.map((item, index) => (
                   <View
                     key={`${item.notificationKey}|${item.postedAt}|${item.text}`}
                     style={{
@@ -218,6 +226,7 @@ export default function PaymentNotifications() {
                       <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>{item.title}</Text>
                     )}
                     {!!item.text && <Text style={bodyStyle}>{item.text}</Text>}
+                    <CandidatePreview candidate={candidates[index] ?? null} />
                   </View>
                 ))}
               {captured.length > 0 && <ActionButton label="캡처된 알림 모두 지우기" onPress={clearCaptured} danger />}
@@ -249,6 +258,67 @@ function Panel({ children }: { children: React.ReactNode }) {
       }}
     >
       {children}
+    </View>
+  );
+}
+
+const DIRECTION_LABEL: Record<ParsedPaymentCandidate['direction'], string> = {
+  outflow: '출금',
+  inflow: '입금',
+  unknown: '방향 확인 필요',
+};
+const CONFIDENCE_LABEL: Record<ParsedPaymentCandidate['confidence'], string> = {
+  high: '신뢰도 높음',
+  medium: '신뢰도 보통 · 일부 확인 필요',
+  low: '신뢰도 낮음 · 확인 필요',
+};
+
+/** STEP 2 test preview of the parser's reading. No save action on purpose. */
+function CandidatePreview({ candidate }: { candidate: ParsedPaymentCandidate | null }) {
+  const boxStyle = {
+    marginTop: 4,
+    padding: 8,
+    borderRadius: radii.md,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: 2,
+  } as const;
+  const line = { fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub } as const;
+  const muted = { fontFamily: fontFamily.medium, fontSize: 11, color: colors.textMuted } as const;
+  if (!candidate || candidate.direction === 'unknown' || candidate.amount == null) {
+    return (
+      <View style={boxStyle}>
+        <Text style={muted}>해석 결과</Text>
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.warningText }}>
+          해석 불가 / 확인 필요{!candidate ? ' · 지원하지 않는 알림' : ''}
+        </Text>
+        {!!candidate && candidate.reasons.length > 0 && <Text style={muted}>{candidate.reasons.join(' · ')}</Text>}
+      </View>
+    );
+  }
+  return (
+    <View style={boxStyle}>
+      <Text style={muted}>해석 결과 (테스트 · 저장되지 않음)</Text>
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>
+        {DIRECTION_LABEL[candidate.direction]} · {fmt(candidate.amount)}원
+      </Text>
+      <Text style={line}>
+        계좌:{' '}
+        {candidate.accountName
+          ? `${candidate.accountName}${candidate.accountLast4 ? ` ****${candidate.accountLast4}` : ''}`
+          : '확인 필요'}
+      </Text>
+      <Text style={line}>상대: {candidate.counterparty ?? '확인 필요'}</Text>
+      {!!candidate.merchantCandidate && <Text style={line}>메모/가맹점 후보: {candidate.merchantCandidate}</Text>}
+      {!!candidate.relationKey && (
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.primaryStrong }}>
+          관련 알림 가능성 있음 · 같은 금액의 반대 방향 알림이 10초 안에 있어요
+        </Text>
+      )}
+      <Text style={{ ...muted, color: candidate.confidence === 'high' ? colors.textMuted : colors.warningText }}>
+        {CONFIDENCE_LABEL[candidate.confidence]}
+      </Text>
     </View>
   );
 }
