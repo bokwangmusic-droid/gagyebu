@@ -9,6 +9,8 @@
  *   - same non-null amount
  *   - one outflow, one inflow
  *   - |occurredAt difference| <= windowMs (default 10 s, inclusive)
+ *   - neither side is a card payment (instrument 'card') — a card payment
+ *     is not one side of an account-to-account move
  * Each candidate joins at most one pair; an outflow pairs with the
  * time-closest unpaired inflow.
  */
@@ -26,7 +28,7 @@ export function findPaymentRelations(
 ): (string | null)[] {
   const keys: (string | null)[] = candidates.map(() => null);
   const pairable = (c: ParsedPaymentCandidate | null): c is ParsedPaymentCandidate =>
-    c != null && c.amount != null && c.direction !== 'unknown';
+    c != null && c.amount != null && c.direction !== 'unknown' && c.instrument !== 'card';
 
   // Earliest outflow first so the result does not depend on list order.
   const outflows = candidates

@@ -13,6 +13,9 @@ export type PaymentDirection = 'outflow' | 'inflow' | 'unknown';
 
 export type PaymentCandidateConfidence = 'high' | 'medium' | 'low';
 
+/** Why a notification is known NOT to be a money move (e.g. an ad). */
+export type PaymentIgnoredReason = 'promotion';
+
 export interface ParsedPaymentCandidate {
   sourcePackage: string;
   /** The captured notification's key — device-local, NOT unique per payment. */
@@ -25,10 +28,15 @@ export interface ParsedPaymentCandidate {
   amount: number | null;
   currency: 'KRW' | null;
 
-  /** The user's own account on this notification, e.g. "입출금통장". */
+  /**
+   * The user's own account on this notification, e.g. "입출금통장" — or,
+   * when `instrument` is 'card', the card, e.g. "체크카드".
+   */
   accountName: string | null;
   /** Its last 4 digits as printed, e.g. "8815". */
   accountLast4: string | null;
+  /** 'card' = a card payment; accountName / accountLast4 then name the card. Absent = account move. */
+  instrument?: 'card';
 
   /** The other side of the move as printed (a person, a company, an account). */
   counterparty: string | null;
@@ -44,6 +52,13 @@ export interface ParsedPaymentCandidate {
   confidence: PaymentCandidateConfidence;
   /** Short Korean notes on how the reading was made. Never contains raw text. */
   reasons: string[];
+
+  /**
+   * Set when the parser recognised the notification as NOT a money move
+   * (e.g. a promotion). Such a candidate is never a transaction candidate:
+   * direction 'unknown', amount null, confidence 'low'.
+   */
+  ignoredReason?: PaymentIgnoredReason;
 
   /**
    * Set by findPaymentRelations(): candidates sharing a key are possibly the

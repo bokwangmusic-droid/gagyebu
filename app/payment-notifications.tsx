@@ -286,6 +286,16 @@ function CandidatePreview({ candidate }: { candidate: ParsedPaymentCandidate | n
   } as const;
   const line = { fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub } as const;
   const muted = { fontFamily: fontFamily.medium, fontSize: 11, color: colors.textMuted } as const;
+  if (candidate?.ignoredReason) {
+    return (
+      <View style={boxStyle}>
+        <Text style={muted}>해석 결과</Text>
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.textMuted }}>
+          거래 후보 아님 · 광고/혜택 알림
+        </Text>
+      </View>
+    );
+  }
   if (!candidate || candidate.direction === 'unknown' || candidate.amount == null) {
     return (
       <View style={boxStyle}>
@@ -297,20 +307,27 @@ function CandidatePreview({ candidate }: { candidate: ParsedPaymentCandidate | n
       </View>
     );
   }
+  const isCard = candidate.instrument === 'card';
   return (
     <View style={boxStyle}>
       <Text style={muted}>해석 결과 (테스트 · 저장되지 않음)</Text>
       <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>
-        {DIRECTION_LABEL[candidate.direction]} · {fmt(candidate.amount)}원
+        {isCard ? '카드 결제' : DIRECTION_LABEL[candidate.direction]} · {fmt(candidate.amount)}원
       </Text>
       <Text style={line}>
-        계좌:{' '}
+        {isCard ? '카드' : '계좌'}:{' '}
         {candidate.accountName
           ? `${candidate.accountName}${candidate.accountLast4 ? ` ****${candidate.accountLast4}` : ''}`
           : '확인 필요'}
       </Text>
-      <Text style={line}>상대: {candidate.counterparty ?? '확인 필요'}</Text>
-      {!!candidate.merchantCandidate && <Text style={line}>메모/가맹점 후보: {candidate.merchantCandidate}</Text>}
+      {isCard ? (
+        <Text style={line}>가맹점 후보: {candidate.merchantCandidate ?? '확인 필요'}</Text>
+      ) : (
+        <>
+          <Text style={line}>상대: {candidate.counterparty ?? '확인 필요'}</Text>
+          {!!candidate.merchantCandidate && <Text style={line}>메모/가맹점 후보: {candidate.merchantCandidate}</Text>}
+        </>
+      )}
       {!!candidate.relationKey && (
         <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.primaryStrong }}>
           관련 알림 가능성 있음 · 같은 금액의 반대 방향 알림이 10초 안에 있어요

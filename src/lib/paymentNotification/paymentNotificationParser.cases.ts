@@ -34,6 +34,13 @@ const OUT_TITLE = '출금 48,000원';
 const OUT_TEXT = '입출금통장(1111) → 홍*동(테스트짐 ○○점 PT) 잔액 202,000원';
 const IN_TITLE = '입금 48,000원';
 const IN_TEXT = '홍*동 → 개인사업자통장(2222) 잔액 1,919,404원';
+// The real card-payment and promotion captures, kept verbatim on purpose:
+// the requested regression checks are on these exact values.
+const CARD_TITLE = '카드 결제 5,400원';
+const CARD_TEXT = '체크카드(3308) | 지에스25 디오르나인 잔액 190,500원';
+const PROMO_TITLE = '최대 5만원 결제 혜택 도착!';
+const PROMO_TEXT =
+  '결제 혜택은 이틀 동안 확인 가능해요. 알림 해지 : 로그인 > 혜택 > 결제하고 랜덤 현금 받기 > 알림 해지';
 
 const kb = (title: string, text: string, postedAt = NOW, key = 'k'): PaymentNotificationInput => ({
   notificationKey: key,
@@ -45,7 +52,7 @@ const kb = (title: string, text: string, postedAt = NOW, key = 'k'): PaymentNoti
 
 const show = (c: ParsedPaymentCandidate | null) =>
   c
-    ? `${c.direction} ${c.amount} acct=${c.accountName}/${c.accountLast4} cp=${c.counterparty} memo=${c.merchantCandidate} ${c.confidence} [${c.reasons.join('; ')}]`
+    ? `${c.ignoredReason ? `ignored=${c.ignoredReason} ` : ''}${c.instrument ?? ''} ${c.direction} ${c.amount} acct=${c.accountName}/${c.accountLast4} cp=${c.counterparty} memo=${c.merchantCandidate} ${c.confidence} [${c.reasons.join('; ')}]`
     : 'null';
 
 type Want = Partial<
@@ -59,6 +66,8 @@ type Want = Partial<
     | 'counterparty'
     | 'merchantCandidate'
     | 'confidence'
+    | 'instrument'
+    | 'ignoredReason'
   >
 >;
 
@@ -215,6 +224,166 @@ export function runPaymentNotificationParserCases(): { results: CaseResult[]; pa
     merchantCandidate: null,
     confidence: 'medium',
   });
+
+  // ── card payment (real capture) ───────────────────────────────
+  expect('CARD 1 real 카드 결제 → outflow 5,400, card 3308, merchant candidate, high', kb(CARD_TITLE, CARD_TEXT), {
+    direction: 'outflow',
+    amount: 5400,
+    currency: 'KRW',
+    instrument: 'card',
+    accountName: '체크카드',
+    accountLast4: '3308',
+    counterparty: null,
+    merchantCandidate: '지에스25 디오르나인',
+    confidence: 'high',
+    ignoredReason: undefined,
+  });
+  check(
+    'CARD 2 잔액 190,500 is never the amount and the merchant has no 잔액',
+    (() => {
+      const c = parsePaymentNotification(kb(CARD_TITLE, CARD_TEXT));
+      return (
+        c?.amount === 5400 &&
+        !c.merchantCandidate?.includes('잔액') &&
+        c.reasons.includes('잔액은 금액에서 제외')
+      );
+    })(),
+  );
+  expect('CARD 3 no balance in body, no space in title', kb('카드결제5,400원', '체크카드(3308)|지에스25 디오르나인'), {
+    amount: 5400,
+    accountLast4: '3308',
+    merchantCandidate: '지에스25 디오르나인',
+    confidence: 'high',
+  });
+  expect('CARD 4 malformed title amount → outflow, amount null, low', kb('카드 결제 5,40원', CARD_TEXT), {
+    direction: 'outflow',
+    amount: null,
+    currency: null,
+    accountName: null,
+    merchantCandidate: null,
+    confidence: 'low',
+  });
+  expect('CARD 5 title without amount → unknown, body balance not used', kb('카드 결제', CARD_TEXT), {
+    direction: 'unknown',
+    amount: null,
+    confidence: 'low',
+  });
+  expect('CARD 6 카드 결제 inside a sentence is not accepted', kb('카드 결제 5,400원이 승인 대기 중이에요', CARD_TEXT), {
+    direction: 'unknown',
+    amount: null,
+    confidence: 'low',
+  });
+  expect('CARD 7 카드 결제 취소 is not an outflow', kb('카드 결제 취소 5,400원', CARD_TEXT), {
+    direction: 'unknown',
+    amount: null,
+    confidence: 'low',
+  });
+  expect('CARD 8 empty body → medium', kb(CARD_TITLE, ''), {
+    amount: 5400,
+    accountName: null,
+    merchantCandidate: null,
+    confidence: 'medium',
+  });
+  expect('CARD 9 no | separator → not guessed, medium', kb(CARD_TITLE, '체크카드(3308) 지에스25 디오르나인 잔액 190,500원'), {
+    amount: 5400,
+    accountName: null,
+    merchantCandidate: null,
+    confidence: 'medium',
+  });
+  expect('CARD 10 two | separators → not guessed', kb(CARD_TITLE, '체크카드(3308) | 지에스25 | 디오르나인'), {
+    accountName: null,
+    merchantCandidate: null,
+    confidence: 'medium',
+  });
+  expect('CARD 11 card without last 4 → card null, merchant kept, medium', kb(CARD_TITLE, '체크카드 | 지에스25 디오르나인'), {
+    accountName: null,
+    accountLast4: null,
+    merchantCandidate: '지에스25 디오르나인',
+    confidence: 'medium',
+  });
+  expect('CARD 12 merchant missing', kb(CARD_TITLE, '체크카드(3308) | 잔액 190,500원'), {
+    amount: 5400,
+    accountLast4: '3308',
+    merchantCandidate: null,
+    confidence: 'medium',
+  });
+  expect('CARD 13 a 잔액 not at the end never leaks into the merchant', kb(CARD_TITLE, '체크카드(3308) | 지에스25 잔액 190,500원 안내'), {
+    amount: 5400,
+    merchantCandidate: null,
+    confidence: 'medium',
+  });
+  check(
+    'CARD 14 card payment + same-amount inflow within 10 s → not related',
+    (() => {
+      const card = parsePaymentNotification(kb(CARD_TITLE, CARD_TEXT, NOW, 'c'));
+      const inflow = parsePaymentNotification(kb('입금 5,400원', IN_TEXT, NOW + 2 * SECOND, 'i'));
+      const keys = findPaymentRelations([card, inflow]);
+      const copies = withPaymentRelations([card, inflow]);
+      return (
+        card?.instrument === 'card' &&
+        inflow?.direction === 'inflow' &&
+        keys.every((k) => k === null) &&
+        copies.every((c) => c?.relationKey === null)
+      );
+    })(),
+  );
+  check(
+    'CARD 15 a card payment does not take the inflow away from a real 출금 of the same amount',
+    (() => {
+      const card = parsePaymentNotification(kb('카드 결제 48,000원', CARD_TEXT, NOW - SECOND, 'c'));
+      const outC2 = parsePaymentNotification(kb(OUT_TITLE, OUT_TEXT, NOW + 3 * SECOND, 'o'));
+      const inflow = parsePaymentNotification(kb(IN_TITLE, IN_TEXT, NOW, 'i'));
+      const keys = findPaymentRelations([card, outC2, inflow]);
+      return keys[0] === null && keys[1] != null && keys[1] === keys[2];
+    })(),
+  );
+
+  // ── promotions ────────────────────────────────────────────────
+  expect('PROMO 1 real 혜택 ad → ignored, no amount, not a candidate', kb(PROMO_TITLE, PROMO_TEXT), {
+    ignoredReason: 'promotion',
+    direction: 'unknown',
+    amount: null,
+    currency: null,
+    merchantCandidate: null,
+    confidence: 'low',
+  });
+  check(
+    'PROMO 2 ignored promotion never joins a relation',
+    findPaymentRelations([
+      parsePaymentNotification(kb(PROMO_TITLE, PROMO_TEXT)),
+      parsePaymentNotification(kb('입금 50,000원', IN_TEXT)),
+    ]).every((k) => k === null),
+  );
+  expect('PROMO 3 혜택 title without an opt-out marker is NOT ignored (just unknown)', kb(PROMO_TITLE, '결제 혜택은 이틀 동안 확인 가능해요.'), {
+    ignoredReason: undefined,
+    direction: 'unknown',
+    confidence: 'low',
+  });
+  expect('PROMO 4 a 카드 결제 title is never ignored, even with 혜택 / 알림 해지 in the body', kb(CARD_TITLE, '체크카드(3308) | 혜택카페 알림 해지 잔액 1원'), {
+    ignoredReason: undefined,
+    direction: 'outflow',
+    amount: 5400,
+  });
+  expect('PROMO 5 an 출금 title is never ignored, even with (광고) in the body', kb(OUT_TITLE, '(광고) 입출금통장(1111) → 홍*동'), {
+    ignoredReason: undefined,
+    direction: 'outflow',
+    amount: 48000,
+  });
+  expect('PROMO 6 opt-out marker but a 잔액 in the body → not ignored', kb('결제 혜택 안내', '체크카드(3308) 잔액 190,500원 알림 해지'), {
+    ignoredReason: undefined,
+    direction: 'unknown',
+  });
+  expect('PROMO 7 (광고) title → ignored', kb('(광고) 이번 주 혜택', '지금 확인하세요'), {
+    ignoredReason: 'promotion',
+    amount: null,
+  });
+  check(
+    'PROMO 8 existing 출금/입금 samples carry no ignoredReason / instrument',
+    [kb(OUT_TITLE, OUT_TEXT), kb(IN_TITLE, IN_TEXT)].every((i) => {
+      const c = parsePaymentNotification(i);
+      return c != null && c.ignoredReason === undefined && c.instrument === undefined;
+    }),
+  );
 
   // ── empty / registry ──────────────────────────────────────────
   expect('EMPTY 1 empty title and body → null', kb('', ''), null);

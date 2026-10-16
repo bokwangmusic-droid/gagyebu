@@ -23,6 +23,22 @@
  *     counterparty (possibly the user's own account).
  *   - high = title and body both fully understood; medium = title only;
  *     low = title not understood.
+ *
+ * Card payments (real capture, masked):
+ *   title  "카드 결제 5,400원"
+ *   text   "체크카드(0000) | ○○25 ○○점 잔액 190,500원"
+ *   - the title must be exactly "카드 결제 N원" → outflow; amount from the
+ *     title only (the body's 잔액 is cut off first, as above).
+ *   - body = "<card>(<4 digits>) | <merchant>". The card goes into
+ *     accountName / accountLast4 with instrument 'card'; the merchant is a
+ *     merchantCandidate only (counterparty stays null).
+ *   - "카드 결제 취소 …" or any other wording is NOT matched (unknown / low).
+ *
+ * Promotions: a notification whose title is NOT a transaction title, whose
+ * body carries no "잔액 N원", AND which contains an ad opt-out marker
+ * ("알림 해지", "수신 거부", "(광고)", "[광고]") gets ignoredReason
+ * 'promotion'. A word like "혜택" alone is never enough, and a transaction
+ * title is never ignored.
  */
 import type {
   ParsedPaymentCandidate,
@@ -33,12 +49,16 @@ import type {
 
 export const KAKAOBANK_PACKAGE = 'com.kakaobank.channel';
 export const KAKAOBANK_PARSER_ID = 'kakaobank';
-export const KAKAOBANK_PARSER_VERSION = 1;
+export const KAKAOBANK_PARSER_VERSION = 2;
 
 const MAX_AMOUNT = 1_000_000_000;
 const MAX_NAME_LENGTH = 40;
 
 const TITLE_RE = /^(출금|입금)\s*([\d,]+)\s*원$/;
+const CARD_TITLE_RE = /^카드 ?결제\s*([\d,]+)\s*원$/;
+const CARD_SEPARATOR = '|';
+const BALANCE_ANYWHERE_RE = /잔액\s*:?\s*[\d,]+\s*원/;
+const PROMOTION_MARKER_RE = /알림\s*해지|수신\s*거부|\(광고\)|\[광고\]/;
 const AMOUNT_FORMAT_RE = /^(?:[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d*)$/;
 const TRAILING_BALANCE_RE = /\s*잔액\s*:?\s*[\d,]+\s*원\s*$/;
 const ARROW = '→';
@@ -77,9 +97,17 @@ export function parseKakaoBankNotification(input: PaymentNotificationInput): Par
     reasons,
   };
 
+  const cardMatch = CARD_TITLE_RE.exec(title);
+  if (cardMatch) return parseCardPayment(cardMatch[1], text, candidate, reasons);
+
   const titleMatch = TITLE_RE.exec(title);
   if (!titleMatch) {
-    reasons.push('제목이 "출금/입금 N원" 형식이 아님');
+    if (isPromotion(title, text)) {
+      candidate.ignoredReason = 'promotion';
+      reasons.push('광고/혜택 알림 — 거래 후보 아님');
+      return candidate;
+    }
+    reasons.push('제목이 "출금/입금/카드 결제 N원" 형식이 아님');
     return candidate;
   }
   const direction: PaymentDirection = titleMatch[1] === '출금' ? 'outflow' : 'inflow';
@@ -156,6 +184,72 @@ function parseBody(
     return false;
   }
   return ok;
+}
+
+/** "카드 결제 N원": outflow, amount from the title token only. */
+function parseCardPayment(
+  amountToken: string,
+  text: string,
+  out: ParsedPaymentCandidate,
+  reasons: string[],
+): ParsedPaymentCandidate {
+  out.direction = 'outflow';
+  out.instrument = 'card';
+  out.amount = parseWon(amountToken);
+  if (out.amount == null) {
+    reasons.push('제목의 금액이 올바르지 않음');
+    return out;
+  }
+  out.currency = 'KRW';
+  reasons.push('제목: 카드 결제');
+  out.confidence = confidenceOf(parseCardBody(text, out, reasons));
+  return out;
+}
+
+/** Fills card / merchant fields. Returns whether the body was fully understood. */
+function parseCardBody(text: string, out: ParsedPaymentCandidate, reasons: string[]): boolean {
+  if (!text) {
+    reasons.push('본문 없음');
+    return false;
+  }
+  const body = text.replace(TRAILING_BALANCE_RE, '');
+  if (body !== text) reasons.push('잔액은 금액에서 제외');
+
+  const sides = body.split(CARD_SEPARATOR);
+  if (sides.length !== 2) {
+    reasons.push(sides.length < 2 ? '본문에 | 없음' : '본문에 | 가 여러 개');
+    return false;
+  }
+  const [cardSide, merchantSide] = sides.map((s) => s.trim());
+
+  let ok = true;
+  const card = ACCOUNT_RE.exec(cardSide);
+  if (card && card[1].length <= MAX_NAME_LENGTH) {
+    out.accountName = card[1].trim();
+    out.accountLast4 = card[2];
+  } else {
+    reasons.push('카드 형식을 확인하지 못함');
+    ok = false;
+  }
+
+  if (
+    !merchantSide ||
+    merchantSide.length > MAX_NAME_LENGTH ||
+    merchantSide.includes(ARROW) ||
+    merchantSide.includes('잔액')
+  ) {
+    reasons.push('가맹점을 확인하지 못함');
+    return false;
+  }
+  out.merchantCandidate = merchantSide;
+  reasons.push('가맹점은 "후보"로만 표시');
+  return ok;
+}
+
+/** Conservative: needs an ad opt-out marker, and never fires on a body with a 잔액. */
+function isPromotion(title: string, text: string): boolean {
+  if (BALANCE_ANYWHERE_RE.test(text)) return false;
+  return PROMOTION_MARKER_RE.test(title) || PROMOTION_MARKER_RE.test(text);
 }
 
 function confidenceOf(bodyOk: boolean): PaymentCandidateConfidence {
