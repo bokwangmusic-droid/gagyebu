@@ -31,6 +31,7 @@ import { cardTypeOf, debitSourceAssetId, installmentPerMonth } from '@/lib/card'
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
 import { uid } from '@/lib/id';
+import { parseInputPrefillParams, type InputPrefill } from '@/lib/inputPrefill';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
 import type { RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
@@ -203,6 +204,9 @@ function applyMonthsKey(cur: string, k: string): string {
  *
  *   /input            -> new-transaction form  (REMOTE_FINANCE_WRITE.transactionCreate)
  *   /input?id=<txn>   -> edit form             (REMOTE_FINANCE_WRITE.transactionEdit)
+ *   /input?prefillType=…&prefillAmount=… -> new-transaction form with
+ *                        starting values (결제 알림 후보함, src/lib/inputPrefill.ts).
+ *                        Seeds the form only — saving is the same create path.
  *
  * Either capability off -> ReadOnlyRouteNotice. The capability + param
  * checks live in this thin wrapper so TransactionForm keeps an
@@ -212,13 +216,15 @@ function applyMonthsKey(cur: string, k: string): string {
 export default function InputRoute() {
   const params = useLocalSearchParams<{ id?: string | string[] }>();
   const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
+  // Read once per mount: a prefill seeds the form's initial state only.
+  const [prefill] = useState(() => (idParam ? null : parseInputPrefillParams(params, toDateKey(new Date()))));
 
   if (idParam) {
     if (!REMOTE_FINANCE_WRITE.transactionEdit) return <ReadOnlyRouteNotice title="거래 수정" />;
     return <TransactionFormRoute editId={idParam} />;
   }
   if (!REMOTE_FINANCE_WRITE.transactionCreate) return <ReadOnlyRouteNotice title="거래 입력" />;
-  return <TransactionFormRoute editId={null} />;
+  return <TransactionFormRoute editId={null} prefill={prefill} />;
 }
 
 type FormMode =
@@ -231,7 +237,7 @@ type FormMode =
  * itself only mounts once its `mode` is fully known, so its hooks stay
  * unconditional; the `key` forces a clean remount when the target changes.
  */
-function TransactionFormRoute({ editId }: { editId: string | null }) {
+function TransactionFormRoute({ editId, prefill = null }: { editId: string | null; prefill?: InputPrefill | null }) {
   const router = useRouter();
   const { status, error, transactions, transactionMeta, refresh } = useFinanceRead();
 
@@ -243,7 +249,7 @@ function TransactionFormRoute({ editId }: { editId: string | null }) {
   const frozenRef = useRef<{ transaction: Transaction; meta: RemoteTransactionMeta } | null>(null);
 
   if (editId == null) {
-    return <TransactionForm key="create" mode={{ kind: 'create' }} />;
+    return <TransactionForm key="create" mode={{ kind: 'create' }} prefill={prefill} />;
   }
 
   const liveTxn = transactions.find((t) => t.id === editId) ?? null;
@@ -333,7 +339,7 @@ function EditUnavailable({
   );
 }
 
-function TransactionForm({ mode }: { mode: FormMode }) {
+function TransactionForm({ mode, prefill = null }: { mode: FormMode; prefill?: InputPrefill | null }) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const toast = useToast();
@@ -359,11 +365,14 @@ function TransactionForm({ mode }: { mode: FormMode }) {
 
   const saveLabel = isEdit ? '수정하기' : '저장하기';
 
-  const [type, setType] = useState<TxnType>(editing?.type ?? 'expense');
-  const [amount, setAmount] = useState(editing ? String(editing.amount) : '');
+  // A prefill (create mode only) seeds type / amount / memo / date; the
+  // category, 결제수단 and card are left for the user to pick.
+  const seed = editing ? null : prefill;
+  const [type, setType] = useState<TxnType>(editing?.type ?? seed?.type ?? 'expense');
+  const [amount, setAmount] = useState(editing ? String(editing.amount) : seed ? String(seed.amount) : '');
   const [category, setCategory] = useState(editing?.category ?? 'food');
-  const [memo, setMemo] = useState(editing?.memo ?? '');
-  const [selectedDate, setSelectedDate] = useState(() => toDateKey(editing?.date ?? new Date()));
+  const [memo, setMemo] = useState(editing?.memo ?? seed?.memo ?? '');
+  const [selectedDate, setSelectedDate] = useState(() => seed?.dateKey ?? toDateKey(editing?.date ?? new Date()));
 
   // One inline keypad, one active target. `padVisible`/`setPadVisible` are kept
   // as a thin shim over it so every existing call site ("collapse the pad",

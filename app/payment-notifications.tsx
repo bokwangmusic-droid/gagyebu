@@ -7,20 +7,36 @@
  * lists what the listener captured on THIS device — each item with a test
  * preview of the parsed payment candidate (src/lib/paymentNotification/).
  *
- * What it deliberately does not do yet: create or save a transaction, link a
- * card, pick a category, or send anything to the server.
+ * STEP 3 — "자동입력 후보" (candidateInbox.ts): the readable notifications as
+ * candidates with a device-local status. "가계부에 입력" only opens the
+ * ordinary /input form with starting values; the user saves there. The input
+ * form does not report back whether it saved, so opening it only marks the
+ * candidate "입력 화면으로 보냄" — 처리 완료 is always the user's own tap.
+ *
+ * What it deliberately does not do yet: create or save a transaction itself,
+ * link a card, pick a category, handle a cancellation / refund, merge a
+ * transfer pair, or send anything to the server.
  * This file is wiring only — the native calls live in
  * src/services/paymentNotificationListener.ts.
  */
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, AppState, Pressable, Text, View } from 'react-native';
 
 import { Field, TextField } from '@/components/ui/controls';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
 import { DEFAULT_PAYMENT_NOTIFICATION_PACKAGES } from '@/data/paymentNotificationPackages';
-import { fmt } from '@/lib/format';
+import { fmt, toDateKey } from '@/lib/format';
+import { inputPrefillToParams } from '@/lib/inputPrefill';
+import {
+  buildPaymentInbox,
+  markCandidateHandled,
+  markCandidatePending,
+  markCandidateSent,
+  type PaymentCandidateState,
+  type PaymentInboxItem,
+} from '@/lib/paymentNotification/candidateInbox';
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import { parsePaymentNotification } from '@/lib/paymentNotification/registry';
 import { withPaymentRelations } from '@/lib/paymentNotification/relation';
@@ -29,6 +45,7 @@ import {
   normalizeAllowedPackages,
   type CapturedNotification,
 } from '@/lib/paymentNotificationBuffer';
+import { loadPaymentCandidateState, savePaymentCandidateState } from '@/services/paymentCandidateState';
 import {
   clearCapturedNotifications,
   getAllowedPackages,
@@ -61,9 +78,49 @@ export default function PaymentNotifications() {
   const [captured, setCaptured] = useState<CapturedNotification[]>([]);
   const [packageDraft, setPackageDraft] = useState('');
   const [listOpen, setListOpen] = useState(false);
+  const [handledOpen, setHandledOpen] = useState(false);
+  // 후보함 status (device-local). Actions wait for the stored state so a tap
+  // can never overwrite it with an empty map.
+  const [candidateState, setCandidateState] = useState<PaymentCandidateState>({});
+  const [candidateStateLoaded, setCandidateStateLoaded] = useState(false);
+  const candidateStateRef = useRef<PaymentCandidateState>({});
 
   // Aligned with `captured`. Display only — nothing is saved or merged.
   const candidates = useMemo(() => withPaymentRelations(captured.map(parsePaymentNotification)), [captured]);
+
+  const inbox = useMemo(
+    () => buildPaymentInbox(captured, candidateState, toDateKey(new Date())),
+    [captured, candidateState],
+  );
+  const pendingItems = inbox.items.filter((item) => item.status === 'pending');
+  const handledItems = inbox.items.filter((item) => item.status === 'handled');
+
+  useEffect(() => {
+    let alive = true;
+    void loadPaymentCandidateState().then((loaded) => {
+      if (!alive) return;
+      candidateStateRef.current = loaded;
+      setCandidateState(loaded);
+      setCandidateStateLoaded(true);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const updateCandidateState = (change: (state: PaymentCandidateState) => PaymentCandidateState) => {
+    if (!candidateStateLoaded) return;
+    const next = change(candidateStateRef.current);
+    candidateStateRef.current = next;
+    setCandidateState(next);
+    void savePaymentCandidateState(next);
+  };
+
+  const openInput = (item: PaymentInboxItem) => {
+    if (!item.prefill || !candidateStateLoaded) return;
+    updateCandidateState((state) => markCandidateSent(state, item.fingerprint, Date.now()));
+    router.push({ pathname: '/input', params: inputPrefillToParams(item.prefill) });
+  };
 
   const reload = useCallback(async () => {
     if (!supported) return;
@@ -143,8 +200,9 @@ export default function PaymentNotifications() {
             아직 준비 중인 기능이에요
           </Text>
           <Text style={bodyStyle}>
-            카드·은행 앱의 결제 알림을 읽어 가계부 입력을 돕는 기능을 만들고 있어요. 지금은 알림이 이 기기에
-            제대로 수신되는지만 확인하는 테스트 단계라서, 거래가 자동으로 만들어지지 않아요.
+            카드·은행 앱의 결제 알림을 읽어 가계부 입력을 돕는 기능을 만들고 있어요. 받은 알림은 아래
+            「자동입력 후보」에 모이고, 거래가 자동으로 저장되지는 않아요. 「가계부에 입력」을 누르면 입력
+            화면이 열리고, 내용을 확인한 뒤 직접 저장해야 가계부에 들어가요.
           </Text>
           <Text style={bodyStyle}>{DISCLOSURE}</Text>
         </Panel>
@@ -189,6 +247,48 @@ export default function PaymentNotifications() {
                 />
               </Field>
               <ActionButton label="추가" onPress={() => void addPackage()} disabled={!packageDraft.trim()} />
+            </Panel>
+
+            <Panel>
+              <StatusRow label="자동입력 후보" value={`확인 대기 ${pendingItems.length}건`} ok={pendingItems.length > 0} />
+              {pendingItems.length === 0 && <Text style={bodyStyle}>확인할 결제 알림이 없어요.</Text>}
+              {pendingItems.map((item) => (
+                <InboxCard
+                  key={item.fingerprint}
+                  item={item}
+                  disabled={!candidateStateLoaded}
+                  onInput={() => openInput(item)}
+                  onHandled={() =>
+                    updateCandidateState((state) => markCandidateHandled(state, item.fingerprint, Date.now()))
+                  }
+                />
+              ))}
+              {inbox.unreadableCount > 0 && (
+                <Text style={{ ...bodyStyle, fontSize: 12, color: colors.warningText }}>
+                  확인 필요 · 아직 지원하지 않는 알림 형식 {inbox.unreadableCount}건 — 아래 테스트 알림 목록에서 원문을
+                  볼 수 있어요. 지원되면 후보로 나타나요.
+                </Text>
+              )}
+              {inbox.ignoredCount > 0 && (
+                <Text style={{ ...bodyStyle, fontSize: 12, color: colors.textMuted }}>
+                  광고/혜택 알림 {inbox.ignoredCount}건은 후보에서 제외했어요.
+                </Text>
+              )}
+              {handledItems.length > 0 && (
+                <ActionButton
+                  label={handledOpen ? '처리한 후보 접기' : `처리한 후보 ${handledItems.length}건 보기`}
+                  onPress={() => setHandledOpen((open) => !open)}
+                />
+              )}
+              {handledOpen &&
+                handledItems.map((item) => (
+                  <InboxCard
+                    key={item.fingerprint}
+                    item={item}
+                    disabled={!candidateStateLoaded}
+                    onPending={() => updateCandidateState((state) => markCandidatePending(state, item.fingerprint))}
+                  />
+                ))}
             </Panel>
 
             <Panel>
@@ -272,6 +372,112 @@ const CONFIDENCE_LABEL: Record<ParsedPaymentCandidate['confidence'], string> = {
   medium: '신뢰도 보통 · 일부 확인 필요',
   low: '신뢰도 낮음 · 확인 필요',
 };
+
+const KIND_LABEL: Record<PaymentInboxItem['kind'], string> = {
+  card_payment: '카드 결제',
+  card_cancellation: '카드 결제 취소',
+  inflow: '입금',
+  outflow: '출금',
+};
+
+/**
+ * One 후보함 entry. "가계부에 입력" only opens /input with starting values —
+ * never saves. A cancellation has no input action (원거래 매칭 / 환불 처리
+ * is not designed yet).
+ */
+function InboxCard({
+  item,
+  disabled,
+  onInput,
+  onHandled,
+  onPending,
+}: {
+  item: PaymentInboxItem;
+  disabled: boolean;
+  onInput?: () => void;
+  onHandled?: () => void;
+  onPending?: () => void;
+}) {
+  const c = item.candidate;
+  const line = { fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub } as const;
+  const muted = { fontFamily: fontFamily.medium, fontSize: 11, color: colors.textMuted } as const;
+  const notice = { fontFamily: fontFamily.bold, fontSize: 12, color: colors.warningText } as const;
+  const isCard = item.kind === 'card_payment' || item.kind === 'card_cancellation';
+  const last4 = c.accountLast4 ? `****${c.accountLast4}` : '확인 필요';
+  return (
+    <View
+      style={{
+        padding: 12,
+        borderRadius: radii.md,
+        backgroundColor: colors.bg,
+        borderWidth: 1,
+        borderColor: colors.border,
+        gap: 4,
+      }}
+    >
+      <Text style={muted}>
+        {formatPostedAt(c.occurredAt)} · {CONFIDENCE_LABEL[c.confidence]}
+        {item.status === 'handled' ? ' · 처리 완료' : item.sentToInput ? ' · 입력 화면으로 보냄' : ''}
+      </Text>
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>
+        {KIND_LABEL[item.kind]} · {fmt(c.amount ?? 0)}원
+      </Text>
+      {isCard ? (
+        <>
+          <Text style={line}>가맹점: {c.merchantCandidate ?? '확인 필요'}</Text>
+          <Text style={line}>
+            카드: {c.accountName ?? '확인 필요'} {last4}
+          </Text>
+        </>
+      ) : (
+        <>
+          <Text style={line}>상대: {c.counterparty ?? '확인 필요'}</Text>
+          {!!c.merchantCandidate && <Text style={line}>메모: {c.merchantCandidate}</Text>}
+          <Text style={line}>
+            계좌: {c.accountName ?? '확인 필요'} {last4}
+          </Text>
+        </>
+      )}
+      {item.kind === 'card_cancellation' && (
+        <Text style={notice}>취소/환불 처리 준비 중 · 아직 가계부에 반영할 수 없어요</Text>
+      )}
+      {item.transferWarning && (
+        <Text style={notice}>
+          계좌이체 가능성 ·{' '}
+          {c.relationKey ? '같은 금액의 반대 방향 알림이 10초 안에 있어요' : '상대가 계좌 형식이에요'}. 내 계좌 간
+          이동이라면 수입/지출로 입력하지 마세요.
+        </Text>
+      )}
+      {item.kind === 'outflow' && !item.transferWarning && (
+        <Text style={muted}>출금은 이체·카드대금일 수도 있어요. 지출이 맞는지 확인해 주세요.</Text>
+      )}
+      {item.sentToInput && item.status === 'pending' && (
+        <Text style={muted}>저장했다면 「처리 완료」를 눌러 주세요. 저장 여부는 자동으로 확인하지 않아요.</Text>
+      )}
+      <View style={{ flexDirection: 'row', gap: 8, marginTop: 4 }}>
+        {!!onInput && !!item.prefill && (
+          <View style={{ flex: 1 }}>
+            <ActionButton
+              label={item.kind === 'outflow' ? '지출로 입력' : item.kind === 'inflow' ? '수입으로 입력' : '가계부에 입력'}
+              onPress={onInput}
+              disabled={disabled}
+            />
+          </View>
+        )}
+        {!!onHandled && (
+          <View style={{ flex: 1 }}>
+            <ActionButton label="처리 완료" onPress={onHandled} disabled={disabled} />
+          </View>
+        )}
+        {!!onPending && (
+          <View style={{ flex: 1 }}>
+            <ActionButton label="확인 대기로 되돌리기" onPress={onPending} disabled={disabled} />
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
 
 /** STEP 2 test preview of the parser's reading. No save action on purpose. */
 function CandidatePreview({ candidate }: { candidate: ParsedPaymentCandidate | null }) {
