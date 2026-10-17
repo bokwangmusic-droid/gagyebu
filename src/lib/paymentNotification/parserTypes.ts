@@ -37,6 +37,13 @@ export interface ParsedPaymentCandidate {
   accountLast4: string | null;
   /** 'card' = a card payment; accountName / accountLast4 then name the card. Absent = account move. */
   instrument?: 'card';
+  /**
+   * 'cancellation' = a card payment being cancelled ("카드 결제 취소 N원").
+   * direction is then 'inflow' (the money comes back to the card's account)
+   * but it is NOT income and NOT a new spend — it reverses an earlier
+   * payment, which is NOT looked up or linked here. Absent = ordinary move.
+   */
+  kind?: 'cancellation';
 
   /** The other side of the move as printed (a person, a company, an account). */
   counterparty: string | null;

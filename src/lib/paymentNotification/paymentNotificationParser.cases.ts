@@ -38,7 +38,9 @@ const IN_TEXT = '홍*동 → 개인사업자통장(2222) 잔액 1,919,404원';
 // the requested regression checks are on these exact values.
 const CARD_TITLE = '카드 결제 5,400원';
 const CARD_TEXT = '체크카드(3308) | 지에스25 디오르나인 잔액 190,500원';
-const PROMO_TITLE = '최대 5만원 결제 혜택 도착!';
+const CANCEL_TITLE = '카드 결제 취소 17,150원';
+const CANCEL_TEXT = '체크카드(3346) | 쿠팡(쿠페이) 잔액 51,598원';
+const PROMO_TITLE ='최대 5만원 결제 혜택 도착!';
 const PROMO_TEXT =
   '결제 혜택은 이틀 동안 확인 가능해요. 알림 해지 : 로그인 > 혜택 > 결제하고 랜덤 현금 받기 > 알림 해지';
 
@@ -52,7 +54,7 @@ const kb = (title: string, text: string, postedAt = NOW, key = 'k'): PaymentNoti
 
 const show = (c: ParsedPaymentCandidate | null) =>
   c
-    ? `${c.ignoredReason ? `ignored=${c.ignoredReason} ` : ''}${c.instrument ?? ''} ${c.direction} ${c.amount} acct=${c.accountName}/${c.accountLast4} cp=${c.counterparty} memo=${c.merchantCandidate} ${c.confidence} [${c.reasons.join('; ')}]`
+    ? `${c.ignoredReason ? `ignored=${c.ignoredReason} ` : ''}${c.instrument ?? ''}${c.kind ? `/${c.kind}` : ''} ${c.direction} ${c.amount} acct=${c.accountName}/${c.accountLast4} cp=${c.counterparty} memo=${c.merchantCandidate} ${c.confidence} [${c.reasons.join('; ')}]`
     : 'null';
 
 type Want = Partial<
@@ -68,6 +70,7 @@ type Want = Partial<
     | 'confidence'
     | 'instrument'
     | 'ignoredReason'
+    | 'kind'
   >
 >;
 
@@ -273,10 +276,10 @@ export function runPaymentNotificationParserCases(): { results: CaseResult[]; pa
     amount: null,
     confidence: 'low',
   });
-  expect('CARD 7 카드 결제 취소 is not an outflow', kb('카드 결제 취소 5,400원', CARD_TEXT), {
-    direction: 'unknown',
-    amount: null,
-    confidence: 'low',
+  expect('CARD 7 카드 결제 취소 is not an outflow (cancellation, not a payment)', kb('카드 결제 취소 5,400원', CARD_TEXT), {
+    direction: 'inflow',
+    kind: 'cancellation',
+    amount: 5400,
   });
   expect('CARD 8 empty body → medium', kb(CARD_TITLE, ''), {
     amount: 5400,
@@ -336,6 +339,86 @@ export function runPaymentNotificationParserCases(): { results: CaseResult[]; pa
       const keys = findPaymentRelations([card, outC2, inflow]);
       return keys[0] === null && keys[1] != null && keys[1] === keys[2];
     })(),
+  );
+
+  // ── card payment cancellation (real capture) ──────────────────
+  expect('CANCEL 1 real 카드 결제 취소 → 17,150, card 3346, merchant 쿠팡(쿠페이), high', kb(CANCEL_TITLE, CANCEL_TEXT), {
+    kind: 'cancellation',
+    instrument: 'card',
+    direction: 'inflow',
+    amount: 17150,
+    currency: 'KRW',
+    accountName: '체크카드',
+    accountLast4: '3346',
+    counterparty: null,
+    merchantCandidate: '쿠팡(쿠페이)',
+    confidence: 'high',
+    ignoredReason: undefined,
+  });
+  check(
+    'CANCEL 2 잔액 51,598 is never the amount',
+    (() => {
+      const c = parsePaymentNotification(kb(CANCEL_TITLE, CANCEL_TEXT));
+      return (
+        c?.amount === 17150 &&
+        !c.merchantCandidate?.includes('잔액') &&
+        c.reasons.includes('잔액은 금액에서 제외')
+      );
+    })(),
+  );
+  check(
+    'CANCEL 3 distinct from a plain 카드 결제 (no kind, outflow) and never an outflow',
+    (() => {
+      const pay = parsePaymentNotification(kb('카드 결제 17,150원', CANCEL_TEXT));
+      const cancel = parsePaymentNotification(kb(CANCEL_TITLE, CANCEL_TEXT));
+      return (
+        pay?.direction === 'outflow' &&
+        pay.kind === undefined &&
+        cancel?.kind === 'cancellation' &&
+        cancel.direction !== 'outflow'
+      );
+    })(),
+  );
+  expect('CANCEL 4 no spaces in title', kb('카드결제취소17,150원', CANCEL_TEXT), {
+    kind: 'cancellation',
+    amount: 17150,
+    accountLast4: '3346',
+  });
+  expect('CANCEL 5 malformed title amount → amount null, low', kb('카드 결제 취소 17,15원', CANCEL_TEXT), {
+    kind: 'cancellation',
+    amount: null,
+    currency: null,
+    confidence: 'low',
+  });
+  expect('CANCEL 6 title without amount → unknown, body balance not used', kb('카드 결제 취소', CANCEL_TEXT), {
+    kind: undefined,
+    direction: 'unknown',
+    amount: null,
+    confidence: 'low',
+  });
+  check(
+    'CANCEL 7 cancellation + same-amount 출금 / 입금 within 10 s → not related',
+    (() => {
+      const cancel = parsePaymentNotification(kb(CANCEL_TITLE, CANCEL_TEXT, NOW, 'x'));
+      const out = parsePaymentNotification(kb('출금 17,150원', OUT_TEXT, NOW + SECOND, 'o'));
+      const inflow = parsePaymentNotification(kb('입금 17,150원', IN_TEXT, NOW + 2 * SECOND, 'i'));
+      const keys = findPaymentRelations([cancel, out]);
+      const copies = withPaymentRelations([cancel, out, inflow]);
+      return keys.every((k) => k === null) && copies[0]?.relationKey === null && copies[1]?.relationKey != null && copies[1].relationKey === copies[2]?.relationKey;
+    })(),
+  );
+  check(
+    'CANCEL 8 cancellation (even without instrument) is excluded from relations',
+    findPaymentRelations([
+      { ...(parsePaymentNotification(kb(CANCEL_TITLE, CANCEL_TEXT)) as ParsedPaymentCandidate), instrument: undefined },
+      parsePaymentNotification(kb('출금 17,150원', OUT_TEXT)),
+    ]).every((k) => k === null),
+  );
+  check(
+    'CANCEL 9 existing 출금/입금/카드 결제 samples carry no kind',
+    [kb(OUT_TITLE, OUT_TEXT), kb(IN_TITLE, IN_TEXT), kb(CARD_TITLE, CARD_TEXT)].every(
+      (i) => parsePaymentNotification(i)?.kind === undefined,
+    ),
   );
 
   // ── promotions ────────────────────────────────────────────────

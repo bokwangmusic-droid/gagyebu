@@ -32,7 +32,15 @@
  *   - body = "<card>(<4 digits>) | <merchant>". The card goes into
  *     accountName / accountLast4 with instrument 'card'; the merchant is a
  *     merchantCandidate only (counterparty stays null).
- *   - "카드 결제 취소 …" or any other wording is NOT matched (unknown / low).
+ *   - any other wording is NOT matched (unknown / low).
+ *
+ * Card payment cancellations (real capture, masked):
+ *   title  "카드 결제 취소 17,150원"
+ *   text   "체크카드(0000) | 쿠팡(쿠페이) 잔액 51,598원"
+ *   - the title must be exactly "카드 결제 취소 N원" → inflow with kind
+ *     'cancellation' (money back, never income / a new spend); amount from
+ *     the title only. The body uses the card payment rules above.
+ *   - the original payment is NOT looked up or linked.
  *
  * Promotions: a notification whose title is NOT a transaction title, whose
  * body carries no "잔액 N원", AND which contains an ad opt-out marker
@@ -49,13 +57,14 @@ import type {
 
 export const KAKAOBANK_PACKAGE = 'com.kakaobank.channel';
 export const KAKAOBANK_PARSER_ID = 'kakaobank';
-export const KAKAOBANK_PARSER_VERSION = 2;
+export const KAKAOBANK_PARSER_VERSION = 3;
 
 const MAX_AMOUNT = 1_000_000_000;
 const MAX_NAME_LENGTH = 40;
 
 const TITLE_RE = /^(출금|입금)\s*([\d,]+)\s*원$/;
 const CARD_TITLE_RE = /^카드 ?결제\s*([\d,]+)\s*원$/;
+const CARD_CANCEL_TITLE_RE = /^카드 ?결제 ?취소\s*([\d,]+)\s*원$/;
 const CARD_SEPARATOR = '|';
 const BALANCE_ANYWHERE_RE = /잔액\s*:?\s*[\d,]+\s*원/;
 const PROMOTION_MARKER_RE = /알림\s*해지|수신\s*거부|\(광고\)|\[광고\]/;
@@ -98,7 +107,9 @@ export function parseKakaoBankNotification(input: PaymentNotificationInput): Par
   };
 
   const cardMatch = CARD_TITLE_RE.exec(title);
-  if (cardMatch) return parseCardPayment(cardMatch[1], text, candidate, reasons);
+  if (cardMatch) return parseCardPayment(cardMatch[1], text, false, candidate, reasons);
+  const cancelMatch = CARD_CANCEL_TITLE_RE.exec(title);
+  if (cancelMatch) return parseCardPayment(cancelMatch[1], text, true, candidate, reasons);
 
   const titleMatch = TITLE_RE.exec(title);
   if (!titleMatch) {
@@ -186,22 +197,27 @@ function parseBody(
   return ok;
 }
 
-/** "카드 결제 N원": outflow, amount from the title token only. */
+/**
+ * "카드 결제 N원": outflow. "카드 결제 취소 N원": inflow with kind
+ * 'cancellation'. Amount from the title token only.
+ */
 function parseCardPayment(
   amountToken: string,
   text: string,
+  cancellation: boolean,
   out: ParsedPaymentCandidate,
   reasons: string[],
 ): ParsedPaymentCandidate {
-  out.direction = 'outflow';
+  out.direction = cancellation ? 'inflow' : 'outflow';
   out.instrument = 'card';
+  if (cancellation) out.kind = 'cancellation';
   out.amount = parseWon(amountToken);
   if (out.amount == null) {
     reasons.push('제목의 금액이 올바르지 않음');
     return out;
   }
   out.currency = 'KRW';
-  reasons.push('제목: 카드 결제');
+  reasons.push(cancellation ? '제목: 카드 결제 취소 (원거래 연결은 미확인)' : '제목: 카드 결제');
   out.confidence = confidenceOf(parseCardBody(text, out, reasons));
   return out;
 }

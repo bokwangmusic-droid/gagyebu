@@ -312,7 +312,7 @@ function CandidatePreview({ candidate }: { candidate: ParsedPaymentCandidate | n
     <View style={boxStyle}>
       <Text style={muted}>해석 결과 (테스트 · 저장되지 않음)</Text>
       <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>
-        {isCard ? '카드 결제' : DIRECTION_LABEL[candidate.direction]} · {fmt(candidate.amount)}원
+        {isCard ? (candidate.kind === 'cancellation' ? '카드 결제 취소' : '카드 결제') : DIRECTION_LABEL[candidate.direction]} · {fmt(candidate.amount)}원
       </Text>
       <Text style={line}>
         {isCard ? '카드' : '계좌'}:{' '}
