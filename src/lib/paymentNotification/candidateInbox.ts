@@ -33,7 +33,10 @@
  *   - re-post fold: the same package + title + body again within
  *     REPOST_WINDOW_MS under another key/time is one candidate (the earliest
  *     is kept). A KakaoBank body carries the balance, so two real payments
- *     of the same amount still differ.
+ *     of the same amount still differ. Never across another notification
+ *     of the same package with other text: pay → cancel → pay again brings
+ *     the balance — and so the whole text — back, and that second payment
+ *     is real (an unfolded re-post is a visible duplicate, never a loss).
  */
 import { toDateKey } from '@/lib/format';
 import type { InputPrefill } from '@/lib/inputPrefill';
@@ -69,8 +72,6 @@ export interface PaymentInboxItem {
   prefill: InputPrefill | null;
   /** Re-posts folded into this candidate. */
   duplicates: number;
-  /** The (earliest) captured notification itself — in memory only, never stored. */
-  notification: CapturedNotification;
 }
 
 export interface PaymentInbox {
@@ -150,7 +151,14 @@ export function buildPaymentInbox(
         k.n.packageName === n.packageName &&
         norm(k.n.title) === norm(n.title) &&
         norm(k.n.text) === norm(n.text) &&
-        n.postedAt - k.n.postedAt <= REPOST_WINDOW_MS,
+        n.postedAt - k.n.postedAt <= REPOST_WINDOW_MS &&
+        !ordered.some(
+          (m) =>
+            m.packageName === n.packageName &&
+            m.postedAt > k.n.postedAt &&
+            m.postedAt < n.postedAt &&
+            (norm(m.title) !== norm(n.title) || norm(m.text) !== norm(n.text)),
+        ),
     );
     if (original) {
       original.duplicates += 1;
@@ -186,7 +194,6 @@ export function buildPaymentInbox(
         (!!candidate.relationKey || (!!candidate.counterparty && ACCOUNT_SHAPED_RE.test(candidate.counterparty))),
       prefill: toInputPrefill(candidate, todayKey),
       duplicates: k.duplicates,
-      notification: k.n,
     });
   });
   items.sort((a, b) => b.candidate.occurredAt - a.candidate.occurredAt);

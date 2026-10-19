@@ -5,18 +5,22 @@
  *
  * Best effort, never throws. A failure (offline, server error, missing
  * crypto module) only leaves the candidate unregistered — the local 후보함
- * is unaffected and the next screen visit tries again. The RPC is
- * insert-or-get, so a retry after a lost reply returns the SAME event.
+ * is unaffected and the next screen visit tries again. Each call carries
+ * this install's device hash and the candidate's local claim hash, so a
+ * retry after a lost reply returns the SAME event.
  */
 import type { PostgrestError } from '@supabase/supabase-js';
 
 import {
   parsePaymentEventRegisterReply,
+  paymentDeviceHashPreimage,
+  paymentLocalClaimPreimage,
   type PaymentEventRegisterResult,
   type PaymentEventRegistration,
 } from '@/lib/paymentNotification/serverDedup';
 import { supabase } from '@/lib/supabase';
 import { isTransportError } from '@/lib/transportError';
+import { loadPaymentInstallId } from '@/services/paymentDeviceIdentity';
 
 type Sha256Hex = (data: string) => Promise<string>;
 
@@ -37,6 +41,7 @@ const isHex64 = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f]
 
 export async function registerPaymentEvent(
   householdId: string,
+  installId: string,
   reg: PaymentEventRegistration,
   sha256?: Sha256Hex,
 ): Promise<PaymentEventRegisterResult> {
@@ -44,7 +49,9 @@ export async function registerPaymentEvent(
     const hash = sha256 ?? (await loadSha256());
     if (!hash) return { ok: false, transport: false };
     const dedupKey = (await hash(reg.preimage)).toLowerCase();
-    if (!isHex64(dedupKey)) return { ok: false, transport: false };
+    const deviceHash = (await hash(paymentDeviceHashPreimage(householdId, installId))).toLowerCase();
+    const claimHash = (await hash(paymentLocalClaimPreimage(householdId, installId, reg.fingerprint))).toLowerCase();
+    if (!isHex64(dedupKey) || !isHex64(deviceHash) || !isHex64(claimHash)) return { ok: false, transport: false };
     const { data, error } = await supabase.rpc('register_payment_notification_event', {
       p_household_id: householdId,
       p_dedup_key: dedupKey,
@@ -55,6 +62,8 @@ export async function registerPaymentEvent(
       p_amount: reg.amount,
       p_last4: reg.last4,
       p_occurred_at: new Date(reg.occurredAt).toISOString(),
+      p_device_hash: deviceHash,
+      p_local_claim_hash: claimHash,
     });
     if (error) return { ok: false, transport: isTransportError(error as PostgrestError) };
     return parsePaymentEventRegisterReply(data);
@@ -73,9 +82,11 @@ export async function registerPaymentEvents(
 ): Promise<string[]> {
   const sha256 = await loadSha256();
   if (!sha256) return [];
+  const installId = await loadPaymentInstallId();
+  if (!installId) return [];
   const done: string[] = [];
   for (const reg of regs) {
-    const res = await registerPaymentEvent(householdId, reg, sha256);
+    const res = await registerPaymentEvent(householdId, installId, reg, sha256);
     if (res.ok) done.push(reg.fingerprint);
     else if (res.transport) break;
   }

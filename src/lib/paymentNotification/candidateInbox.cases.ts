@@ -99,6 +99,17 @@ export function runCandidateInboxCases(): { results: CaseResult[]; passed: numbe
       .items.length === 2,
   );
   check(
+    'DEDUP 8 pay → cancel → pay again within 2 min (same text again) → 3 candidates, never folded across the cancel',
+    (() => {
+      const r = inbox([
+        kb(CARD_TITLE, CARD_TEXT, NOW, 'p1'),
+        kb('카드 결제 취소 5,100원', '체크카드(3308) | 청계상회 잔액 190,500원', NOW + 20 * SECOND, 'c'),
+        kb(CARD_TITLE, CARD_TEXT, NOW + 40 * SECOND, 'p2'),
+      ]);
+      return r.items.length === 3 && r.items.every((i) => i.duplicates === 0);
+    })(),
+  );
+  check(
     'DEDUP 8 the fingerprint does not contain the notification text',
     (() => {
       const fp = paymentCandidateFingerprint(kb(CARD_TITLE, CARD_TEXT));

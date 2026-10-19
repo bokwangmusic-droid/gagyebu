@@ -6,33 +6,54 @@
  * re-posts / retries report it. Registration only — no transaction is
  * created from it. Pure, no I/O; hashing is injected.
  *
- * base fingerprint (p_dedup_key) = SHA-256 hex of
- *   "pn1" \0 household id \0 source package \0 normalised title \0
- *   normalised body
- * Only what is INTRINSIC to the push, so every phone of the household
- * computes the same value for the same real event, whatever else it has
- * captured before:
- *   - the notification text carries the type and amount (title) and the
- *     card / account last 4 and, for KakaoBank, the balance after the move
- *     (body). The balance is what separates two real payments of the same
- *     amount at the same shop. The parsed fields are NOT hashed separately:
- *     they are derived from this same text, and hashing them would make the
- *     key depend on the parser — a parser update must not create a "new"
- *     event.
- *   - the household id salts the hash: the same text gives an unrelated key
- *     in another household.
+ * base fingerprint (p_dedup_key) = SHA-256 hex of, \0-separated:
+ *   "pn1", household id, source package, event type, instrument
+ *   ('card' | 'account'), amount, last 4, account / card name, merchant
+ *   candidate, counterparty
+ * — a WHITELIST of the transaction fields the parser already extracted,
+ * normalised (NFC, single spaces). Never the raw title / body:
+ *   - NO balance. The parser cuts the trailing "잔액 N원" off the body
+ *     before reading any field, so no field can carry it — and only these
+ *     fields are hashed. Two notifications that differ only in the balance
+ *     have the SAME fingerprint; the claim rule below decides.
  *   - NOT the Android notification key (device-local), NOT the post time
- *     (it is each phone's own arrival time), and NOTHING from this phone's
- *     history: no counters / ordinals.
- * Time is compared by the server: the same base fingerprint within
- * PAYMENT_EVENT_MATCH_TOLERANCE_MS of an existing event IS that event.
+ *     (each phone's own arrival time — the server compares it), NOT the
+ *     parser id / version, NOTHING from this phone's history.
+ *   - the household id salts the hash: the same payment gives an unrelated
+ *     key in another household.
+ * Every phone that reads the same push the same way computes the same
+ * value. A parser update that only bumps the version keeps it; one that
+ * READS a field differently changes it (two phones on different app
+ * versions could then register one payment twice).
  *
- * The raw text never leaves the phone — only this hash and the parsed
+ * The base fingerprint alone never decides that two reports are one event
+ * (two real payments of the same amount / card / merchant have the same
+ * one). Each report is also a CLAIM by this app install:
+ *   device hash      = SHA-256("pnd1", household id, install id)
+ *   local claim hash = SHA-256("pnc1", household id, install id, local
+ *                      candidate fingerprint)
+ * The install id is a random UUID made once per app install
+ * (src/services/paymentDeviceIdentity.ts) — not the Android notification
+ * key, not the account, not a hardware id — and never leaves the phone.
+ * The server's rule (migration 20261019002200):
+ *   A. this device already claimed this local candidate → that event
+ *      (a retry / a lost reply / a later screen visit);
+ *   B. otherwise the nearest event with the same base fingerprint within
+ *      ±PAYMENT_EVENT_MATCH_TOLERANCE_MS that THIS device has not claimed
+ *      yet and with no purchase / cancel of the same amount and card in
+ *      between — but only when no second such event is within
+ *      PAYMENT_EVENT_AMBIGUITY_MARGIN_MS of that distance;
+ *   C. anything else → a new event.
+ * A phone sees each push once and folds its own re-posts locally, so two
+ * of its candidates are two real moves: they never share an event. When a
+ * merge is not clear, two events are kept: a duplicate can be dismissed,
+ * a payment merged away is lost without a trace.
+ *
+ * The raw text never leaves the phone — only these hashes and the parsed
  * amount / last 4 / type / time. Only inbox candidates are registered: a
  * promotion (ignored) or a notification no parser reads yet never is.
  */
 import {
-  REPOST_WINDOW_MS,
   type PaymentCandidateKind,
   type PaymentCandidateState,
   type PaymentInboxItem,
@@ -40,16 +61,33 @@ import {
 
 export const PAYMENT_EVENT_DEDUP_VERSION = 'pn1';
 /**
- * Same as the server's match tolerance (migration header): ±2 minutes, the
- * window the inbox already treats an identical re-posted text as one
- * notification (REPOST_WINDOW_MS). Each phone stamps its own arrival time;
- * pushes of one event to two awake phones arrive seconds apart. Kept small
- * on purpose: an identical text further apart (pay → cancel → pay again,
- * same balance) is a separate real event and must not merge. A phone that
- * gets the push more than 2 minutes late (e.g. offline) registers a second
- * event — a visible duplicate, never a lost payment.
+ * Cross-device merge window (= the RPC's). Each phone stamps its own
+ * arrival time; one push reaches two awake phones seconds apart. Smaller
+ * than the 2 min re-post window on purpose: the wider it is, the longer a
+ * payment that only one phone saw can be taken for another phone's report
+ * of a different one. A phone that gets the push later (Doze, offline)
+ * registers a second event — a visible duplicate, never a lost payment.
+ * Not backed by measured two-phone data yet.
  */
-export const PAYMENT_EVENT_MATCH_TOLERANCE_MS = REPOST_WINDOW_MS;
+export const PAYMENT_EVENT_MATCH_TOLERANCE_MS = 30 * 1000;
+/** Two candidate events whose distances differ by less than this = ambiguous → new event. */
+export const PAYMENT_EVENT_AMBIGUITY_MARGIN_MS = 10 * 1000;
+
+const INSTALL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** A random v4 UUID, lower case — the only accepted install id. */
+export function isPaymentInstallId(v: unknown): v is string {
+  return typeof v === 'string' && INSTALL_ID_RE.test(v);
+}
+
+export function paymentDeviceHashPreimage(householdId: string, installId: string): string {
+  return ['pnd1', householdId, installId].join('\u0000');
+}
+
+/** Stable for one local candidate on one install; differs for any other candidate. */
+export function paymentLocalClaimPreimage(householdId: string, installId: string, fingerprint: string): string {
+  return ['pnc1', householdId, installId, fingerprint].join('\u0000');
+}
 
 export type PaymentEventType = 'card_purchase' | 'card_cancel' | 'income' | 'outflow';
 
@@ -64,15 +102,27 @@ export function paymentEventType(kind: PaymentCandidateKind): PaymentEventType {
   return EVENT_TYPE[kind];
 }
 
-const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+const norm = (v: string | null | undefined) => (v ?? '').normalize('NFC').replace(/\s+/g, ' ').trim();
 
 export function paymentEventDedupPreimage(householdId: string, item: PaymentInboxItem): string {
-  const n = item.notification;
-  return `${PAYMENT_EVENT_DEDUP_VERSION}\u0000${householdId}\u0000${n.packageName}\u0000${norm(n.title)}\u0000${norm(n.text)}`;
+  const c = item.candidate;
+  return [
+    PAYMENT_EVENT_DEDUP_VERSION,
+    householdId,
+    c.sourcePackage,
+    paymentEventType(item.kind),
+    c.instrument === 'card' ? 'card' : 'account',
+    String(c.amount ?? ''),
+    norm(c.accountLast4),
+    norm(c.accountName),
+    norm(c.merchantCandidate),
+    norm(c.counterparty),
+  ].join('\u0000');
 }
 
 /** Arguments of register_payment_notification_event, minus the hash. */
 export interface PaymentEventRegistration {
+  /** The local candidate fingerprint — input of the local claim hash. */
   fingerprint: string;
   /** Hash this (SHA-256 hex) into p_dedup_key. Never sent as-is. */
   preimage: string;
@@ -89,7 +139,8 @@ export interface PaymentEventRegistration {
 /**
  * The inbox candidates not yet registered from this phone for this
  * household. A failed / skipped registration simply comes back on the next
- * build — the server call is idempotent, so a retry never adds a row.
+ * build — the same local claim always returns the same event, so a retry
+ * never adds a row.
  */
 export function buildPaymentEventRegistrations(
   items: readonly PaymentInboxItem[],
