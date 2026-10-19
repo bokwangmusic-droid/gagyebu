@@ -11,9 +11,15 @@
  * RPCs of migration 20261019002300 with their rules. A `phone` (one each):
  * its captured list, its stored 후보함 state (serialised read-modify-writes,
  * as paymentCandidateState.ts does) and its setting.
+ *
+ * The automatic save is switched off for this build
+ * (PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED); its own cases below still run it
+ * by injecting `autoSaveEnabled: true`, and the GATE cases check the build's
+ * default.
  */
 import { toDateKey } from '@/lib/format';
 import {
+  PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED,
   paymentAutoSavedMessage,
   type PaymentAutoSaveIO,
   type PaymentEventCompleteStatus,
@@ -31,6 +37,7 @@ import { KAKAOBANK_PACKAGE } from '@/lib/paymentNotification/kakaoBankParser';
 import {
   createPaymentNotificationProcessor,
   type PaymentAutoSavedItem,
+  type PaymentNotificationProcessorOptions,
   type PaymentProcessingIO,
 } from '@/lib/paymentNotification/processor';
 import type { CapturedNotification } from '@/lib/paymentNotificationBuffer';
@@ -77,6 +84,8 @@ interface EventRow {
 interface Server {
   events: Map<string, EventRow>;
   txns: Map<string, { createdBy: string; draft: NewTransactionDraft }>;
+  /** createTransaction calls made by the processors. */
+  creates: number;
   registerFails: boolean;
   /** complete: n calls fail on the network BEFORE reaching the server. */
   completeTransportFails: number;
@@ -88,6 +97,8 @@ interface Phone {
   captured: CapturedNotification[];
   stored: PaymentCandidateState;
   since: number | null;
+  /** Times a pass read the stored setting. */
+  sinceReads: number;
   passes: number;
   throwOn: 'captured' | 'register' | null;
 }
@@ -95,6 +106,7 @@ interface Phone {
 const server = (over: Partial<Server> = {}): Server => ({
   events: new Map(),
   txns: new Map(),
+  creates: 0,
   registerFails: false,
   completeTransportFails: 0,
   completeRepliesLost: 0,
@@ -105,6 +117,7 @@ const phone = (over: Partial<Phone> = {}): Phone => ({
   captured: [CARD],
   stored: {},
   since: NOW - 10 * MINUTE,
+  sinceReads: 0,
   passes: 0,
   throwOn: null,
   ...over,
@@ -112,8 +125,12 @@ const phone = (over: Partial<Phone> = {}): Phone => ({
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
-/** One phone's processor (one app runtime) against the shared server. */
-function processorFor(srv: Server, ph: Phone) {
+/**
+ * One phone's processor (one app runtime) against the shared server. The
+ * automatic save is ON unless `options` says otherwise (`{}` = the build's
+ * default, PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED).
+ */
+function processorFor(srv: Server, ph: Phone, options: PaymentNotificationProcessorOptions = { autoSaveEnabled: true }) {
   let queue: Promise<unknown> = Promise.resolve();
   const serial = <T>(task: () => Promise<T>): Promise<T> => {
     const run = queue.then(task, task);
@@ -128,6 +145,7 @@ function processorFor(srv: Server, ph: Phone) {
       return e ? { ok: true, status: e.status, transactionId: e.linked } : { ok: false, transport: false };
     },
     create: async (transactionId, draft) => {
+      srv.creates += 1;
       await tick();
       const existing = srv.txns.get(transactionId);
       if (existing) {
@@ -199,11 +217,14 @@ function processorFor(srv: Server, ph: Phone) {
         return { fingerprint: r.fingerprint, eventId: e.id };
       });
     },
-    loadAutoSaveSince: async () => ph.since,
+    loadAutoSaveSince: async () => {
+      ph.sinceReads += 1;
+      return ph.since;
+    },
     autoSave: () => autoSave,
     now: () => NOW,
   };
-  return createPaymentNotificationProcessor(io);
+  return createPaymentNotificationProcessor(io, options);
 }
 
 const ctxOf = (ph: Phone) => ({ householdId: HOUSE, userId: ph.userId });
@@ -629,6 +650,110 @@ export async function runProcessorCases(): Promise<{ results: CaseResult[]; pass
     check(
       'UX-7 광고 / 입금 / 출금 / 카드 취소 with 자동입력 ON → nothing saved; the three money moves stay pending',
       res.saved.length === 0 && srv.txns.size === 0 && items.pending.length === 3 && items.autoSaved.length === 0,
+    );
+  }
+
+  // ── GATE: the automatic save switched off for this build ──────
+  check('GATE-0 this build ships with the automatic save switched off', PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED === false);
+  {
+    // The setting stored ON (an earlier build), fresh eligible card payments.
+    const srv = server();
+    const ph = phone({ captured: [CARD, CARD_2] });
+    const p = processorFor(srv, ph, {});
+    const res = await p.run(ctxOf(ph));
+    await p.run(ctxOf(ph));
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    check(
+      'GATE-1 setting stored ON + switch off → no automatic save chosen (the setting is not even read), 0 createTransaction',
+      res.saved.length === 0 && srv.creates === 0 && srv.txns.size === 0 && ph.sinceReads === 0,
+      JSON.stringify({ creates: srv.creates, sinceReads: ph.sinceReads }),
+    );
+    check('GATE-2 … and the stored setting itself is left as it was', ph.since === NOW - 10 * MINUTE);
+    check(
+      'GATE-3 … the card payments are still registered with the server and stay pending 후보 with their /input prefill',
+      srv.events.size === 2 &&
+        [paymentCandidateFingerprint(CARD), paymentCandidateFingerprint(CARD_2)].every((fp) => !!ph.stored[fp]?.registeredEventId) &&
+        items.pending.length === 2 &&
+        items.pending.every((i) => !!i.prefill && !i.autoSaved && !i.autoSaveFailed) &&
+        items.autoSaved.length === 0,
+      JSON.stringify(ph.stored),
+    );
+  }
+  {
+    // 「가계부에 입력」 → /input → the user saves with the derived id.
+    const srv = server();
+    const ph = phone();
+    const p = processorFor(srv, ph, {});
+    await p.run(ctxOf(ph));
+    const fp = paymentCandidateFingerprint(CARD);
+    const txnId = `txn-pn-${ph.stored[fp].registeredEventId}`;
+    ph.stored = markCandidateSent(ph.stored, fp, NOW);
+    srv.txns.set(txnId, { createdBy: USER_A, draft: MANUAL_DRAFT }); // /input's createTransaction
+    ph.stored = markCandidateHandled(ph.stored, fp, NOW);
+    ph.stored = markCandidateManualSaved(ph.stored, fp, txnId, HOUSE, NOW);
+    await p.run(ctxOf(ph)); // /input kicks a pass after the save
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    const e = [...srv.events.values()][0];
+    check(
+      'GATE-4 manual 「가계부에 입력」 save with the switch off → linked on the server, 처리 완료, still 1 transaction, no automatic create',
+      e.status === 'handled' &&
+        e.linked === txnId &&
+        ph.stored[fp].manualLinkedAt != null &&
+        items.handled.length === 1 &&
+        items.pending.length === 0 &&
+        srv.txns.size === 1 &&
+        srv.creates === 0,
+      JSON.stringify({ e, entry: ph.stored[fp] }),
+    );
+  }
+  {
+    // A manual save made before registration (ordinary id): still linked.
+    const srv = server();
+    const ph = manualBeforeRegistration(srv, true);
+    await processorFor(srv, ph, {}).run(ctxOf(ph));
+    const e = manualEvent(srv);
+    check(
+      'GATE-5 manual save before registration with the switch off → registered and linked as before, no automatic create',
+      !!e && e.status === 'handled' && srv.txns.size === 1 && srv.creates === 0,
+    );
+  }
+  {
+    // An earlier build saved CARD automatically and its link failed on the
+    // network; this build (switch off) still finishes that link.
+    const srv = server({ completeTransportFails: 1 });
+    const ph = phone();
+    await processorFor(srv, ph).run(ctxOf(ph));
+    const fp = paymentCandidateFingerprint(CARD);
+    const before = { txns: srv.txns.size, creates: srv.creates, linked: ph.stored[fp]?.autoSaveLinkedAt ?? null };
+    ph.captured = [CARD, CARD_2]; // and a new card payment arrives
+    const res = await processorFor(srv, ph, {}).run(ctxOf(ph));
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    const derived = `txn-pn-${ph.stored[fp].registeredEventId}`;
+    check(
+      'GATE-6 past automatic save, switch now off → its link is still retried and lands; it stays under 자동저장 내역; the new payment stays pending; nothing new saved',
+      before.txns === 1 &&
+        before.creates === 1 &&
+        before.linked == null &&
+        ph.stored[fp].autoSaveLinkedAt != null &&
+        [...srv.events.values()].some((x) => x.linked === derived && x.status === 'handled') &&
+        res.saved.length === 0 &&
+        srv.txns.size === 1 &&
+        srv.creates === 1 &&
+        items.autoSaved.length === 1 &&
+        items.autoSaved[0].fingerprint === fp &&
+        items.pending.length === 1 &&
+        items.pending[0].candidate.merchantCandidate === '김밥천국',
+      JSON.stringify({ before, entry: ph.stored[fp], res }),
+    );
+  }
+  {
+    // registerCandidate (/input, right before a save) does not depend on the switch.
+    const srv = server();
+    const ph = phone();
+    const ok = await processorFor(srv, ph, {}).registerCandidate(ctxOf(ph), paymentCandidateFingerprint(CARD));
+    check(
+      "GATE-7 /input's register-now works with the switch off (no transaction)",
+      ok && srv.events.size === 1 && srv.creates === 0,
     );
   }
 

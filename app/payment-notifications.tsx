@@ -52,7 +52,11 @@ import { useToast } from '@/components/ui/Toast';
 import { DEFAULT_PAYMENT_NOTIFICATION_PACKAGES } from '@/data/paymentNotificationPackages';
 import { fmt, toDateKey } from '@/lib/format';
 import { inputPrefillToParams } from '@/lib/inputPrefill';
-import { PAYMENT_AUTO_SAVE_BLOCKER_LABEL, paymentAutoSaveBlocker } from '@/lib/paymentNotification/autoSave';
+import {
+  PAYMENT_AUTO_SAVE_BLOCKER_LABEL,
+  PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED,
+  paymentAutoSaveBlocker,
+} from '@/lib/paymentNotification/autoSave';
 import {
   buildPaymentInbox,
   markCandidateHandled,
@@ -293,8 +297,9 @@ export default function PaymentNotifications() {
           <Text style={bodyStyle}>
             카드·은행 앱의 결제 알림을 읽어 가계부 입력을 돕는 기능을 만들고 있어요. 받은 알림은 아래
             「자동입력 후보」에 모여요. 「가계부에 입력」을 누르면 입력 화면이 열리고, 내용을 확인한 뒤 직접
-            저장해야 가계부에 들어가요. 「확실한 카드 결제 자동입력」을 켠 경우에만 신뢰도 높은 카드 결제가
-            자동으로 저장돼요.
+            저장해야 가계부에 들어가요.
+            {PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED &&
+              ' 「확실한 카드 결제 자동입력」을 켠 경우에만 신뢰도 높은 카드 결제가 자동으로 저장돼요.'}
           </Text>
           <Text style={bodyStyle}>{DISCLOSURE}</Text>
         </Panel>
@@ -341,32 +346,40 @@ export default function PaymentNotifications() {
               <ActionButton label="추가" onPress={() => void addPackage()} disabled={!packageDraft.trim()} />
             </Panel>
 
-            <Panel>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                <Text style={{ flex: 1, fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, ...noPad }}>
-                  확실한 카드 결제 자동입력
-                </Text>
-                <Toggle value={autoSaveSince != null} onChange={toggleAutoSave} disabled={!autoSaveLoaded} />
-              </View>
-              <Text style={bodyStyle}>
-                켠 뒤에 받은 신뢰도 높은 카드 결제만 지출로 자동 기록해요. 입금·출금·취소와 애매한 알림은 직접
-                확인해 주세요.
-              </Text>
-              <Text style={{ ...bodyStyle, fontSize: 12, color: colors.textMuted }}>
-                카테고리는 「기타」로 저장되고 결제수단(카드)은 연결하지 않아요. 거래내역에서 언제든 수정할 수 있어요.
-                돈돈 앱을 열거나 다시 돌아올 때 처리돼요.
-              </Text>
-              {autoSavedItems.length > 0 && (
-                <ActionButton
-                  label={autoSavedOpen ? '자동저장 내역 접기' : `자동저장 내역 ${autoSavedItems.length}건 보기`}
-                  onPress={() => setAutoSavedOpen((open) => !open)}
-                />
-              )}
-              {autoSavedOpen &&
-                autoSavedItems.map((item) => (
-                  <InboxCard key={item.fingerprint} item={item} disabled={!candidateStateLoaded} />
-                ))}
-            </Panel>
+            {/* The setting only while the automatic save is switched on for
+                this build (autoSave.ts); past automatic saves stay listed. */}
+            {(PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED || autoSavedItems.length > 0) && (
+              <Panel>
+                {PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED && (
+                  <>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                      <Text style={{ flex: 1, fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, ...noPad }}>
+                        확실한 카드 결제 자동입력
+                      </Text>
+                      <Toggle value={autoSaveSince != null} onChange={toggleAutoSave} disabled={!autoSaveLoaded} />
+                    </View>
+                    <Text style={bodyStyle}>
+                      켠 뒤에 받은 신뢰도 높은 카드 결제만 지출로 자동 기록해요. 입금·출금·취소와 애매한 알림은 직접
+                      확인해 주세요.
+                    </Text>
+                    <Text style={{ ...bodyStyle, fontSize: 12, color: colors.textMuted }}>
+                      카테고리는 「기타」로 저장되고 결제수단(카드)은 연결하지 않아요. 거래내역에서 언제든 수정할 수
+                      있어요. 돈돈 앱을 열거나 다시 돌아올 때 처리돼요.
+                    </Text>
+                  </>
+                )}
+                {autoSavedItems.length > 0 && (
+                  <ActionButton
+                    label={autoSavedOpen ? '자동저장 내역 접기' : `자동저장 내역 ${autoSavedItems.length}건 보기`}
+                    onPress={() => setAutoSavedOpen((open) => !open)}
+                  />
+                )}
+                {autoSavedOpen &&
+                  autoSavedItems.map((item) => (
+                    <InboxCard key={item.fingerprint} item={item} disabled={!candidateStateLoaded} />
+                  ))}
+              </Panel>
+            )}
 
             <Panel>
               <StatusRow label="자동입력 후보" value={`확인 대기 ${pendingItems.length}건`} ok={pendingItems.length > 0} />
@@ -376,7 +389,7 @@ export default function PaymentNotifications() {
                   key={item.fingerprint}
                   item={item}
                   disabled={!candidateStateLoaded}
-                  autoSaveOn={autoSaveSince != null}
+                  autoSaveOn={PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED && autoSaveSince != null}
                   onInput={() => openInput(item)}
                   onHandled={() =>
                     updateCandidateState((state) => markCandidateHandled(state, item.fingerprint, Date.now()))

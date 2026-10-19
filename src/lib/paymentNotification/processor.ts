@@ -7,8 +7,9 @@
  *   2. link the transactions already saved for an event and not linked yet
  *      (manual saves — also one made BEFORE the candidate was registered,
  *      with an ordinary id — and automatic ones), and store the result;
- *   3. only if no link failed on the network in step 2: with "확실한 카드
- *      결제 자동입력" on, save the eligible card payments (autoSave.ts),
+ *   3. only if no link failed on the network in step 2, the automatic save
+ *      is switched on for this build (PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED)
+ *      and "확실한 카드 결제 자동입력" is on: save the eligible card payments (autoSave.ts),
  *      chosen from the state AFTER step 2, each one re-checking on the
  *      server that its event is still unhandled right before its insert.
  * A candidate with a manual save recorded (or opened in /input) is never
@@ -25,6 +26,7 @@
  */
 import { toDateKey } from '@/lib/format';
 import {
+  PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED,
   applyPaymentAutoSaveOutcomes,
   runPaymentAutoSaveJobs,
   selectPaymentAutoSaveJobs,
@@ -75,7 +77,11 @@ export interface PaymentProcessingResult {
 
 const EMPTY = (): PaymentProcessingResult => ({ changed: false, saved: [] });
 
-async function processOnce(ctx: PaymentProcessingContext, io: PaymentProcessingIO): Promise<PaymentProcessingResult> {
+async function processOnce(
+  ctx: PaymentProcessingContext,
+  io: PaymentProcessingIO,
+  autoSaveEnabled: boolean,
+): Promise<PaymentProcessingResult> {
   if (!io.supported()) return EMPTY();
   const captured = await io.getCaptured();
   let state = await io.loadState();
@@ -114,6 +120,9 @@ async function processOnce(ctx: PaymentProcessingContext, io: PaymentProcessingI
     inbox = buildPaymentInbox(captured, state, todayKey);
   }
 
+  // The automatic save switched off for this build: no save is chosen, the
+  // stored setting is not even read.
+  if (!autoSaveEnabled) return { changed, saved: [] };
   const since = await io.loadAutoSaveSince();
   const saves = selectPaymentAutoSaveJobs(inbox.items, state, ctx.householdId, since, now);
   if (saves.length === 0) return { changed, saved: [] };
@@ -172,7 +181,16 @@ export interface PaymentNotificationProcessor {
   onSaved: (listener: (saved: PaymentAutoSavedItem[]) => void) => () => void;
 }
 
-export function createPaymentNotificationProcessor(io: PaymentProcessingIO): PaymentNotificationProcessor {
+export interface PaymentNotificationProcessorOptions {
+  /** Default PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED (autoSave.ts). */
+  autoSaveEnabled?: boolean;
+}
+
+export function createPaymentNotificationProcessor(
+  io: PaymentProcessingIO,
+  options: PaymentNotificationProcessorOptions = {},
+): PaymentNotificationProcessor {
+  const autoSaveEnabled = options.autoSaveEnabled ?? PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED;
   let inFlight: Promise<PaymentProcessingResult> | null = null;
   let again = false;
   let latest: PaymentProcessingContext | null = null;
@@ -192,7 +210,7 @@ export function createPaymentNotificationProcessor(io: PaymentProcessingIO): Pay
         const current = latest;
         if (!current) break;
         try {
-          const r = await processOnce(current, io);
+          const r = await processOnce(current, io, autoSaveEnabled);
           total.changed = total.changed || r.changed;
           total.saved.push(...r.saved);
         } catch {

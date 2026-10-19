@@ -47,6 +47,16 @@ import type { PaymentCandidateState, PaymentCandidateStateEntry, PaymentInboxIte
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 
 /**
+ * THE switch for the automatic save, over the user's "확실한 카드 결제
+ * 자동입력" setting: while `false`, no pass ever saves a transaction
+ * automatically (processor.ts checks it before choosing any save) and the
+ * setting is hidden — whatever a phone has stored stays as it is, unread,
+ * for when this is turned back on. Registration, links and the 후보함's
+ * manual input are not affected. Tests inject their own value.
+ */
+export const PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED = false;
+
+/**
  * 기타 — a built-in expense category (src/data/categories.ts), always present
  * and the fallback the store already uses for a completed planned expense.
  * No category is guessed from the merchant.
