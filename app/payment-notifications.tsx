@@ -36,9 +36,15 @@
  * to the foreground, and while this screen is open. Everything else stays
  * in the 후보함.
  *
- * What it deliberately does not do yet: save 입금 / 출금 / 카드 취소, link a
- * card, pick a category other than 기타, handle a cancellation / refund, or
- * merge a transfer pair.
+ * 카드 결제 취소 — "원결제 찾기" lists the expenses that could be the
+ * original payment (src/lib/paymentNotification/refundMatch.ts); the user
+ * picks one and confirms, and only then it is deleted the ordinary way
+ * (soft delete / offline delete queue) and the cancellation marked 처리 완료.
+ * Full cancellations only; nothing is matched, deleted or created by itself.
+ *
+ * What it deliberately does not do yet: save 입금 / 출금 automatically, link
+ * a card, pick a category other than 기타, apply a partial cancellation /
+ * create a refund income, or merge a transfer pair.
  * This file is wiring only — the native calls live in
  * src/services/paymentNotificationListener.ts.
  */
@@ -67,6 +73,13 @@ import {
   type PaymentInboxItem,
 } from '@/lib/paymentNotification/candidateInbox';
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
+import {
+  REFUND_BLOCKER_MESSAGE,
+  findPartialRefundCandidates,
+  findRefundMatches,
+  refundCardCancellation,
+  type RefundMatch,
+} from '@/lib/paymentNotification/refundMatch';
 import { parsePaymentNotification } from '@/lib/paymentNotification/registry';
 import { withPaymentRelations } from '@/lib/paymentNotification/relation';
 import {
@@ -77,6 +90,7 @@ import {
 import { loadPaymentAutoSaveSince, savePaymentAutoSaveEnabled } from '@/services/paymentAutoSave';
 import { loadPaymentCandidateState, updatePaymentCandidateState } from '@/services/paymentCandidateState';
 import { processPaymentNotifications } from '@/services/paymentNotificationProcessor';
+import { paymentRefundIO } from '@/services/paymentRefund';
 import {
   clearCapturedNotifications,
   getAllowedPackages,
@@ -87,7 +101,10 @@ import {
   setAllowedPackages,
 } from '@/services/paymentNotificationListener';
 import { useAuth } from '@/store/auth';
+import { useFinanceRead } from '@/store/financeRead';
 import { useHousehold } from '@/store/household';
+import { usePendingWrites } from '@/store/pendingFinance';
+import type { Transaction } from '@/store/types';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
 
@@ -215,6 +232,112 @@ export default function PaymentNotifications() {
     if (!item.prefill || !candidateStateLoaded) return;
     updateCandidateState((state) => markCandidateSent(state, item.fingerprint, Date.now()));
     router.push({ pathname: '/input', params: inputPrefillToParams(item.prefill, item.fingerprint) });
+  };
+
+  // 카드 결제 취소 → 원결제 찾기. Only rows with a known server version and
+  // no offline change pending can be deleted (the delete needs the token).
+  const finance = useFinanceRead();
+  const pending = usePendingWrites();
+  const deletableIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const t of finance.transactions) {
+      if (finance.transactionMeta[t.id] && !finance.pendingTransactionOps.has(t.id) && !finance.failedTransactionIds.has(t.id)) {
+        ids.add(t.id);
+      }
+    }
+    return ids;
+  }, [finance.transactions, finance.transactionMeta, finance.pendingTransactionOps, finance.failedTransactionIds]);
+  const [refundOpenFor, setRefundOpenFor] = useState<string | null>(null);
+  const [refunding, setRefunding] = useState(false);
+  const refundingRef = useRef(false);
+  const refundLookup = (item: PaymentInboxItem) => {
+    const input = {
+      cancel: item,
+      items: inbox.items,
+      state: candidateState,
+      householdId: householdId ?? '',
+      transactions: finance.transactions,
+      deletableIds,
+    };
+    return { matches: findRefundMatches(input), partials: findPartialRefundCandidates(input) };
+  };
+
+  const runRefund = async (item: PaymentInboxItem, txn: Transaction) => {
+    if (refundingRef.current || !householdId || !userId) return;
+    refundingRef.current = true;
+    setRefunding(true);
+    try {
+      const out = await refundCardCancellation(
+        item,
+        txn,
+        deletableIds,
+        paymentRefundIO({
+          householdId,
+          userId,
+          expectedUpdatedAt: (id) => finance.transactionMeta[id]?.updatedAt ?? null,
+          enqueueTransactionDelete: pending.enqueueTransactionDelete,
+        }),
+      );
+      if (out.kind === 'refunded') {
+        candidateStateSeqRef.current += 1;
+        reloadCandidateState();
+        setRefundOpenFor(null);
+        if (!out.queued) await finance.refresh();
+        toast.show(out.queued ? '환불 처리했어요 · 인터넷에 연결되면 자동으로 반영할게요' : '환불 처리했어요');
+        return;
+      }
+      if (out.kind === 'blocked') {
+        toast.show(REFUND_BLOCKER_MESSAGE[out.blocker]);
+        return;
+      }
+      if (out.kind === 'queue-failed') {
+        toast.show(
+          out.reason === 'existing-pending'
+            ? '이미 전송 대기 중인 변경이 있어요.'
+            : out.reason === 'not-hydrated'
+              ? '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.'
+              : out.reason === 'cap'
+                ? '오프라인에 저장할 수 있는 거래 수를 초과했어요. 인터넷 연결 후 다시 시도해주세요.'
+                : '처리하지 못했어요. 잠시 후 다시 시도해주세요.',
+        );
+        return;
+      }
+      // conflict / deleted / gone — the list is stale: reload it.
+      if (out.reason !== 'identity' && out.reason !== 'error') await finance.refresh();
+      toast.show(out.message ?? '처리하지 못했어요. 잠시 후 다시 시도해주세요.');
+    } finally {
+      refundingRef.current = false;
+      setRefunding(false);
+    }
+  };
+
+  const confirmRefund = (item: PaymentInboxItem, match: RefundMatch) => {
+    if (refundingRef.current) return;
+    const t = match.transaction;
+    const d = new Date(t.date);
+    const name = t.memo.trim() || item.candidate.merchantCandidate || '지출';
+    Alert.alert(
+      `${name} ${fmt(t.amount)}원`,
+      `${d.getMonth() + 1}월 ${d.getDate()}일 거래를 카드 결제 취소로 처리할까요?\n\n처리하면 원래 지출 거래가 삭제되어 지출 합계와 연결된 잔액/카드 금액에서 빠집니다.`,
+      [
+        { text: '취소', style: 'cancel' },
+        { text: '환불 처리', style: 'destructive', onPress: () => void runRefund(item, t) },
+      ],
+    );
+  };
+
+  const refundPropsFor = (item: PaymentInboxItem) => {
+    if (item.kind !== 'card_cancellation' || item.refundTxnId) return undefined;
+    const open = refundOpenFor === item.fingerprint;
+    return {
+      open,
+      ready: finance.status === 'ready' && !!householdId,
+      busy: refunding,
+      lookup: open ? refundLookup(item) : null,
+      onToggle: () => setRefundOpenFor((cur) => (cur === item.fingerprint ? null : item.fingerprint)),
+      onChoose: (m: RefundMatch) => confirmRefund(item, m),
+      onEdit: (t: Transaction) => router.push({ pathname: '/input', params: { id: t.id } }),
+    };
   };
 
   const reload = useCallback(async () => {
@@ -394,6 +517,7 @@ export default function PaymentNotifications() {
                   onHandled={() =>
                     updateCandidateState((state) => markCandidateHandled(state, item.fingerprint, Date.now()))
                   }
+                  refund={refundPropsFor(item)}
                 />
               ))}
               {inbox.unreadableCount > 0 && (
@@ -513,10 +637,22 @@ const KIND_LABEL: Record<PaymentInboxItem['kind'], string> = {
   outflow: '출금',
 };
 
+/** 원결제 찾기 for one cancellation (refundMatch.ts). */
+interface RefundCardProps {
+  open: boolean;
+  /** The ledger is loaded for the active household. */
+  ready: boolean;
+  busy: boolean;
+  lookup: { matches: RefundMatch[]; partials: Transaction[] } | null;
+  onToggle: () => void;
+  onChoose: (match: RefundMatch) => void;
+  onEdit: (transaction: Transaction) => void;
+}
+
 /**
  * One 후보함 entry. "가계부에 입력" only opens /input with starting values —
- * never saves. A cancellation has no input action (원거래 매칭 / 환불 처리
- * is not designed yet).
+ * never saves. A cancellation has no input action; "원결제 찾기" lists the
+ * possible original payments — choosing one asks for confirmation first.
  */
 function InboxCard({
   item,
@@ -525,6 +661,7 @@ function InboxCard({
   onInput,
   onHandled,
   onPending,
+  refund,
 }: {
   item: PaymentInboxItem;
   disabled: boolean;
@@ -533,6 +670,8 @@ function InboxCard({
   onInput?: () => void;
   onHandled?: () => void;
   onPending?: () => void;
+  /** Pending, unprocessed cancellations only. */
+  refund?: RefundCardProps;
 }) {
   const c = item.candidate;
   const line = { fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub } as const;
@@ -597,9 +736,12 @@ function InboxCard({
       {!!blocker && !item.autoSaveFailed && (
         <Text style={muted}>자동입력 대상 아님 · {PAYMENT_AUTO_SAVE_BLOCKER_LABEL[blocker]}</Text>
       )}
-      {item.kind === 'card_cancellation' && (
-        <Text style={notice}>취소/환불 처리 준비 중 · 아직 가계부에 반영할 수 없어요</Text>
-      )}
+      {item.kind === 'card_cancellation' &&
+        (item.refundTxnId ? (
+          <Text style={{ ...muted, color: colors.primaryStrong }}>환불 처리됨 · 원래 지출 거래를 삭제했어요</Text>
+        ) : (
+          <Text style={muted}>원결제를 찾아 직접 고르면 전액 취소로 처리할 수 있어요. 자동으로 처리되지는 않아요.</Text>
+        ))}
       {item.transferWarning && (
         <Text style={notice}>
           계좌이체 가능성 ·{' '}
@@ -623,6 +765,15 @@ function InboxCard({
             />
           </View>
         )}
+        {!!refund && (
+          <View style={{ flex: 1 }}>
+            <ActionButton
+              label={refund.open ? '원결제 찾기 닫기' : '원결제 찾기'}
+              onPress={refund.onToggle}
+              disabled={disabled || !refund.ready}
+            />
+          </View>
+        )}
         {!!onHandled && (
           <View style={{ flex: 1 }}>
             <ActionButton label="처리 완료" onPress={onHandled} disabled={disabled} />
@@ -634,6 +785,76 @@ function InboxCard({
           </View>
         )}
       </View>
+      {!!refund?.open && !!refund.lookup && (
+        <RefundMatchList lookup={refund.lookup} busy={refund.busy || disabled} onChoose={refund.onChoose} onEdit={refund.onEdit} />
+      )}
+    </View>
+  );
+}
+
+/**
+ * The possible original payments, strongest first. Every one is listed —
+ * nothing is chosen for the user; a tap only asks for confirmation.
+ */
+function RefundMatchList({
+  lookup,
+  busy,
+  onChoose,
+  onEdit,
+}: {
+  lookup: { matches: RefundMatch[]; partials: Transaction[] };
+  busy: boolean;
+  onChoose: (match: RefundMatch) => void;
+  onEdit: (transaction: Transaction) => void;
+}) {
+  const muted = { fontFamily: fontFamily.medium, fontSize: 11, color: colors.textMuted } as const;
+  const row = {
+    padding: 10,
+    borderRadius: radii.md,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: 2,
+  } as const;
+  const title = (t: Transaction) => {
+    const d = new Date(t.date);
+    return `${d.getMonth() + 1}/${d.getDate()} · ${t.memo.trim() || '메모 없음'} · ${fmt(t.amount)}원`;
+  };
+  return (
+    <View style={{ gap: 6, marginTop: 4 }}>
+      {lookup.matches.length === 0 ? (
+        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.textSub }}>
+          원결제를 찾지 못했어요. 직접 정리하려면 「처리 완료」를 눌러 주세요.
+        </Text>
+      ) : (
+        <Text style={muted}>
+          원결제 후보 {lookup.matches.length}건 · 맞는 거래를 직접 골라 주세요. 고른 뒤 한 번 더 확인해요.
+        </Text>
+      )}
+      {lookup.matches.map((m) => (
+        <Pressable
+          key={m.transaction.id}
+          onPress={() => onChoose(m)}
+          disabled={busy}
+          style={({ pressed }) => ({ ...row, opacity: busy ? 0.5 : pressed ? 0.7 : 1 })}
+        >
+          <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>{title(m.transaction)}</Text>
+          <Text style={{ ...muted, color: m.basis === 'inbox' ? colors.primaryStrong : colors.textMuted }}>
+            {m.reasons.join(' · ')}
+          </Text>
+        </Pressable>
+      ))}
+      {lookup.partials.length > 0 && (
+        <>
+          <Text style={{ ...muted, color: colors.warningText }}>{REFUND_BLOCKER_MESSAGE.partial}</Text>
+          {lookup.partials.map((t) => (
+            <View key={t.id} style={row}>
+              <Text style={{ fontFamily: fontFamily.medium, fontSize: 12, color: colors.textSub }}>{title(t)}</Text>
+              <ActionButton label="거래 수정" onPress={() => onEdit(t)} disabled={busy} />
+            </View>
+          ))}
+        </>
+      )}
     </View>
   );
 }

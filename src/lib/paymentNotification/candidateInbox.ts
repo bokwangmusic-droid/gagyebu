@@ -81,6 +81,13 @@ export interface PaymentCandidateStateEntry {
   manualLinkFailedAt?: number;
   /** The server event is linked to ANOTHER transaction: possibly a duplicate. */
   linkConflictAt?: number;
+  /**
+   * 카드 결제 취소 (refundMatch.ts): the expense the user picked as this
+   * cancellation's original payment and had deleted (or queued for delete) —
+   * device-local only. Set once; never used for a second cancellation.
+   */
+  refundTxnId?: string;
+  refundedAt?: number;
 }
 export type PaymentCandidateState = Record<string, PaymentCandidateStateEntry>;
 
@@ -105,6 +112,8 @@ export interface PaymentInboxItem {
   autoSaveFailed: boolean;
   /** STEP 6: another transaction is linked to the same server event — check for a duplicate. */
   linkConflict: boolean;
+  /** 카드 결제 취소: the original payment deleted for it (refundMatch.ts); `null` = not processed. */
+  refundTxnId: string | null;
 }
 
 export interface PaymentInbox {
@@ -232,6 +241,7 @@ export function buildPaymentInbox(
       autoSavedAt: entry?.autoSavedAt ?? null,
       autoSaveFailed: entry?.autoSaveFailedAt != null,
       linkConflict: entry?.linkConflictAt != null,
+      refundTxnId: entry?.refundTxnId ?? null,
     });
   });
   items.sort((a, b) => b.candidate.occurredAt - a.candidate.occurredAt);
@@ -307,6 +317,25 @@ export function markCandidateManualSaved(
   };
 }
 
+/**
+ * 카드 결제 취소: the user had `transactionId` (its original payment) deleted
+ * — 처리 완료 with the transaction recorded. The first record wins: a
+ * cancellation is never recorded against a second transaction.
+ */
+export function markCandidateRefunded(
+  state: PaymentCandidateState,
+  fingerprint: string,
+  transactionId: string,
+  now: number,
+): PaymentCandidateState {
+  const entry = state[fingerprint] ?? {};
+  if (entry.refundTxnId) return state;
+  return {
+    ...state,
+    [fingerprint]: { ...entry, handledAt: entry.handledAt ?? now, refundTxnId: transactionId, refundedAt: now },
+  };
+}
+
 /** Back to 확인 대기 (keeps `sentAt`). */
 export function markCandidatePending(state: PaymentCandidateState, fingerprint: string): PaymentCandidateState {
   const { handledAt: _drop, ...rest } = state[fingerprint] ?? {};
@@ -355,6 +384,10 @@ export function prunePaymentCandidateState(raw: unknown, now: number): PaymentCa
       if (valid(v.manualLinkFailedAt)) entry.manualLinkFailedAt = v.manualLinkFailedAt;
     }
     if (valid(v.linkConflictAt)) entry.linkConflictAt = v.linkConflictAt;
+    if (typeof v.refundTxnId === 'string' && v.refundTxnId && valid(v.refundedAt)) {
+      entry.refundTxnId = v.refundTxnId;
+      entry.refundedAt = v.refundedAt;
+    }
     const touched = Math.max(
       entry.sentAt ?? 0,
       entry.handledAt ?? 0,
@@ -366,6 +399,7 @@ export function prunePaymentCandidateState(raw: unknown, now: number): PaymentCa
       entry.manualLinkedAt ?? 0,
       entry.manualLinkFailedAt ?? 0,
       entry.linkConflictAt ?? 0,
+      entry.refundedAt ?? 0,
     );
     if (touched === 0 || now - touched > CANDIDATE_STATE_MAX_AGE_MS) continue;
     rows.push([key, entry, touched]);
