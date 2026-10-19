@@ -259,6 +259,70 @@ export async function runCandidateAutoHandleCases(): Promise<{
     );
   }
 
+  // ── manual save → 처리 완료, with the saved transaction recorded ──
+  const SAVED = { transactionId: 'txn-pn-00000000-0000-4000-8000-000000000001', householdId: 'house-1' };
+  {
+    const { store, seed } = openFromInbox(card, markCandidateSent({}, card2.fingerprint, NOW - 5000));
+    const ok = await settleSourceCandidate(store.io, seed.sourceCandidateId, 'saved', NOW, SAVED);
+    const s = store.read();
+    check(
+      'MANUAL 1 online save from A → A handled with its transaction recorded (for the server link); B untouched',
+      ok &&
+        statusOf(s, card.fingerprint) === 'handled' &&
+        s[card.fingerprint].manualTxnId === SAVED.transactionId &&
+        s[card.fingerprint].manualHouseholdId === SAVED.householdId &&
+        statusOf(s, card2.fingerprint) === 'pending' &&
+        s[card2.fingerprint].manualTxnId === undefined &&
+        s[card2.fingerprint].handledAt === undefined,
+      JSON.stringify(s),
+    );
+    // The listener hands the same notifications again (re-parse / app re-entry).
+    const again = buildPaymentInbox([CARD_2, CANCEL, CARD, CARD], s, TODAY).items;
+    check(
+      'MANUAL 2 the same notifications parsed again → A stays handled (one entry), B still pending',
+      again.filter((i) => i.fingerprint === card.fingerprint).length === 1 &&
+        again.find((i) => i.fingerprint === card.fingerprint)?.status === 'handled' &&
+        again.find((i) => i.fingerprint === card2.fingerprint)?.status === 'pending',
+    );
+  }
+  {
+    // Offline: the durable queue accepted the create (same id) — handled, as the form says 저장했어요.
+    const { store, seed } = openFromInbox(card);
+    const ok = await settleSourceCandidate(store.io, seed.sourceCandidateId, 'queued', NOW, SAVED);
+    const s = store.read();
+    check(
+      'MANUAL 3 offline queued save → handled, the queued id recorded (its link waits for the replay)',
+      ok && statusOf(s, card.fingerprint) === 'handled' && s[card.fingerprint].manualTxnId === SAVED.transactionId,
+    );
+  }
+  for (const outcome of ['failed', 'queue-failed'] as CreateSaveOutcome[]) {
+    const { store, seed } = openFromInbox(card);
+    const ok = await settleSourceCandidate(store.io, seed.sourceCandidateId, outcome, NOW, SAVED);
+    check(
+      `MANUAL 4 ${outcome} with a transaction ref → pending, nothing recorded`,
+      !ok && store.saves() === 0 && store.read()[card.fingerprint].manualTxnId === undefined,
+    );
+  }
+  {
+    // A and B both stored; /input reports a bad or foreign source id.
+    const both = markCandidateSent(markCandidateSent({}, card.fingerprint, NOW - 2000), card2.fingerprint, NOW - 1000);
+    const store = memoryIO(both);
+    const before = JSON.stringify(store.read());
+    const bad = [
+      parseInputRouteSeed({ ...inputPrefillToParams(card.prefill!), sourceCandidateId: 'pc1_' }, TODAY).sourceCandidateId,
+      parseInputRouteSeed({ ...inputPrefillToParams(card.prefill!), sourceCandidateId: `${card.fingerprint}x!` }, TODAY)
+        .sourceCandidateId,
+      'pc1_zzzzzzzz', // well-formed, but no such candidate
+      'not-a-fingerprint',
+    ];
+    const outs = await Promise.all(bad.map((id) => settleSourceCandidate(store.io, id, 'saved', NOW, SAVED)));
+    check(
+      'MANUAL 5 malformed / unknown source ids → no candidate handled or recorded, A and B unchanged',
+      outs.every((o) => !o) && store.saves() === 0 && JSON.stringify(store.read()) === before,
+      JSON.stringify(outs),
+    );
+  }
+
   const passed = results.filter((r) => r.pass).length;
   return { results, passed, failed: results.length - passed };
 }
