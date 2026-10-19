@@ -103,7 +103,8 @@ export function paymentAutoSaveIO(args: { householdId: string; userId: string })
           // No card is ever set on an automatic save.
           knownCardIds: new Set<string>(),
         });
-        return res.ok ? { ok: true } : { ok: false, transport: res.transport === true };
+        // `reconciled`: the same request had landed before — nothing new.
+        return res.ok ? { ok: true, createdNow: res.reconciled !== true } : { ok: false, transport: res.transport === true };
       } catch (e) {
         return { ok: false, transport: isTransportError(e) };
       }

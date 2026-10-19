@@ -15,7 +15,7 @@ import { useEffect } from 'react';
 import { AppState } from 'react-native';
 
 import { useToast } from '@/components/ui/Toast';
-import { fmt } from '@/lib/format';
+import { paymentAutoSavedMessage } from '@/lib/paymentNotification/autoSave';
 import {
   onPaymentNotificationsAutoSaved,
   processPaymentNotifications,
@@ -35,17 +35,13 @@ export function PaymentNotificationAutoProcess() {
   const userId = session?.user?.id ?? null;
   const householdId = userId && !loading && loadedForUserId === userId ? (activeHousehold?.id ?? null) : null;
 
-  // One short line per pass that saved something; the ledger is refreshed.
+  // One short line per pass that saved something new (each save announced
+  // once per app run — processor.ts); the ledger is refreshed.
   useEffect(
     () =>
       onPaymentNotificationsAutoSaved((saved) => {
         void refreshRemoteFinance().catch(() => {});
-        const first = saved[0];
-        toast.show(
-          saved.length === 1 && first.merchant
-            ? `${first.merchant} ${fmt(first.amount)}원 자동 입력`
-            : `카드 결제 ${saved.length}건 자동 입력`,
-        );
+        toast.show(paymentAutoSavedMessage(saved));
       }),
     [refreshRemoteFinance, toast],
   );

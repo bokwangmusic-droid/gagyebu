@@ -138,10 +138,10 @@ function fakeServer(events: EventRow[]) {
           existing.householdId === HOUSE &&
           existing.createdBy === userId &&
           JSON.stringify(existing.draft) === JSON.stringify(draft);
-        return same ? { ok: true } : { ok: false, transport: false };
+        return same ? { ok: true, createdNow: false } : { ok: false, transport: false };
       }
       txns.set(transactionId, { id: transactionId, householdId: HOUSE, createdBy: userId, draft, deleted: false });
-      return { ok: true };
+      return { ok: true, createdNow: true };
     },
     // complete_payment_notification_event (migration 20261019002300).
     complete: async (eventId, transactionId, source) => {
@@ -543,7 +543,7 @@ export async function runAutoSaveCases(): Promise<{ results: CaseResult[]; passe
         JSON.stringify(
           applyPaymentAutoSaveOutcomes(
             registered([card]),
-            [{ kind: 'saved', fingerprint: card.fingerprint, transactionId: `txn-pn-${EVENT_1}`, linked: false }],
+            [{ kind: 'saved', fingerprint: card.fingerprint, transactionId: `txn-pn-${EVENT_1}`, linked: false, createdNow: true }],
             NOW,
           ),
         ),

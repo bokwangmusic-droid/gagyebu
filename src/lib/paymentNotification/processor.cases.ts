@@ -12,12 +12,19 @@
  * its captured list, its stored 후보함 state (serialised read-modify-writes,
  * as paymentCandidateState.ts does) and its setting.
  */
-import type { PaymentAutoSaveIO, PaymentEventCompleteStatus } from '@/lib/paymentNotification/autoSave';
+import { toDateKey } from '@/lib/format';
 import {
+  paymentAutoSavedMessage,
+  type PaymentAutoSaveIO,
+  type PaymentEventCompleteStatus,
+} from '@/lib/paymentNotification/autoSave';
+import {
+  buildPaymentInbox,
   markCandidateHandled,
   markCandidateManualSaved,
   markCandidateSent,
   paymentCandidateFingerprint,
+  splitPaymentInbox,
   type PaymentCandidateState,
 } from '@/lib/paymentNotification/candidateInbox';
 import { KAKAOBANK_PACKAGE } from '@/lib/paymentNotification/kakaoBankParser';
@@ -126,10 +133,10 @@ function processorFor(srv: Server, ph: Phone) {
       if (existing) {
         // createTransaction's 23505 reconcile.
         const same = existing.createdBy === ph.userId && JSON.stringify(existing.draft) === JSON.stringify(draft);
-        return same ? { ok: true } : { ok: false, transport: false };
+        return same ? { ok: true, createdNow: false } : { ok: false, transport: false };
       }
       srv.txns.set(transactionId, { createdBy: ph.userId, draft });
-      return { ok: true };
+      return { ok: true, createdNow: true };
     },
     // complete_payment_notification_event (migration 20261019002300).
     complete: async (eventId, transactionId, source) => {
@@ -465,6 +472,164 @@ export async function runProcessorCases(): Promise<{ results: CaseResult[]; pass
     const ph3 = phone({ throwOn: 'captured' });
     const thrown = await processorFor(server(), ph3).registerCandidate(ctxOf(ph3), paymentCandidateFingerprint(CARD));
     check('REG-NOW2 offline / failing / throwing → false (the save keeps the ordinary id), never throws', !off && !thrown);
+  }
+
+  // ── STEP 6 UX: what the user is told / shown ──────────────────
+  check(
+    'UX-1 success line names the merchant and amount and says it was recorded automatically',
+    paymentAutoSavedMessage([{ merchant: '쿠팡(쿠페이)', amount: 17060 }]) ===
+      '쿠팡(쿠페이) 17,060원이 자동으로 기록됐어요' &&
+      paymentAutoSavedMessage([
+        { merchant: '쿠팡(쿠페이)', amount: 17060 },
+        { merchant: '청계상회', amount: 5100 },
+      ]) === '카드 결제 2건이 자동으로 기록됐어요',
+  );
+  {
+    // T1 / T2: a new automatic save is announced once; re-runs add nothing.
+    const srv = server();
+    const ph = phone();
+    const p = processorFor(srv, ph);
+    const announced: PaymentAutoSavedItem[][] = [];
+    p.onSaved((s) => announced.push(s));
+    const first = await p.run(ctxOf(ph));
+    await p.run(ctxOf(ph));
+    await p.run(ctxOf(ph));
+    await Promise.all([p.run(ctxOf(ph)), p.run(ctxOf(ph))]);
+    check(
+      'T1 new automatic save → createdNow → announced exactly once',
+      first.saved.length === 1 && announced.length === 1 && announced[0].length === 1 && srv.txns.size === 1,
+    );
+    check('T2 the same processor re-run (incl. at once) → no further announcement, no new transaction', announced.length === 1 && srv.txns.size === 1);
+  }
+  {
+    // T3 / T4: local 후보함 state lost AND the app restarted (a NEW processor:
+    // its in-memory "announced" set is empty) — the transaction exists.
+    const restart = async (linkLanded: boolean) => {
+      const srv = server();
+      const ph = phone();
+      await processorFor(srv, ph).run(ctxOf(ph)); // the original save
+      ph.stored = {}; // the device lost its candidate state
+      if (!linkLanded) {
+        for (const e of srv.events.values()) {
+          e.status = 'pending';
+          e.linked = null;
+        }
+      }
+      const fresh = processorFor(srv, ph); // app killed and started again
+      const announced: PaymentAutoSavedItem[][] = [];
+      fresh.onSaved((s) => announced.push(s));
+      const res = await fresh.run(ctxOf(ph));
+      const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+      return { srv, res, announced, items };
+    };
+    const landed = await restart(true);
+    check(
+      'T3 state lost + app restart, the server event already linked → no new transaction, no announcement, candidate handled',
+      landed.srv.txns.size === 1 &&
+        landed.res.saved.length === 0 &&
+        landed.announced.length === 0 &&
+        landed.items.pending.length === 0,
+      JSON.stringify(landed.res),
+    );
+    const notLanded = await restart(false);
+    check(
+      'T4 state lost + app restart, link not landed → the existing transaction is re-confirmed (23505 reconcile): no new one, 자동저장 restored, NO announcement',
+      notLanded.srv.txns.size === 1 &&
+        notLanded.res.saved.length === 0 &&
+        notLanded.announced.length === 0 &&
+        notLanded.items.autoSaved.length === 1 &&
+        [...notLanded.srv.events.values()][0].status === 'handled',
+      JSON.stringify({ res: notLanded.res, autoSaved: notLanded.items.autoSaved.length }),
+    );
+  }
+  {
+    const srv = server();
+    const ph = phone();
+    const p = processorFor(srv, ph);
+    await p.run(ctxOf(ph));
+    const fp = paymentCandidateFingerprint(CARD);
+    ph.since = null; // the user turns it OFF
+    ph.captured = [CARD, CARD_2]; // and a new card payment arrives
+    const off = await p.run(ctxOf(ph));
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    check(
+      'UX-3 OFF after a save: the saved one stays saved (never undone), the new payment stays pending, nothing new saved',
+      off.saved.length === 0 &&
+        srv.txns.size === 1 &&
+        ph.stored[fp].autoSavedAt != null &&
+        items.autoSaved.length === 1 &&
+        items.autoSaved[0].fingerprint === fp &&
+        items.pending.length === 1 &&
+        items.pending[0].candidate.merchantCandidate === '김밥천국',
+      JSON.stringify(off),
+    );
+  }
+  {
+    // Captured BEFORE the toggle was turned on, then turned on.
+    const srv = server();
+    const ph = phone({ since: null });
+    const p = processorFor(srv, ph);
+    await p.run(ctxOf(ph));
+    ph.since = NOW; // turned on now — after CARD arrived
+    const on = await p.run(ctxOf(ph));
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    check(
+      'UX-4 a payment captured before the toggle went ON is never saved automatically (stays pending)',
+      on.saved.length === 0 && srv.txns.size === 0 && items.pending.length === 1 && items.autoSaved.length === 0,
+    );
+  }
+  {
+    const srv = server();
+    const ph = phone();
+    const p = processorFor(srv, ph);
+    for (let i = 0; i < 5; i++) await p.run(ctxOf(ph)); // re-entries / foregrounds / screen visits
+    await Promise.all([p.run(ctxOf(ph)), processorFor(srv, ph).run(ctxOf(ph))]);
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    check(
+      'UX-5 the same notification through 7 passes (incl. two at once) → 1 transaction, shown once under 자동저장 내역',
+      srv.txns.size === 1 &&
+        items.autoSaved.length === 1 &&
+        items.autoSaved[0].autoSaved &&
+        items.autoSaved[0].autoSavedAt === NOW &&
+        items.autoSaved[0].candidate.accountLast4 === '3308' &&
+        items.autoSaved[0].candidate.merchantCandidate === '청계상회' &&
+        items.handled.length === 0 &&
+        items.pending.length === 0,
+    );
+  }
+  {
+    // A refused create with no transaction behind it → the automatic save gives up.
+    const srv = server();
+    const ph = phone();
+    const p = processorFor(srv, ph);
+    srv.txns.set('txn-pn-00000000-0000-4000-8000-000000000001', {
+      createdBy: USER_B,
+      draft: { ...MANUAL_DRAFT, type: 'income' }, // the derived id is taken by something that does not fit
+    });
+    await p.run(ctxOf(ph));
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    check(
+      'UX-6 automatic save failed → the candidate stays pending (자동저장 실패 · 직접 확인), nothing lost',
+      items.pending.length === 1 &&
+        items.pending[0].autoSaveFailed &&
+        !items.pending[0].autoSaved &&
+        !!items.pending[0].prefill &&
+        items.autoSaved.length === 0,
+      JSON.stringify(ph.stored),
+    );
+  }
+  {
+    const srv = server();
+    const promo = kb('최대 5만원 결제 혜택 도착!', '결제 혜택은 이틀 동안 확인 가능해요. 알림 해지 : 로그인 > 혜택 > 알림 해지', NOW - MINUTE, 'p');
+    const out = kb('출금 398,400원', '입출금통장(1111) → 홍*동 잔액 601,600원', NOW - MINUTE, 'o');
+    const cancel = kb('카드 결제 취소 5,100원', '체크카드(3308) | 청계상회 잔액 190,500원', NOW - MINUTE, 'c');
+    const ph = phone({ captured: [promo, IN, out, cancel] });
+    const res = await processorFor(srv, ph).run(ctxOf(ph));
+    const items = splitPaymentInbox(buildPaymentInbox(ph.captured, ph.stored, toDateKey(new Date(NOW))).items);
+    check(
+      'UX-7 광고 / 입금 / 출금 / 카드 취소 with 자동입력 ON → nothing saved; the three money moves stay pending',
+      res.saved.length === 0 && srv.txns.size === 0 && items.pending.length === 3 && items.autoSaved.length === 0,
+    );
   }
 
   const passed = results.filter((r) => r.pass).length;

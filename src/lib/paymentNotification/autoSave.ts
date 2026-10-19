@@ -41,6 +41,7 @@
  * candidate (linkConflictAt) so the user can check for a duplicate. Nothing
  * here ever deletes a transaction.
  */
+import { fmt } from '@/lib/format';
 import { KAKAOBANK_PACKAGE } from '@/lib/paymentNotification/kakaoBankParser';
 import type { PaymentCandidateState, PaymentCandidateStateEntry, PaymentInboxItem } from '@/lib/paymentNotification/candidateInbox';
 import type { NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
@@ -143,6 +144,18 @@ export function buildPaymentAutoSaveDraft(item: PaymentInboxItem): NewTransactio
   };
 }
 
+/**
+ * The one short line shown after a pass saved something automatically, e.g.
+ * "쿠팡(쿠페이) 17,060원이 자동으로 기록됐어요". Several at once → a count.
+ */
+export function paymentAutoSavedMessage(saved: readonly { merchant: string; amount: number }[]): string {
+  const first = saved[0];
+  if (saved.length === 1 && first?.merchant) {
+    return `${first.merchant} ${fmt(first.amount)}원이 자동으로 기록됐어요`;
+  }
+  return `카드 결제 ${saved.length}건이 자동으로 기록됐어요`;
+}
+
 // ── the injected server calls ──────────────────────────────────────
 export type PaymentEventLinkResult =
   | { ok: true; status: 'pending' | 'handled'; transactionId: string | null }
@@ -162,7 +175,11 @@ export type PaymentEventCompleteResult =
 
 export type PaymentLinkSource = 'auto' | 'manual';
 
-export type PaymentAutoSaveCreateResult = { ok: true } | { ok: false; transport: boolean };
+/**
+ * `createdNow`: THIS call inserted the row. `false` = the very same request
+ * had already landed (createTransaction's 23505 reconcile) — nothing new.
+ */
+export type PaymentAutoSaveCreateResult = { ok: true; createdNow: boolean } | { ok: false; transport: boolean };
 
 export interface PaymentAutoSaveIO {
   getLink: (eventId: string) => Promise<PaymentEventLinkResult>;
@@ -171,8 +188,13 @@ export interface PaymentAutoSaveIO {
 }
 
 export type PaymentAutoSaveOutcome =
-  /** Saved and linked (or the link to our transaction confirmed). */
-  | { kind: 'saved'; fingerprint: string; transactionId: string; linked: true }
+  /**
+   * Saved and linked (or the link to our transaction confirmed).
+   * `createdNow` (both 'saved' shapes): this run inserted the transaction —
+   * `false` when it re-confirmed one that existed already (the local state
+   * was lost); only `createdNow` saves are announced to the user.
+   */
+  | { kind: 'saved'; fingerprint: string; transactionId: string; linked: true; createdNow: boolean }
   /**
    * Saved; the server link failed on the network — only the link is retried
    * later. With `refused` the server answered and said no: the transaction
@@ -183,6 +205,7 @@ export type PaymentAutoSaveOutcome =
       fingerprint: string;
       transactionId: string;
       linked: false;
+      createdNow: boolean;
       refused?: PaymentEventCompleteStatus;
     }
   /** The event was already handled (another phone / a manual save / an earlier run). */
@@ -224,12 +247,21 @@ export async function autoSavePaymentCandidate(
   // (another phone, a manual save from the 후보함) saved it first — kept as
   // it is, nothing is added here.
   if (isCompleted(linked)) {
-    return created.ok ? { kind: 'saved', fingerprint, transactionId, linked: true } : { kind: 'already', fingerprint };
+    return created.ok
+      ? { kind: 'saved', fingerprint, transactionId, linked: true, createdNow: created.createdNow }
+      : { kind: 'already', fingerprint };
   }
   if (created.ok) {
     // The transaction exists: never undone, never re-created. A link that
     // failed on the network is retried; a refused one is left as it is.
-    return { kind: 'saved', fingerprint, transactionId, linked: false, ...(linked.ok ? { refused: linked.status } : {}) };
+    return {
+      kind: 'saved',
+      fingerprint,
+      transactionId,
+      linked: false,
+      createdNow: created.createdNow,
+      ...(linked.ok ? { refused: linked.status } : {}),
+    };
   }
   // The create was refused AND the link could not confirm the transaction.
   if (!linked.ok && linked.transport) return { kind: 'retry', fingerprint };

@@ -99,6 +99,8 @@ export interface PaymentInboxItem {
   duplicates: number;
   /** STEP 6: saved by 확실한 카드 결제 자동입력 (not by the user). */
   autoSaved: boolean;
+  /** …at this time (epoch ms); `null` when not saved automatically. */
+  autoSavedAt: number | null;
   /** STEP 6: automatic save was tried and gave up — the user decides. */
   autoSaveFailed: boolean;
   /** STEP 6: another transaction is linked to the same server event — check for a duplicate. */
@@ -227,12 +229,30 @@ export function buildPaymentInbox(
       prefill: toInputPrefill(candidate, todayKey),
       duplicates: k.duplicates,
       autoSaved: entry?.autoSavedAt != null,
+      autoSavedAt: entry?.autoSavedAt ?? null,
       autoSaveFailed: entry?.autoSaveFailedAt != null,
       linkConflict: entry?.linkConflictAt != null,
     });
   });
   items.sort((a, b) => b.candidate.occurredAt - a.candidate.occurredAt);
   return { items, ignoredCount, unreadableCount };
+}
+
+/**
+ * The 후보함 screen's three lists, newest first: 확인 대기 (pending — an
+ * automatic save that failed stays here for the user), 자동저장 내역 (saved
+ * automatically and still handled) and 처리한 후보 (handled otherwise).
+ */
+export function splitPaymentInbox(items: readonly PaymentInboxItem[]): {
+  pending: PaymentInboxItem[];
+  autoSaved: PaymentInboxItem[];
+  handled: PaymentInboxItem[];
+} {
+  return {
+    pending: items.filter((i) => i.status === 'pending'),
+    autoSaved: items.filter((i) => i.status === 'handled' && i.autoSaved),
+    handled: items.filter((i) => i.status === 'handled' && !i.autoSaved),
+  };
 }
 
 export function markCandidateSent(state: PaymentCandidateState, fingerprint: string, now: number): PaymentCandidateState {

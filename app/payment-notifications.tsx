@@ -56,6 +56,7 @@ import { PAYMENT_AUTO_SAVE_BLOCKER_LABEL, paymentAutoSaveBlocker } from '@/lib/p
 import {
   buildPaymentInbox,
   markCandidateHandled,
+  splitPaymentInbox,
   markCandidatePending,
   markCandidateSent,
   type PaymentCandidateState,
@@ -148,8 +149,8 @@ export default function PaymentNotifications() {
     () => buildPaymentInbox(captured, candidateState, toDateKey(new Date())),
     [captured, candidateState],
   );
-  const pendingItems = inbox.items.filter((item) => item.status === 'pending');
-  const handledItems = inbox.items.filter((item) => item.status === 'handled');
+  const { pending: pendingItems, autoSaved: autoSavedItems, handled: handledItems } = splitPaymentInbox(inbox.items);
+  const [autoSavedOpen, setAutoSavedOpen] = useState(false);
 
   // On first focus and on coming back from /input (which may have marked a
   // candidate 처리 완료 after saving).
@@ -205,7 +206,6 @@ export default function PaymentNotifications() {
     // reloadCandidateState is a plain closure over refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [captured, householdId, userId, candidateStateLoaded, autoSaveLoaded, autoSaveSince]);
-  const autoSavedCount = inbox.items.filter((item) => item.autoSaved).length;
 
   const openInput = (item: PaymentInboxItem) => {
     if (!item.prefill || !candidateStateLoaded) return;
@@ -349,18 +349,23 @@ export default function PaymentNotifications() {
                 <Toggle value={autoSaveSince != null} onChange={toggleAutoSave} disabled={!autoSaveLoaded} />
               </View>
               <Text style={bodyStyle}>
-                신뢰도 높은 카드 결제를 자동으로 지출에 기록해요. 애매한 알림과 입금·출금·취소는 계속 확인이
-                필요해요.
+                켠 뒤에 받은 신뢰도 높은 카드 결제만 지출로 자동 기록해요. 입금·출금·취소와 애매한 알림은 직접
+                확인해 주세요.
               </Text>
               <Text style={{ ...bodyStyle, fontSize: 12, color: colors.textMuted }}>
-                켠 뒤에 받은 카카오뱅크 카드 결제만 「기타」 카테고리, 결제수단 미지정으로 저장돼요. 돈돈 앱을 열거나
-                다시 돌아올 때 처리되고, 인터넷에 연결되지 않으면 다음에 다시 시도해요.
+                카테고리는 「기타」로 저장되고 결제수단(카드)은 연결하지 않아요. 거래내역에서 언제든 수정할 수 있어요.
+                돈돈 앱을 열거나 다시 돌아올 때 처리돼요.
               </Text>
-              {autoSavedCount > 0 && (
-                <Text style={{ ...bodyStyle, fontSize: 12, color: colors.primaryStrong }}>
-                  최근 자동입력 {autoSavedCount}건 · 아래 「처리한 후보」에서 볼 수 있어요
-                </Text>
+              {autoSavedItems.length > 0 && (
+                <ActionButton
+                  label={autoSavedOpen ? '자동저장 내역 접기' : `자동저장 내역 ${autoSavedItems.length}건 보기`}
+                  onPress={() => setAutoSavedOpen((open) => !open)}
+                />
               )}
+              {autoSavedOpen &&
+                autoSavedItems.map((item) => (
+                  <InboxCard key={item.fingerprint} item={item} disabled={!candidateStateLoaded} />
+                ))}
             </Panel>
 
             <Panel>
@@ -538,7 +543,7 @@ function InboxCard({
       <Text style={muted}>
         {formatPostedAt(c.occurredAt)} · {CONFIDENCE_LABEL[c.confidence]}
         {item.autoSaved
-          ? ' · 자동 입력됨'
+          ? ' · 자동저장됨'
           : item.status === 'handled'
             ? ' · 처리 완료'
             : item.sentToInput
@@ -564,12 +569,17 @@ function InboxCard({
           </Text>
         </>
       )}
-      {item.autoSaved && <Text style={muted}>「기타」 카테고리로 자동 저장했어요. 가계부에서 수정할 수 있어요.</Text>}
+      {item.autoSaved && (
+        <Text style={{ ...muted, color: colors.primaryStrong }}>
+          자동저장됨{item.autoSavedAt != null ? ` · ${formatPostedAt(item.autoSavedAt)}` : ''} · 「기타」로 저장했어요.
+          거래내역에서 수정할 수 있어요.
+        </Text>
+      )}
       {item.linkConflict && (
         <Text style={notice}>다른 기기에서 입력된 같은 결제가 있을 수 있어요 · 가계부에서 중복인지 확인해 주세요</Text>
       )}
       {item.autoSaveFailed && item.status === 'pending' && (
-        <Text style={notice}>자동입력하지 못했어요 · 직접 확인해 주세요</Text>
+        <Text style={notice}>자동저장 실패 · 직접 확인이 필요해요</Text>
       )}
       {!!blocker && !item.autoSaveFailed && (
         <Text style={muted}>자동입력 대상 아님 · {PAYMENT_AUTO_SAVE_BLOCKER_LABEL[blocker]}</Text>

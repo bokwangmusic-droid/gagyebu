@@ -66,7 +66,10 @@ export interface PaymentAutoSavedItem {
 export interface PaymentProcessingResult {
   /** The stored 후보함 state changed (a screen showing it should reload). */
   changed: boolean;
-  /** New automatic saves of this pass (not link retries). */
+  /**
+   * Transactions this pass INSERTED automatically — not link retries, not a
+   * re-confirmed transaction that existed already. What the user is told.
+   */
   saved: PaymentAutoSavedItem[];
 }
 
@@ -122,7 +125,7 @@ async function processOnce(ctx: PaymentProcessingContext, io: PaymentProcessingI
   }
   const saved: PaymentAutoSavedItem[] = [];
   for (const o of outcomes) {
-    if (o.kind !== 'saved') continue;
+    if (o.kind !== 'saved' || !o.createdNow) continue;
     const c = saves.find((j) => j.item.fingerprint === o.fingerprint)?.item.candidate;
     saved.push({ fingerprint: o.fingerprint, merchant: c?.merchantCandidate ?? '', amount: c?.amount ?? 0 });
   }
@@ -161,7 +164,11 @@ async function registerOne(ctx: PaymentProcessingContext, fingerprint: string, i
 export interface PaymentNotificationProcessor {
   run: (ctx: PaymentProcessingContext) => Promise<PaymentProcessingResult>;
   registerCandidate: (ctx: PaymentProcessingContext, fingerprint: string) => Promise<boolean>;
-  /** Called once per pass that saved something new. Returns an unsubscribe. */
+  /**
+   * Called once per pass that INSERTED something new (`saved` above) — and,
+   * as a second guard, each candidate at most once per app run. Returns an
+   * unsubscribe.
+   */
   onSaved: (listener: (saved: PaymentAutoSavedItem[]) => void) => () => void;
 }
 
@@ -170,6 +177,7 @@ export function createPaymentNotificationProcessor(io: PaymentProcessingIO): Pay
   let again = false;
   let latest: PaymentProcessingContext | null = null;
   const listeners = new Set<(saved: PaymentAutoSavedItem[]) => void>();
+  const announced = new Set<string>();
 
   const run = (ctx: PaymentProcessingContext): Promise<PaymentProcessingResult> => {
     latest = ctx;
@@ -191,10 +199,12 @@ export function createPaymentNotificationProcessor(io: PaymentProcessingIO): Pay
           // A failed pass changes nothing it did not already store.
         }
       } while (again);
-      if (total.saved.length > 0) {
+      const fresh = total.saved.filter((s) => !announced.has(s.fingerprint));
+      fresh.forEach((s) => announced.add(s.fingerprint));
+      if (fresh.length > 0) {
         for (const l of listeners) {
           try {
-            l(total.saved);
+            l(fresh);
           } catch {
             // A listener's failure is its own.
           }

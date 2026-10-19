@@ -45,7 +45,12 @@ import { isTransportError } from '@/lib/transportError';
 import type { TransactionSplit } from '@/store/types';
 
 export type CreateTransactionResult =
-  | { ok: true; id: string }
+  /**
+   * `reconciled: true` = no row was inserted by THIS call: a 23505 whose
+   * stored row is this exact request (an earlier attempt landed). Additive
+   * and optional; callers that only branch on `ok` are unaffected.
+   */
+  | { ok: true; id: string; reconciled?: true }
   /**
    * `transport: true` (STEP 16-H2-A1 §1) marks a NETWORK/TRANSPORT failure —
    * the INSERT never reached a server verdict — as opposed to an unexpected
@@ -253,7 +258,7 @@ export async function createTransaction(args: {
     }
 
     if (isSameRequest(existing as Record<string, unknown>, row, args.expectedUserId)) {
-      return { ok: true, id: args.id };
+      return { ok: true, id: args.id, reconciled: true };
     }
     return { ok: false, message: GENERIC_ERROR };
   }
