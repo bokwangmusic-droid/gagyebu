@@ -10,7 +10,8 @@
  *   - pending  확인 대기. May also carry `sentToInput` (the user opened the
  *              input form from it) — that is NOT proof a transaction was
  *              saved, so it stays pending.
- *   - handled  the user marked it 처리 완료 themselves.
+ *   - handled  the user marked it 처리 완료 themselves, or /input did after
+ *              the transaction started from it was saved (candidateAutoHandle.ts).
  *   - ignored  ONLY a notification the parser positively recognised as not a
  *              money move (ignoredReason 'promotion'). Never listed in the
  *              inbox — counted only.

@@ -31,9 +31,10 @@ import { cardTypeOf, debitSourceAssetId, installmentPerMonth } from '@/lib/card'
 import { REMOTE_FINANCE_WRITE } from '@/lib/financeMode';
 import { fmt, parseNum, toDateKey, weekdayKo } from '@/lib/format';
 import { uid } from '@/lib/id';
-import { parseInputPrefillParams, type InputPrefill } from '@/lib/inputPrefill';
+import { parseInputRouteSeed, type InputPrefill } from '@/lib/inputPrefill';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
+import type { CreateSaveOutcome } from '@/lib/paymentNotification/candidateAutoHandle';
 import type { RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import { type NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
@@ -43,6 +44,7 @@ import {
   SPLIT_ERROR_TEXT,
   type SplitDraft,
 } from '@/lib/splits';
+import { settlePaymentCandidateAfterCreate } from '@/services/paymentCandidateState';
 import {
   createTransaction,
   softDeleteTransaction,
@@ -207,6 +209,9 @@ function applyMonthsKey(cur: string, k: string): string {
  *   /input?prefillType=…&prefillAmount=… -> new-transaction form with
  *                        starting values (결제 알림 후보함, src/lib/inputPrefill.ts).
  *                        Seeds the form only — saving is the same create path.
+ *                        `&sourceCandidateId=pc1_…` (only with a prefill): the
+ *                        candidate is marked 처리 완료 after a saved / queued
+ *                        create (src/lib/paymentNotification/candidateAutoHandle.ts).
  *
  * Either capability off -> ReadOnlyRouteNotice. The capability + param
  * checks live in this thin wrapper so TransactionForm keeps an
@@ -216,15 +221,16 @@ function applyMonthsKey(cur: string, k: string): string {
 export default function InputRoute() {
   const params = useLocalSearchParams<{ id?: string | string[] }>();
   const idParam = Array.isArray(params.id) ? params.id[0] : params.id;
-  // Read once per mount: a prefill seeds the form's initial state only.
-  const [prefill] = useState(() => (idParam ? null : parseInputPrefillParams(params, toDateKey(new Date()))));
+  // Read once per mount: a prefill seeds the form's initial state only. The
+  // source candidate is read only for a new transaction WITH a prefill.
+  const [{ prefill, sourceCandidateId }] = useState(() => parseInputRouteSeed(params, toDateKey(new Date())));
 
   if (idParam) {
     if (!REMOTE_FINANCE_WRITE.transactionEdit) return <ReadOnlyRouteNotice title="거래 수정" />;
     return <TransactionFormRoute editId={idParam} />;
   }
   if (!REMOTE_FINANCE_WRITE.transactionCreate) return <ReadOnlyRouteNotice title="거래 입력" />;
-  return <TransactionFormRoute editId={null} prefill={prefill} />;
+  return <TransactionFormRoute editId={null} prefill={prefill} sourceCandidateId={sourceCandidateId} />;
 }
 
 type FormMode =
@@ -237,7 +243,15 @@ type FormMode =
  * itself only mounts once its `mode` is fully known, so its hooks stay
  * unconditional; the `key` forces a clean remount when the target changes.
  */
-function TransactionFormRoute({ editId, prefill = null }: { editId: string | null; prefill?: InputPrefill | null }) {
+function TransactionFormRoute({
+  editId,
+  prefill = null,
+  sourceCandidateId = null,
+}: {
+  editId: string | null;
+  prefill?: InputPrefill | null;
+  sourceCandidateId?: string | null;
+}) {
   const router = useRouter();
   const { status, error, transactions, transactionMeta, refresh } = useFinanceRead();
 
@@ -249,7 +263,9 @@ function TransactionFormRoute({ editId, prefill = null }: { editId: string | nul
   const frozenRef = useRef<{ transaction: Transaction; meta: RemoteTransactionMeta } | null>(null);
 
   if (editId == null) {
-    return <TransactionForm key="create" mode={{ kind: 'create' }} prefill={prefill} />;
+    return (
+      <TransactionForm key="create" mode={{ kind: 'create' }} prefill={prefill} sourceCandidateId={sourceCandidateId} />
+    );
   }
 
   const liveTxn = transactions.find((t) => t.id === editId) ?? null;
@@ -339,7 +355,15 @@ function EditUnavailable({
   );
 }
 
-function TransactionForm({ mode, prefill = null }: { mode: FormMode; prefill?: InputPrefill | null }) {
+function TransactionForm({
+  mode,
+  prefill = null,
+  sourceCandidateId = null,
+}: {
+  mode: FormMode;
+  prefill?: InputPrefill | null;
+  sourceCandidateId?: string | null;
+}) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const toast = useToast();
@@ -941,6 +965,11 @@ function TransactionForm({ mode, prefill = null }: { mode: FormMode; prefill?: I
     setSubmitting(true);
 
     if (mode.kind === 'create') {
+      // 결제 알림 후보함: 처리 완료 for the source candidate, fire-and-forget —
+      // it never rejects and never affects the save (saved / queued only).
+      const settleCandidate = (outcome: CreateSaveOutcome) =>
+        void settlePaymentCandidateAfterCreate(sourceCandidateId, outcome);
+
       const res = await createTransaction({
         id: transactionIdRef.current,
         householdId: activeHousehold.id,
@@ -952,6 +981,7 @@ function TransactionForm({ mode, prefill = null }: { mode: FormMode; prefill?: I
       });
 
       if (res.ok) {
+        settleCandidate('saved');
         // Authoritative remote refresh, then leave — no optimistic local
         // write, no stale-closure re-check (STEP 16-G2-A2 §13/§19).
         await refresh();
@@ -974,12 +1004,14 @@ function TransactionForm({ mode, prefill = null }: { mode: FormMode; prefill?: I
         submittingRef.current = false;
         setSubmitting(false);
         if (enq.ok) {
+          settleCandidate('queued');
           void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
           toast.show('저장했어요 · 인터넷에 연결되면 자동으로 반영할게요');
           router.back();
           return;
         }
         // Durable enqueue failed — DO NOT claim success, keep the form.
+        settleCandidate('queue-failed');
         toast.show(
           enq.reason === 'not-hydrated'
             ? '오프라인 저장 준비를 완료하지 못했어요. 잠시 후 다시 시도해주세요.'
@@ -995,6 +1027,7 @@ function TransactionForm({ mode, prefill = null }: { mode: FormMode; prefill?: I
       // a manual retry reuses the same id.
       submittingRef.current = false;
       setSubmitting(false);
+      settleCandidate('failed');
       toast.show(res.message);
       return;
     }

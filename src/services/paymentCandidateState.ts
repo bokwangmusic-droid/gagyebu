@@ -3,7 +3,16 @@
  * state (src/lib/paymentNotification/candidateInbox.ts): fingerprint →
  * { sentAt, handledAt }. Only hashes and timestamps — never notification
  * text. Not part of the backup format, never sent to the server.
+ *
+ * STEP 4: /input also writes here (auto 처리 완료 after a save), so every
+ * load / save runs one at a time — the 후보함 reloading on focus always sees
+ * a write that was started before it.
  */
+import {
+  settleSourceCandidate,
+  type CandidateStateIO,
+  type CreateSaveOutcome,
+} from '@/lib/paymentNotification/candidateAutoHandle';
 import {
   prunePaymentCandidateState,
   type PaymentCandidateState,
@@ -12,10 +21,36 @@ import { loadItem, saveItem } from '@/lib/storage';
 
 const KEY = 'paymentNotificationCandidates.v1';
 
-export async function loadPaymentCandidateState(): Promise<PaymentCandidateState> {
-  return prunePaymentCandidateState(await loadItem<unknown>(KEY, {}), Date.now());
+let queue: Promise<unknown> = Promise.resolve();
+function serial<T>(task: () => Promise<T>): Promise<T> {
+  const run = queue.then(task, task);
+  queue = run.catch(() => {});
+  return run;
 }
 
-export async function savePaymentCandidateState(state: PaymentCandidateState): Promise<void> {
-  await saveItem(KEY, prunePaymentCandidateState(state, Date.now()));
+export function loadPaymentCandidateState(): Promise<PaymentCandidateState> {
+  return serial(async () => prunePaymentCandidateState(await loadItem<unknown>(KEY, {}), Date.now()));
+}
+
+export function savePaymentCandidateState(state: PaymentCandidateState): Promise<void> {
+  return serial(() => saveItem(KEY, prunePaymentCandidateState(state, Date.now())));
+}
+
+// `null` fallback: nothing stored / unreadable → the auto 처리 완료 is skipped.
+const io: CandidateStateIO = {
+  load: () => loadItem<unknown>(KEY, null),
+  save: (state) => saveItem(KEY, prunePaymentCandidateState(state, Date.now())),
+};
+
+/**
+ * Called by /input when a create ends: 처리 완료 for the candidate it came
+ * from, only for a saved / queued create. Never rejects; `false` = the
+ * candidate was left pending.
+ */
+export function settlePaymentCandidateAfterCreate(
+  sourceCandidateId: string | null,
+  outcome: CreateSaveOutcome,
+): Promise<boolean> {
+  if (!sourceCandidateId) return Promise.resolve(false);
+  return serial(() => settleSourceCandidate(io, sourceCandidateId, outcome, Date.now())).catch(() => false);
 }

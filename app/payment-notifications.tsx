@@ -9,9 +9,15 @@
  *
  * STEP 3 — "자동입력 후보" (candidateInbox.ts): the readable notifications as
  * candidates with a device-local status. "가계부에 입력" only opens the
- * ordinary /input form with starting values; the user saves there. The input
- * form does not report back whether it saved, so opening it only marks the
- * candidate "입력 화면으로 보냄" — 처리 완료 is always the user's own tap.
+ * ordinary /input form with starting values; the user saves there. Opening
+ * it marks the candidate "입력 화면으로 보냄" only.
+ *
+ * STEP 4 — the candidate's fingerprint rides along as `sourceCandidateId`;
+ * /input marks it 처리 완료 itself once that transaction's save succeeded
+ * (src/lib/paymentNotification/candidateAutoHandle.ts). Leaving /input
+ * without saving keeps it pending. The 처리 완료 button stays as the
+ * fallback, and the stored state is re-read whenever this screen regains
+ * focus.
  *
  * What it deliberately does not do yet: create or save a transaction itself,
  * link a card, pick a category, handle a cancellation / refund, merge a
@@ -19,7 +25,7 @@
  * This file is wiring only — the native calls live in
  * src/services/paymentNotificationListener.ts.
  */
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, AppState, Pressable, Text, View } from 'react-native';
 
@@ -84,6 +90,9 @@ export default function PaymentNotifications() {
   const [candidateState, setCandidateState] = useState<PaymentCandidateState>({});
   const [candidateStateLoaded, setCandidateStateLoaded] = useState(false);
   const candidateStateRef = useRef<PaymentCandidateState>({});
+  // Bumped on every local change, so a focus reload that started before it
+  // never replaces it.
+  const candidateStateSeqRef = useRef(0);
 
   // Aligned with `captured`. Display only — nothing is saved or merged.
   const candidates = useMemo(() => withPaymentRelations(captured.map(parsePaymentNotification)), [captured]);
@@ -95,22 +104,28 @@ export default function PaymentNotifications() {
   const pendingItems = inbox.items.filter((item) => item.status === 'pending');
   const handledItems = inbox.items.filter((item) => item.status === 'handled');
 
-  useEffect(() => {
-    let alive = true;
-    void loadPaymentCandidateState().then((loaded) => {
-      if (!alive) return;
-      candidateStateRef.current = loaded;
-      setCandidateState(loaded);
-      setCandidateStateLoaded(true);
-    });
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // On first focus and on coming back from /input (which may have marked a
+  // candidate 처리 완료 after saving).
+  useFocusEffect(
+    useCallback(() => {
+      let alive = true;
+      const seq = candidateStateSeqRef.current;
+      void loadPaymentCandidateState().then((loaded) => {
+        if (!alive || seq !== candidateStateSeqRef.current) return;
+        candidateStateRef.current = loaded;
+        setCandidateState(loaded);
+        setCandidateStateLoaded(true);
+      });
+      return () => {
+        alive = false;
+      };
+    }, []),
+  );
 
   const updateCandidateState = (change: (state: PaymentCandidateState) => PaymentCandidateState) => {
     if (!candidateStateLoaded) return;
     const next = change(candidateStateRef.current);
+    candidateStateSeqRef.current += 1;
     candidateStateRef.current = next;
     setCandidateState(next);
     void savePaymentCandidateState(next);
@@ -119,7 +134,7 @@ export default function PaymentNotifications() {
   const openInput = (item: PaymentInboxItem) => {
     if (!item.prefill || !candidateStateLoaded) return;
     updateCandidateState((state) => markCandidateSent(state, item.fingerprint, Date.now()));
-    router.push({ pathname: '/input', params: inputPrefillToParams(item.prefill) });
+    router.push({ pathname: '/input', params: inputPrefillToParams(item.prefill, item.fingerprint) });
   };
 
   const reload = useCallback(async () => {
@@ -452,7 +467,7 @@ function InboxCard({
         <Text style={muted}>출금은 이체·카드대금일 수도 있어요. 지출이 맞는지 확인해 주세요.</Text>
       )}
       {item.sentToInput && item.status === 'pending' && (
-        <Text style={muted}>저장했다면 「처리 완료」를 눌러 주세요. 저장 여부는 자동으로 확인하지 않아요.</Text>
+        <Text style={muted}>입력 화면에서 저장하면 자동으로 처리 완료돼요. 그대로 남아 있다면 「처리 완료」를 눌러 주세요.</Text>
       )}
       <View style={{ flexDirection: 'row', gap: 8, marginTop: 4 }}>
         {!!onInput && !!item.prefill && (

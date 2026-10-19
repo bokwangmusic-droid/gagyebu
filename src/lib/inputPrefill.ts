@@ -8,8 +8,14 @@
  *
  * Pure, no I/O. Params are untrusted (any screen / deep link can set them),
  * so every field is re-validated and anything malformed is dropped.
+ *
+ * STEP 4: `sourceCandidateId` names the 후보함 candidate the prefill came
+ * from, so /input can mark it 처리 완료 once the save succeeds
+ * (src/lib/paymentNotification/candidateAutoHandle.ts). Read only together
+ * with a valid prefill, never in edit mode.
  */
 import type { TxnType } from '@/data/categories';
+import { isPaymentCandidateFingerprint } from '@/lib/paymentNotification/candidateAutoHandle';
 
 export interface InputPrefill {
   type: TxnType;
@@ -26,6 +32,7 @@ export type InputPrefillParams = {
   prefillAmount: string;
   prefillMemo?: string;
   prefillDate?: string;
+  sourceCandidateId?: string;
 };
 
 export const INPUT_PREFILL_MAX_AMOUNT = 9_999_999_999; // the keypad's 10-digit cap
@@ -33,12 +40,13 @@ export const INPUT_PREFILL_MAX_MEMO_LENGTH = 100;
 
 const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-export function inputPrefillToParams(prefill: InputPrefill): InputPrefillParams {
+export function inputPrefillToParams(prefill: InputPrefill, sourceCandidateId?: string): InputPrefillParams {
   return {
     prefillType: prefill.type,
     prefillAmount: String(prefill.amount),
     ...(prefill.memo ? { prefillMemo: prefill.memo } : {}),
     ...(prefill.dateKey ? { prefillDate: prefill.dateKey } : {}),
+    ...(sourceCandidateId ? { sourceCandidateId } : {}),
   };
 }
 
@@ -65,6 +73,26 @@ export function parseInputPrefillParams(params: Record<string, unknown>, todayKe
   const dateKey = dateRaw && DATE_KEY_RE.test(dateRaw) && isRealDate(dateRaw) && dateRaw <= todayKey ? dateRaw : null;
 
   return { type, amount, memo, dateKey };
+}
+
+/** `null` = not started from a 후보함 candidate (or a malformed id). */
+export function parseInputSourceCandidateParam(params: Record<string, unknown>): string | null {
+  const id = first(params.sourceCandidateId);
+  return isPaymentCandidateFingerprint(id) ? id : null;
+}
+
+/**
+ * What /input takes from its params. Edit mode (`id` present) takes
+ * nothing; the source candidate only comes with a usable prefill, so a plain
+ * manual entry never carries one.
+ */
+export function parseInputRouteSeed(
+  params: Record<string, unknown>,
+  todayKey: string,
+): { prefill: InputPrefill | null; sourceCandidateId: string | null } {
+  if (first(params.id)) return { prefill: null, sourceCandidateId: null };
+  const prefill = parseInputPrefillParams(params, todayKey);
+  return { prefill, sourceCandidateId: prefill ? parseInputSourceCandidateParam(params) : null };
 }
 
 function isRealDate(key: string): boolean {
