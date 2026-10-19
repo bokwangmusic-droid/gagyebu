@@ -49,6 +49,10 @@ export type PaymentInboxStatus = 'pending' | 'handled';
 export interface PaymentCandidateStateEntry {
   sentAt?: number;
   handledAt?: number;
+  /** STEP 5: the server dedup registration succeeded (serverDedup.ts)… */
+  registeredAt?: number;
+  /** …for this household (another household registers it again). */
+  registeredHouseholdId?: string;
 }
 export type PaymentCandidateState = Record<string, PaymentCandidateStateEntry>;
 
@@ -65,6 +69,8 @@ export interface PaymentInboxItem {
   prefill: InputPrefill | null;
   /** Re-posts folded into this candidate. */
   duplicates: number;
+  /** The (earliest) captured notification itself — in memory only, never stored. */
+  notification: CapturedNotification;
 }
 
 export interface PaymentInbox {
@@ -180,6 +186,7 @@ export function buildPaymentInbox(
         (!!candidate.relationKey || (!!candidate.counterparty && ACCOUNT_SHAPED_RE.test(candidate.counterparty))),
       prefill: toInputPrefill(candidate, todayKey),
       duplicates: k.duplicates,
+      notification: k.n,
     });
   });
   items.sort((a, b) => b.candidate.occurredAt - a.candidate.occurredAt);
@@ -196,6 +203,16 @@ export function markCandidateHandled(
   now: number,
 ): PaymentCandidateState {
   return { ...state, [fingerprint]: { ...state[fingerprint], handledAt: now } };
+}
+
+/** STEP 5: registered with the server dedup (keeps everything else). */
+export function markCandidateRegistered(
+  state: PaymentCandidateState,
+  fingerprint: string,
+  householdId: string,
+  now: number,
+): PaymentCandidateState {
+  return { ...state, [fingerprint]: { ...state[fingerprint], registeredAt: now, registeredHouseholdId: householdId } };
 }
 
 /** Back to 확인 대기 (keeps `sentAt`). */
@@ -219,7 +236,11 @@ export function prunePaymentCandidateState(raw: unknown, now: number): PaymentCa
     const entry: PaymentCandidateStateEntry = {};
     if (valid(v.sentAt)) entry.sentAt = v.sentAt;
     if (valid(v.handledAt)) entry.handledAt = v.handledAt;
-    const touched = Math.max(entry.sentAt ?? 0, entry.handledAt ?? 0);
+    if (valid(v.registeredAt) && typeof v.registeredHouseholdId === 'string' && v.registeredHouseholdId) {
+      entry.registeredAt = v.registeredAt;
+      entry.registeredHouseholdId = v.registeredHouseholdId;
+    }
+    const touched = Math.max(entry.sentAt ?? 0, entry.handledAt ?? 0, entry.registeredAt ?? 0);
     if (touched === 0 || now - touched > CANDIDATE_STATE_MAX_AGE_MS) continue;
     rows.push([key, entry, touched]);
   }

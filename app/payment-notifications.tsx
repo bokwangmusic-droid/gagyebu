@@ -19,9 +19,17 @@
  * fallback, and the stored state is re-read whenever this screen regains
  * focus.
  *
+ * STEP 5 — server dedup: every candidate is registered (best effort, in the
+ * background) with register_payment_notification_event so several phones of
+ * the household keep ONE server event per real money move
+ * (src/lib/paymentNotification/serverDedup.ts). Only a hash and the parsed
+ * amount / last 4 / type / time are sent — never the notification text. A
+ * failed registration changes nothing on this screen and is retried on the
+ * next visit.
+ *
  * What it deliberately does not do yet: create or save a transaction itself,
- * link a card, pick a category, handle a cancellation / refund, merge a
- * transfer pair, or send anything to the server.
+ * link a card, pick a category, handle a cancellation / refund, or merge a
+ * transfer pair.
  * This file is wiring only — the native calls live in
  * src/services/paymentNotificationListener.ts.
  */
@@ -39,6 +47,7 @@ import {
   buildPaymentInbox,
   markCandidateHandled,
   markCandidatePending,
+  markCandidateRegistered,
   markCandidateSent,
   type PaymentCandidateState,
   type PaymentInboxItem,
@@ -46,12 +55,14 @@ import {
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import { parsePaymentNotification } from '@/lib/paymentNotification/registry';
 import { withPaymentRelations } from '@/lib/paymentNotification/relation';
+import { buildPaymentEventRegistrations } from '@/lib/paymentNotification/serverDedup';
 import {
   CAPTURED_MAX_ENTRIES,
   normalizeAllowedPackages,
   type CapturedNotification,
 } from '@/lib/paymentNotificationBuffer';
-import { loadPaymentCandidateState, savePaymentCandidateState } from '@/services/paymentCandidateState';
+import { loadPaymentCandidateState, updatePaymentCandidateState } from '@/services/paymentCandidateState';
+import { registerPaymentEvents } from '@/services/paymentEventRegistration';
 import {
   clearCapturedNotifications,
   getAllowedPackages,
@@ -61,12 +72,15 @@ import {
   openNotificationAccessSettings,
   setAllowedPackages,
 } from '@/services/paymentNotificationListener';
+import { useAuth } from '@/store/auth';
+import { useHousehold } from '@/store/household';
 import { colors, radii, spacing } from '@/theme/tokens';
 import { fontFamily, noPad } from '@/theme/typography';
 
 const DISCLOSURE =
   '돈돈은 사용자가 허용한 금융 앱의 결제 알림을 읽어 가계부 입력을 돕기 위해 사용합니다.\n\n' +
-  '현재 테스트 단계에서는 알림 내용이 서버로 전송되지 않고 이 기기에만 임시 저장됩니다.';
+  '알림 원문은 서버로 전송되지 않고 이 기기에만 임시 저장됩니다. 같은 결제가 여러 기기에서 중복으로 ' +
+  '처리되지 않도록 금액·카드/계좌 끝 4자리·거래 종류·시각과 알림 내용의 해시값만 우리집 가계부 서버에 기록돼요.';
 
 const pad2 = (n: number) => String(n).padStart(2, '0');
 const formatPostedAt = (ms: number): string => {
@@ -78,6 +92,9 @@ export default function PaymentNotifications() {
   const router = useRouter();
   const toast = useToast();
   const supported = isPaymentNotificationSupported();
+  const { session } = useAuth();
+  const { activeHousehold } = useHousehold();
+  const householdId = session?.user?.id ? (activeHousehold?.id ?? null) : null;
 
   const [granted, setGranted] = useState(false);
   const [packages, setPackages] = useState<string[]>([]);
@@ -125,11 +142,39 @@ export default function PaymentNotifications() {
   const updateCandidateState = (change: (state: PaymentCandidateState) => PaymentCandidateState) => {
     if (!candidateStateLoaded) return;
     const next = change(candidateStateRef.current);
-    candidateStateSeqRef.current += 1;
+    const seq = (candidateStateSeqRef.current += 1);
     candidateStateRef.current = next;
     setCandidateState(next);
-    void savePaymentCandidateState(next);
+    // The stored result also carries writes made elsewhere meanwhile.
+    void updatePaymentCandidateState(change, next).then((stored) => {
+      if (seq !== candidateStateSeqRef.current) return;
+      candidateStateRef.current = stored;
+      setCandidateState(stored);
+    });
   };
+
+  // STEP 5: server dedup registration, in the background. One run at a
+  // time; whatever fails stays unregistered and is retried on a later run.
+  const registeringRef = useRef(false);
+  useEffect(() => {
+    if (!candidateStateLoaded || !householdId || registeringRef.current) return;
+    const regs = buildPaymentEventRegistrations(inbox.items, householdId, candidateStateRef.current);
+    if (regs.length === 0) return;
+    registeringRef.current = true;
+    void registerPaymentEvents(householdId, regs)
+      .then((done) => {
+        if (done.length === 0) return;
+        const now = Date.now();
+        updateCandidateState((state) =>
+          done.reduce((acc, fingerprint) => markCandidateRegistered(acc, fingerprint, householdId, now), state),
+        );
+      })
+      .finally(() => {
+        registeringRef.current = false;
+      });
+    // updateCandidateState is a plain closure over refs + the loaded flag.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inbox, householdId, candidateStateLoaded]);
 
   const openInput = (item: PaymentInboxItem) => {
     if (!item.prefill || !candidateStateLoaded) return;

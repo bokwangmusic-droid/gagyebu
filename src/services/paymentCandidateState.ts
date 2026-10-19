@@ -1,7 +1,7 @@
 /**
  * 결제 알림 자동입력 — STEP 3. Device-local persistence of the 후보함
  * state (src/lib/paymentNotification/candidateInbox.ts): fingerprint →
- * { sentAt, handledAt }. Only hashes and timestamps — never notification
+ * { sentAt, handledAt, registeredAt }. Only hashes and timestamps — never notification
  * text. Not part of the backup format, never sent to the server.
  *
  * STEP 4: /input also writes here (auto 처리 완료 after a save), so every
@@ -32,8 +32,22 @@ export function loadPaymentCandidateState(): Promise<PaymentCandidateState> {
   return serial(async () => prunePaymentCandidateState(await loadItem<unknown>(KEY, {}), Date.now()));
 }
 
-export function savePaymentCandidateState(state: PaymentCandidateState): Promise<void> {
-  return serial(() => saveItem(KEY, prunePaymentCandidateState(state, Date.now())));
+/**
+ * Applies `change` to the STORED state (not the caller's copy), so a write
+ * made meanwhile elsewhere — /input's auto 처리 완료 — is never overwritten
+ * by an older snapshot. `fallback` is saved instead when nothing readable is
+ * stored.
+ */
+export function updatePaymentCandidateState(
+  change: (state: PaymentCandidateState) => PaymentCandidateState,
+  fallback: PaymentCandidateState,
+): Promise<PaymentCandidateState> {
+  return serial(async () => {
+    const raw = await loadItem<unknown>(KEY, null);
+    const next = raw == null ? fallback : change(prunePaymentCandidateState(raw, Date.now()));
+    await saveItem(KEY, prunePaymentCandidateState(next, Date.now()));
+    return next;
+  });
 }
 
 // `null` fallback: nothing stored / unreadable → the auto 처리 완료 is skipped.
