@@ -271,7 +271,7 @@ export async function runServerDedupCases(): Promise<{
     'REG 7 already registered in THIS household → not sent again; another household → sent',
     (() => {
       const fp = regsFor([kb(CARD_TITLE, CARD_TEXT)])[0].fingerprint;
-      const state = markCandidateRegistered({}, fp, HOUSE_1, NOW);
+      const state = markCandidateRegistered({}, fp, HOUSE_1, NOW, 'e1e1e1e1-1111-4111-8111-111111111111');
       return (
         regsFor([kb(CARD_TITLE, CARD_TEXT)], HOUSE_1, state).length === 0 &&
         regsFor([kb(CARD_TITLE, CARD_TEXT)], HOUSE_2, state).length === 1

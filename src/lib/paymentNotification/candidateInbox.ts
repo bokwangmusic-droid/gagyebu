@@ -56,6 +56,31 @@ export interface PaymentCandidateStateEntry {
   registeredAt?: number;
   /** …for this household (another household registers it again). */
   registeredHouseholdId?: string;
+  /** …as this server event (register_payment_notification_event's event_id). */
+  registeredEventId?: string;
+  /**
+   * STEP 6 (autoSave.ts): the transaction saved automatically for this
+   * candidate — set once it is known to exist on the server…
+   */
+  autoSaveTxnId?: string;
+  autoSavedAt?: number;
+  /** …and once the server event is linked to it (until then the link is retried). */
+  autoSaveLinkedAt?: number;
+  /** Automatic save gave up on this candidate: it stays for the user, never retried. */
+  autoSaveFailedAt?: number;
+  /**
+   * The transaction the user saved in /input from this candidate
+   * (candidateAutoHandle.ts), in that household — linked to the server event
+   * (autoSave.ts) so another phone's automatic save sees it as handled.
+   */
+  manualTxnId?: string;
+  manualHouseholdId?: string;
+  manualSavedAt?: number;
+  manualLinkedAt?: number;
+  /** The server refused the link (or it never landed in time): not retried. */
+  manualLinkFailedAt?: number;
+  /** The server event is linked to ANOTHER transaction: possibly a duplicate. */
+  linkConflictAt?: number;
 }
 export type PaymentCandidateState = Record<string, PaymentCandidateStateEntry>;
 
@@ -72,6 +97,12 @@ export interface PaymentInboxItem {
   prefill: InputPrefill | null;
   /** Re-posts folded into this candidate. */
   duplicates: number;
+  /** STEP 6: saved by 확실한 카드 결제 자동입력 (not by the user). */
+  autoSaved: boolean;
+  /** STEP 6: automatic save was tried and gave up — the user decides. */
+  autoSaveFailed: boolean;
+  /** STEP 6: another transaction is linked to the same server event — check for a duplicate. */
+  linkConflict: boolean;
 }
 
 export interface PaymentInbox {
@@ -89,6 +120,7 @@ export const CANDIDATE_STATE_MAX_ENTRIES = 300;
 
 const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
 const ACCOUNT_SHAPED_RE = /\(\d{4}\)$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Stable, non-reversible id for one captured notification (see header). */
 export function paymentCandidateFingerprint(n: CapturedNotification): string {
@@ -194,6 +226,9 @@ export function buildPaymentInbox(
         (!!candidate.relationKey || (!!candidate.counterparty && ACCOUNT_SHAPED_RE.test(candidate.counterparty))),
       prefill: toInputPrefill(candidate, todayKey),
       duplicates: k.duplicates,
+      autoSaved: entry?.autoSavedAt != null,
+      autoSaveFailed: entry?.autoSaveFailedAt != null,
+      linkConflict: entry?.linkConflictAt != null,
     });
   });
   items.sort((a, b) => b.candidate.occurredAt - a.candidate.occurredAt);
@@ -218,8 +253,38 @@ export function markCandidateRegistered(
   fingerprint: string,
   householdId: string,
   now: number,
+  eventId?: string,
 ): PaymentCandidateState {
-  return { ...state, [fingerprint]: { ...state[fingerprint], registeredAt: now, registeredHouseholdId: householdId } };
+  const { registeredEventId: _old, ...rest } = state[fingerprint] ?? {};
+  return {
+    ...state,
+    [fingerprint]: {
+      ...rest,
+      registeredAt: now,
+      registeredHouseholdId: householdId,
+      ...(eventId ? { registeredEventId: eventId } : {}),
+    },
+  };
+}
+
+/**
+ * STEP 6: the user saved this candidate in /input as `transactionId` in
+ * `householdId` — the server event link is made later (autoSave.ts). The
+ * first record wins: a second save from the same candidate is not linked.
+ */
+export function markCandidateManualSaved(
+  state: PaymentCandidateState,
+  fingerprint: string,
+  transactionId: string,
+  householdId: string,
+  now: number,
+): PaymentCandidateState {
+  const entry = state[fingerprint] ?? {};
+  if (entry.manualTxnId || entry.autoSaveTxnId) return state;
+  return {
+    ...state,
+    [fingerprint]: { ...entry, manualTxnId: transactionId, manualHouseholdId: householdId, manualSavedAt: now },
+  };
 }
 
 /** Back to 확인 대기 (keeps `sentAt`). */
@@ -246,8 +311,42 @@ export function prunePaymentCandidateState(raw: unknown, now: number): PaymentCa
     if (valid(v.registeredAt) && typeof v.registeredHouseholdId === 'string' && v.registeredHouseholdId) {
       entry.registeredAt = v.registeredAt;
       entry.registeredHouseholdId = v.registeredHouseholdId;
+      if (typeof v.registeredEventId === 'string' && UUID_RE.test(v.registeredEventId)) {
+        entry.registeredEventId = v.registeredEventId;
+      }
     }
-    const touched = Math.max(entry.sentAt ?? 0, entry.handledAt ?? 0, entry.registeredAt ?? 0);
+    if (valid(v.autoSavedAt) && typeof v.autoSaveTxnId === 'string' && v.autoSaveTxnId) {
+      entry.autoSavedAt = v.autoSavedAt;
+      entry.autoSaveTxnId = v.autoSaveTxnId;
+      if (valid(v.autoSaveLinkedAt)) entry.autoSaveLinkedAt = v.autoSaveLinkedAt;
+    }
+    if (valid(v.autoSaveFailedAt)) entry.autoSaveFailedAt = v.autoSaveFailedAt;
+    if (
+      typeof v.manualTxnId === 'string' &&
+      v.manualTxnId &&
+      typeof v.manualHouseholdId === 'string' &&
+      v.manualHouseholdId &&
+      valid(v.manualSavedAt)
+    ) {
+      entry.manualTxnId = v.manualTxnId;
+      entry.manualHouseholdId = v.manualHouseholdId;
+      entry.manualSavedAt = v.manualSavedAt;
+      if (valid(v.manualLinkedAt)) entry.manualLinkedAt = v.manualLinkedAt;
+      if (valid(v.manualLinkFailedAt)) entry.manualLinkFailedAt = v.manualLinkFailedAt;
+    }
+    if (valid(v.linkConflictAt)) entry.linkConflictAt = v.linkConflictAt;
+    const touched = Math.max(
+      entry.sentAt ?? 0,
+      entry.handledAt ?? 0,
+      entry.registeredAt ?? 0,
+      entry.autoSavedAt ?? 0,
+      entry.autoSaveLinkedAt ?? 0,
+      entry.autoSaveFailedAt ?? 0,
+      entry.manualSavedAt ?? 0,
+      entry.manualLinkedAt ?? 0,
+      entry.manualLinkFailedAt ?? 0,
+      entry.linkConflictAt ?? 0,
+    );
     if (touched === 0 || now - touched > CANDIDATE_STATE_MAX_AGE_MS) continue;
     rows.push([key, entry, touched]);
   }

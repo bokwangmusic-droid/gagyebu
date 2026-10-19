@@ -17,14 +17,27 @@
  * Marking handled is best effort and never throws: a failure here leaves the
  * candidate pending (the user can still tap 처리 완료) and never touches the
  * saved transaction. Pure apart from the injected IO.
+ *
+ * STEP 6: with `saved` (link), the transaction id and household are recorded
+ * on the candidate too (markCandidateManualSaved) — the server event is
+ * linked to it later, with retries (autoSave.ts), so another phone's
+ * automatic save of the same event does not add it a second time. Only for
+ * a saved / queued create; a failed one records nothing.
  */
 import {
   markCandidateHandled,
+  markCandidateManualSaved,
   prunePaymentCandidateState,
   type PaymentCandidateState,
 } from '@/lib/paymentNotification/candidateInbox';
 
 export type CreateSaveOutcome = 'saved' | 'queued' | 'failed' | 'queue-failed';
+
+/** The transaction /input created, for the server event link. */
+export interface CreatedTransactionRef {
+  transactionId: string;
+  householdId: string;
+}
 
 export interface CandidateStateIO {
   /** The stored state as-is; `null` = nothing stored / unreadable. */
@@ -53,6 +66,7 @@ export async function markStoredCandidateHandled(
   io: CandidateStateIO,
   fingerprint: string,
   now: number,
+  saved?: CreatedTransactionRef,
 ): Promise<boolean> {
   try {
     if (!isPaymentCandidateFingerprint(fingerprint)) return false;
@@ -61,8 +75,11 @@ export async function markStoredCandidateHandled(
     const state = prunePaymentCandidateState(raw, now);
     const entry = state[fingerprint];
     if (!entry) return false;
-    if (entry.handledAt != null) return true;
-    await io.save(markCandidateHandled(state, fingerprint, now));
+    let next = entry.handledAt != null ? state : markCandidateHandled(state, fingerprint, now);
+    if (saved && saved.transactionId && saved.householdId) {
+      next = markCandidateManualSaved(next, fingerprint, saved.transactionId, saved.householdId, now);
+    }
+    if (next !== state) await io.save(next);
     return true;
   } catch {
     return false;
@@ -75,7 +92,8 @@ export async function settleSourceCandidate(
   sourceCandidateId: string | null,
   outcome: CreateSaveOutcome,
   now: number,
+  saved?: CreatedTransactionRef,
 ): Promise<boolean> {
   if (!sourceCandidateId || !isCreateSaved(outcome)) return false;
-  return markStoredCandidateHandled(io, sourceCandidateId, now);
+  return markStoredCandidateHandled(io, sourceCandidateId, now, saved);
 }

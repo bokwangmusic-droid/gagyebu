@@ -150,7 +150,10 @@ export function buildPaymentEventRegistrations(
   const out: PaymentEventRegistration[] = [];
   for (const item of items) {
     const c = item.candidate;
-    if (state[item.fingerprint]?.registeredHouseholdId === householdId) continue;
+    // Registered before the event id was kept (STEP 6 needs it): asked
+    // again — the same local claim returns the same event.
+    const entry = state[item.fingerprint];
+    if (entry?.registeredHouseholdId === householdId && entry.registeredEventId) continue;
     if (c.amount == null || !Number.isSafeInteger(c.amount) || c.amount <= 0) continue;
     out.push({
       fingerprint: item.fingerprint,

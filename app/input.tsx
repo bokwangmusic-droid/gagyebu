@@ -44,7 +44,12 @@ import {
   SPLIT_ERROR_TEXT,
   type SplitDraft,
 } from '@/lib/splits';
-import { settlePaymentCandidateAfterCreate } from '@/services/paymentCandidateState';
+import { confirmPaymentEventTransaction, isPaymentEventHandled } from '@/services/paymentAutoSave';
+import {
+  resolvePaymentCandidateTransactionId,
+  settlePaymentCandidateAfterCreate,
+} from '@/services/paymentCandidateState';
+import { processPaymentNotifications, registerPaymentCandidateNow } from '@/services/paymentNotificationProcessor';
 import {
   createTransaction,
   softDeleteTransaction,
@@ -667,6 +672,13 @@ function TransactionForm({
   //  - submittingRef / submitting: sync + UI re-entry guard for save
   //    (create & edit).  deletingRef / deleting: same for soft delete.
   const transactionIdRef = useRef(uid('txn'));
+  // 결제 알림 STEP 6: a create started from a REGISTERED 후보함 candidate uses
+  // the server event's derived id (`txn-pn-<event id>`) instead — the same
+  // one the automatic save uses, so the event gets at most one transaction
+  // whichever phone / path saves first. Decided once, at the first save, and
+  // then fixed like the random id (retries and the offline queue reuse it).
+  const paymentEventIdRef = useRef<string | null>(null);
+  const createIdDecidedRef = useRef(false);
   const submittingRef = useRef(false);
   const [submitting, setSubmitting] = useState(false);
   const deletingRef = useRef(false);
@@ -967,8 +979,47 @@ function TransactionForm({
     if (mode.kind === 'create') {
       // 결제 알림 후보함: 처리 완료 for the source candidate, fire-and-forget —
       // it never rejects and never affects the save (saved / queued only).
-      const settleCandidate = (outcome: CreateSaveOutcome) =>
-        void settlePaymentCandidateAfterCreate(sourceCandidateId, outcome);
+      // The saved transaction is recorded on the candidate and the shared
+      // pass links its server event (STEP 6), so another phone's automatic
+      // save of the same payment sees it as handled.
+      const householdId = activeHousehold.id;
+      const userId = session.user.id;
+      if (!createIdDecidedRef.current && sourceCandidateId) {
+        let derived = await resolvePaymentCandidateTransactionId(sourceCandidateId, householdId);
+        // Not registered yet: register it now (bounded wait), so that this
+        // save never gets an ordinary id another phone's automatic save
+        // could race. Offline / failing → the ordinary id, as before.
+        if (!derived && (await registerPaymentCandidateNow({ householdId, userId }, sourceCandidateId))) {
+          derived = await resolvePaymentCandidateTransactionId(sourceCandidateId, householdId);
+        }
+        if (derived) {
+          transactionIdRef.current = derived.transactionId;
+          paymentEventIdRef.current = derived.eventId;
+        }
+      }
+      createIdDecidedRef.current = true;
+      const settleCandidate = (outcome: CreateSaveOutcome) => {
+        if (!sourceCandidateId) return;
+        void settlePaymentCandidateAfterCreate(sourceCandidateId, outcome, {
+          transactionId: transactionIdRef.current,
+          householdId,
+        }).then((recorded) => {
+          if (recorded) void processPaymentNotifications({ householdId, userId });
+        });
+      };
+      // The same payment was already saved for this household (another phone,
+      // an automatic save): nothing is added — the candidate is done.
+      const leaveAlreadyHandled = async () => {
+        settleCandidate('saved');
+        await refresh();
+        toast.show('이미 가계부에 입력된 결제예요');
+        router.back();
+      };
+      const eventId = paymentEventIdRef.current;
+      if (eventId && (await isPaymentEventHandled(householdId, eventId))) {
+        await leaveAlreadyHandled();
+        return;
+      }
 
       const res = await createTransaction({
         id: transactionIdRef.current,
@@ -1019,6 +1070,14 @@ function TransactionForm({
               ? '오프라인에 저장할 수 있는 거래 수를 초과했어요. 인터넷 연결 후 다시 시도해주세요.'
               : '거래를 저장하지 못했어요. 잠시 후 다시 시도해주세요.',
         );
+        return;
+      }
+
+      // With the derived id, a refused insert usually means the event's
+      // transaction was saved first elsewhere (23505 whose row is not this
+      // request): kept as it is, nothing is added here.
+      if (eventId && (await confirmPaymentEventTransaction(householdId, eventId, transactionIdRef.current)) === 'exists') {
+        await leaveAlreadyHandled();
         return;
       }
 

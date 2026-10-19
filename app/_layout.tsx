@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import { PaymentNotificationAutoProcess } from '@/components/PaymentNotificationAutoProcess';
 import { ToastProvider, useToast } from '@/components/ui/Toast';
 import { maybeAutoBackup } from '@/lib/backup';
 import { isAuthCallbackUrl, isResetPasswordUrl, parseOAuthFragment, parseRecoveryFragment } from '@/lib/authValidation';
@@ -692,6 +693,8 @@ function RootNav() {
         onInitialCheckSettled={handleRecoveryLinkChecked}
         onRecoveryRouteMatched={handleRecoveryRouteMatched}
       />
+      {/* 결제 알림 자동입력 STEP 6: start-up / foreground pass. */}
+      <PaymentNotificationAutoProcess />
       {LEGACY_APP_REACHABLE && (
         <>
           <Gate />

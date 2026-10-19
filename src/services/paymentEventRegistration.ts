@@ -74,20 +74,21 @@ export async function registerPaymentEvent(
 
 /**
  * Registers each one in turn; stops at the first transport failure (the
- * rest would fail the same way). Returns the fingerprints that registered.
+ * rest would fail the same way). Returns the ones that registered, with
+ * their server event id.
  */
 export async function registerPaymentEvents(
   householdId: string,
   regs: readonly PaymentEventRegistration[],
-): Promise<string[]> {
+): Promise<{ fingerprint: string; eventId: string }[]> {
   const sha256 = await loadSha256();
   if (!sha256) return [];
   const installId = await loadPaymentInstallId();
   if (!installId) return [];
-  const done: string[] = [];
+  const done: { fingerprint: string; eventId: string }[] = [];
   for (const reg of regs) {
     const res = await registerPaymentEvent(householdId, installId, reg, sha256);
-    if (res.ok) done.push(reg.fingerprint);
+    if (res.ok) done.push({ fingerprint: reg.fingerprint, eventId: res.eventId });
     else if (res.transport) break;
   }
   return done;

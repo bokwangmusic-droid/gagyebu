@@ -25,11 +25,20 @@
  * (src/lib/paymentNotification/serverDedup.ts). Only a hash and the parsed
  * amount / last 4 / type / time are sent — never the notification text. A
  * failed registration changes nothing on this screen and is retried on the
- * next visit.
+ * next pass.
  *
- * What it deliberately does not do yet: create or save a transaction itself,
- * link a card, pick a category, handle a cancellation / refund, or merge a
- * transfer pair.
+ * STEP 6 — "확실한 카드 결제 자동입력" (default OFF, device-local): with it on,
+ * a registered card payment the parser read with full confidence that
+ * arrived after the setting was turned on is saved as 지출 · 기타
+ * (src/lib/paymentNotification/autoSave.ts) and linked to its server event;
+ * a manual save from the 후보함 is linked too. All of it runs in the shared
+ * pass (src/services/paymentNotificationProcessor.ts) — on app start / back
+ * to the foreground, and while this screen is open. Everything else stays
+ * in the 후보함.
+ *
+ * What it deliberately does not do yet: save 입금 / 출금 / 카드 취소, link a
+ * card, pick a category other than 기타, handle a cancellation / refund, or
+ * merge a transfer pair.
  * This file is wiring only — the native calls live in
  * src/services/paymentNotificationListener.ts.
  */
@@ -37,17 +46,17 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, AppState, Pressable, Text, View } from 'react-native';
 
-import { Field, TextField } from '@/components/ui/controls';
+import { Field, TextField, Toggle } from '@/components/ui/controls';
 import { ModalScreen } from '@/components/ui/ModalScreen';
 import { useToast } from '@/components/ui/Toast';
 import { DEFAULT_PAYMENT_NOTIFICATION_PACKAGES } from '@/data/paymentNotificationPackages';
 import { fmt, toDateKey } from '@/lib/format';
 import { inputPrefillToParams } from '@/lib/inputPrefill';
+import { PAYMENT_AUTO_SAVE_BLOCKER_LABEL, paymentAutoSaveBlocker } from '@/lib/paymentNotification/autoSave';
 import {
   buildPaymentInbox,
   markCandidateHandled,
   markCandidatePending,
-  markCandidateRegistered,
   markCandidateSent,
   type PaymentCandidateState,
   type PaymentInboxItem,
@@ -55,14 +64,14 @@ import {
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import { parsePaymentNotification } from '@/lib/paymentNotification/registry';
 import { withPaymentRelations } from '@/lib/paymentNotification/relation';
-import { buildPaymentEventRegistrations } from '@/lib/paymentNotification/serverDedup';
 import {
   CAPTURED_MAX_ENTRIES,
   normalizeAllowedPackages,
   type CapturedNotification,
 } from '@/lib/paymentNotificationBuffer';
+import { loadPaymentAutoSaveSince, savePaymentAutoSaveEnabled } from '@/services/paymentAutoSave';
 import { loadPaymentCandidateState, updatePaymentCandidateState } from '@/services/paymentCandidateState';
-import { registerPaymentEvents } from '@/services/paymentEventRegistration';
+import { processPaymentNotifications } from '@/services/paymentNotificationProcessor';
 import {
   clearCapturedNotifications,
   getAllowedPackages,
@@ -95,7 +104,8 @@ export default function PaymentNotifications() {
   const supported = isPaymentNotificationSupported();
   const { session } = useAuth();
   const { activeHousehold } = useHousehold();
-  const householdId = session?.user?.id ? (activeHousehold?.id ?? null) : null;
+  const userId = session?.user?.id ?? null;
+  const householdId = userId ? (activeHousehold?.id ?? null) : null;
 
   const [granted, setGranted] = useState(false);
   const [packages, setPackages] = useState<string[]>([]);
@@ -111,6 +121,25 @@ export default function PaymentNotifications() {
   // Bumped on every local change, so a focus reload that started before it
   // never replaces it.
   const candidateStateSeqRef = useRef(0);
+  // STEP 6: "확실한 카드 결제 자동입력". null = off (default). Nothing runs
+  // until the stored value is known.
+  const [autoSaveSince, setAutoSaveSince] = useState<number | null>(null);
+  const [autoSaveLoaded, setAutoSaveLoaded] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    void loadPaymentAutoSaveSince().then((since) => {
+      if (!alive) return;
+      setAutoSaveSince(since);
+      setAutoSaveLoaded(true);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const toggleAutoSave = (on: boolean) => {
+    if (!autoSaveLoaded) return;
+    void savePaymentAutoSaveEnabled(on, Date.now()).then(setAutoSaveSince);
+  };
 
   // Aligned with `captured`. Display only — nothing is saved or merged.
   const candidates = useMemo(() => withPaymentRelations(captured.map(parsePaymentNotification)), [captured]);
@@ -154,28 +183,29 @@ export default function PaymentNotifications() {
     });
   };
 
-  // STEP 5: server dedup registration, in the background. One run at a
-  // time; whatever fails stays unregistered and is retried on a later run.
-  const registeringRef = useRef(false);
+  // STEP 5/6: registration, link retries and the automatic save run in the
+  // shared pass (src/services/paymentNotificationProcessor.ts) — the same
+  // single flight the app start / foreground trigger uses, so this screen
+  // and that trigger never save twice. Run when the captured list or the
+  // setting changes; a pass that changed the stored state reloads it here.
+  // The "N원 자동 입력" toast comes from the app-wide trigger's listener.
+  const reloadCandidateState = () => {
+    const seq = candidateStateSeqRef.current;
+    void loadPaymentCandidateState().then((loaded) => {
+      if (seq !== candidateStateSeqRef.current) return;
+      candidateStateRef.current = loaded;
+      setCandidateState(loaded);
+    });
+  };
   useEffect(() => {
-    if (!candidateStateLoaded || !householdId || registeringRef.current) return;
-    const regs = buildPaymentEventRegistrations(inbox.items, householdId, candidateStateRef.current);
-    if (regs.length === 0) return;
-    registeringRef.current = true;
-    void registerPaymentEvents(householdId, regs)
-      .then((done) => {
-        if (done.length === 0) return;
-        const now = Date.now();
-        updateCandidateState((state) =>
-          done.reduce((acc, fingerprint) => markCandidateRegistered(acc, fingerprint, householdId, now), state),
-        );
-      })
-      .finally(() => {
-        registeringRef.current = false;
-      });
-    // updateCandidateState is a plain closure over refs + the loaded flag.
+    if (!candidateStateLoaded || !autoSaveLoaded || !householdId || !userId) return;
+    void processPaymentNotifications({ householdId, userId }).then((res) => {
+      if (res.changed) reloadCandidateState();
+    });
+    // reloadCandidateState is a plain closure over refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inbox, householdId, candidateStateLoaded]);
+  }, [captured, householdId, userId, candidateStateLoaded, autoSaveLoaded, autoSaveSince]);
+  const autoSavedCount = inbox.items.filter((item) => item.autoSaved).length;
 
   const openInput = (item: PaymentInboxItem) => {
     if (!item.prefill || !candidateStateLoaded) return;
@@ -262,8 +292,9 @@ export default function PaymentNotifications() {
           </Text>
           <Text style={bodyStyle}>
             카드·은행 앱의 결제 알림을 읽어 가계부 입력을 돕는 기능을 만들고 있어요. 받은 알림은 아래
-            「자동입력 후보」에 모이고, 거래가 자동으로 저장되지는 않아요. 「가계부에 입력」을 누르면 입력
-            화면이 열리고, 내용을 확인한 뒤 직접 저장해야 가계부에 들어가요.
+            「자동입력 후보」에 모여요. 「가계부에 입력」을 누르면 입력 화면이 열리고, 내용을 확인한 뒤 직접
+            저장해야 가계부에 들어가요. 「확실한 카드 결제 자동입력」을 켠 경우에만 신뢰도 높은 카드 결제가
+            자동으로 저장돼요.
           </Text>
           <Text style={bodyStyle}>{DISCLOSURE}</Text>
         </Panel>
@@ -311,6 +342,28 @@ export default function PaymentNotifications() {
             </Panel>
 
             <Panel>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                <Text style={{ flex: 1, fontFamily: fontFamily.bold, fontSize: 14, color: colors.text, ...noPad }}>
+                  확실한 카드 결제 자동입력
+                </Text>
+                <Toggle value={autoSaveSince != null} onChange={toggleAutoSave} disabled={!autoSaveLoaded} />
+              </View>
+              <Text style={bodyStyle}>
+                신뢰도 높은 카드 결제를 자동으로 지출에 기록해요. 애매한 알림과 입금·출금·취소는 계속 확인이
+                필요해요.
+              </Text>
+              <Text style={{ ...bodyStyle, fontSize: 12, color: colors.textMuted }}>
+                켠 뒤에 받은 카카오뱅크 카드 결제만 「기타」 카테고리, 결제수단 미지정으로 저장돼요. 돈돈 앱을 열거나
+                다시 돌아올 때 처리되고, 인터넷에 연결되지 않으면 다음에 다시 시도해요.
+              </Text>
+              {autoSavedCount > 0 && (
+                <Text style={{ ...bodyStyle, fontSize: 12, color: colors.primaryStrong }}>
+                  최근 자동입력 {autoSavedCount}건 · 아래 「처리한 후보」에서 볼 수 있어요
+                </Text>
+              )}
+            </Panel>
+
+            <Panel>
               <StatusRow label="자동입력 후보" value={`확인 대기 ${pendingItems.length}건`} ok={pendingItems.length > 0} />
               {pendingItems.length === 0 && <Text style={bodyStyle}>확인할 결제 알림이 없어요.</Text>}
               {pendingItems.map((item) => (
@@ -318,6 +371,7 @@ export default function PaymentNotifications() {
                   key={item.fingerprint}
                   item={item}
                   disabled={!candidateStateLoaded}
+                  autoSaveOn={autoSaveSince != null}
                   onInput={() => openInput(item)}
                   onHandled={() =>
                     updateCandidateState((state) => markCandidateHandled(state, item.fingerprint, Date.now()))
@@ -449,12 +503,15 @@ const KIND_LABEL: Record<PaymentInboxItem['kind'], string> = {
 function InboxCard({
   item,
   disabled,
+  autoSaveOn,
   onInput,
   onHandled,
   onPending,
 }: {
   item: PaymentInboxItem;
   disabled: boolean;
+  /** STEP 6: the setting is on — say why a card payment is not saved by itself. */
+  autoSaveOn?: boolean;
   onInput?: () => void;
   onHandled?: () => void;
   onPending?: () => void;
@@ -465,6 +522,8 @@ function InboxCard({
   const notice = { fontFamily: fontFamily.bold, fontSize: 12, color: colors.warningText } as const;
   const isCard = item.kind === 'card_payment' || item.kind === 'card_cancellation';
   const last4 = c.accountLast4 ? `****${c.accountLast4}` : '확인 필요';
+  const blocker =
+    autoSaveOn && item.kind === 'card_payment' && item.status === 'pending' ? paymentAutoSaveBlocker(item, Date.now()) : null;
   return (
     <View
       style={{
@@ -478,7 +537,13 @@ function InboxCard({
     >
       <Text style={muted}>
         {formatPostedAt(c.occurredAt)} · {CONFIDENCE_LABEL[c.confidence]}
-        {item.status === 'handled' ? ' · 처리 완료' : item.sentToInput ? ' · 입력 화면으로 보냄' : ''}
+        {item.autoSaved
+          ? ' · 자동 입력됨'
+          : item.status === 'handled'
+            ? ' · 처리 완료'
+            : item.sentToInput
+              ? ' · 입력 화면으로 보냄'
+              : ''}
       </Text>
       <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>
         {KIND_LABEL[item.kind]} · {fmt(c.amount ?? 0)}원
@@ -498,6 +563,16 @@ function InboxCard({
             계좌: {c.accountName ?? '확인 필요'} {last4}
           </Text>
         </>
+      )}
+      {item.autoSaved && <Text style={muted}>「기타」 카테고리로 자동 저장했어요. 가계부에서 수정할 수 있어요.</Text>}
+      {item.linkConflict && (
+        <Text style={notice}>다른 기기에서 입력된 같은 결제가 있을 수 있어요 · 가계부에서 중복인지 확인해 주세요</Text>
+      )}
+      {item.autoSaveFailed && item.status === 'pending' && (
+        <Text style={notice}>자동입력하지 못했어요 · 직접 확인해 주세요</Text>
+      )}
+      {!!blocker && !item.autoSaveFailed && (
+        <Text style={muted}>자동입력 대상 아님 · {PAYMENT_AUTO_SAVE_BLOCKER_LABEL[blocker]}</Text>
       )}
       {item.kind === 'card_cancellation' && (
         <Text style={notice}>취소/환불 처리 준비 중 · 아직 가계부에 반영할 수 없어요</Text>

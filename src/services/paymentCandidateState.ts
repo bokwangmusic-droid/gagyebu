@@ -11,8 +11,10 @@
 import {
   settleSourceCandidate,
   type CandidateStateIO,
+  type CreatedTransactionRef,
   type CreateSaveOutcome,
 } from '@/lib/paymentNotification/candidateAutoHandle';
+import { paymentCandidateTransactionId } from '@/lib/paymentNotification/autoSave';
 import {
   prunePaymentCandidateState,
   type PaymentCandidateState,
@@ -64,7 +66,23 @@ const io: CandidateStateIO = {
 export function settlePaymentCandidateAfterCreate(
   sourceCandidateId: string | null,
   outcome: CreateSaveOutcome,
+  saved?: CreatedTransactionRef,
 ): Promise<boolean> {
   if (!sourceCandidateId) return Promise.resolve(false);
-  return serial(() => settleSourceCandidate(io, sourceCandidateId, outcome, Date.now())).catch(() => false);
+  return serial(() => settleSourceCandidate(io, sourceCandidateId, outcome, Date.now(), saved)).catch(() => false);
+}
+
+/**
+ * STEP 6: the transaction id /input must use for a new transaction started
+ * from this candidate — `txn-pn-<server event id>` when it is registered in
+ * this household, `null` otherwise (keep the ordinary random id). Never
+ * rejects.
+ */
+export function resolvePaymentCandidateTransactionId(
+  sourceCandidateId: string,
+  householdId: string,
+): Promise<{ transactionId: string; eventId: string } | null> {
+  return loadPaymentCandidateState()
+    .then((state) => paymentCandidateTransactionId(state, sourceCandidateId, householdId))
+    .catch(() => null);
 }
