@@ -44,8 +44,15 @@ import {
   SPLIT_ERROR_TEXT,
   type SplitDraft,
 } from '@/lib/splits';
-import { confirmPaymentEventTransaction, isPaymentEventHandled } from '@/services/paymentAutoSave';
 import {
+  checkExistingPayment,
+  checkRefusedPaymentInsert,
+  EXISTING_PAYMENT_MESSAGE,
+  type ExistingPaymentVerdict,
+} from '@/lib/paymentNotification/existingPayment';
+import { existingPaymentIO } from '@/services/paymentAutoSave';
+import {
+  loadPaymentCandidateManualTransactionId,
   resolvePaymentCandidateTransactionId,
   settlePaymentCandidateAfterCreate,
 } from '@/services/paymentCandidateState';
@@ -679,6 +686,10 @@ function TransactionForm({
   // then fixed like the random id (retries and the offline queue reuse it).
   const paymentEventIdRef = useRef<string | null>(null);
   const createIdDecidedRef = useRef(false);
+  // The candidate's earlier transaction was deleted and the user chose
+  // 다시 입력 (existingPayment.ts): a NEW ordinary id, no event link, and
+  // the "already saved?" check is not asked again — its record link state.
+  const reentryLinkRef = useRef<Extract<ExistingPaymentVerdict, { kind: 'stale' }>['link'] | null>(null);
   const submittingRef = useRef(false);
   const [submitting, setSubmitting] = useState(false);
   const deletingRef = useRef(false);
@@ -998,27 +1009,76 @@ function TransactionForm({
         }
       }
       createIdDecidedRef.current = true;
-      const settleCandidate = (outcome: CreateSaveOutcome) => {
+      const reentryLink = reentryLinkRef.current;
+      const settleCandidate = (outcome: CreateSaveOutcome, saved?: { transactionId: string; link: typeof reentryLink }) => {
         if (!sourceCandidateId) return;
+        const link = saved ? saved.link : reentryLink;
         void settlePaymentCandidateAfterCreate(sourceCandidateId, outcome, {
-          transactionId: transactionIdRef.current,
+          transactionId: saved?.transactionId ?? transactionIdRef.current,
           householdId,
+          ...(link ? { link } : {}),
         }).then((recorded) => {
           if (recorded) void processPaymentNotifications({ householdId, userId });
         });
       };
-      // The same payment was already saved for this household (another phone,
-      // an automatic save): nothing is added — the candidate is done.
-      const leaveAlreadyHandled = async () => {
-        settleCandidate('saved');
+      // The same payment is in this household's ledger, alive (another phone,
+      // an automatic save, an earlier save from this candidate): nothing is
+      // added — the candidate is done, recorded with THAT transaction.
+      const leaveAlreadyHandled = async (existing: { transactionId: string; link: typeof reentryLink }) => {
+        settleCandidate('saved', existing);
         await refresh();
-        toast.show('이미 가계부에 입력된 결제예요');
+        toast.show(EXISTING_PAYMENT_MESSAGE.exists);
         router.back();
       };
+      const stay = (message: string) => {
+        submittingRef.current = false;
+        setSubmitting(false);
+        toast.show(message);
+      };
+      // Saved before, but that transaction is deleted / gone: only the user
+      // may add it again — with a new ordinary id, never the event's.
+      const offerReentry = async (link: NonNullable<typeof reentryLink>) => {
+        submittingRef.current = false;
+        setSubmitting(false);
+        const again = await new Promise<boolean>((resolve) =>
+          Alert.alert(
+            EXISTING_PAYMENT_MESSAGE.staleTitle,
+            EXISTING_PAYMENT_MESSAGE.staleBody,
+            [
+              { text: '취소', style: 'cancel', onPress: () => resolve(false) },
+              { text: '다시 입력', onPress: () => resolve(true) },
+            ],
+            { cancelable: true, onDismiss: () => resolve(false) },
+          ),
+        );
+        if (!again) return;
+        reentryLinkRef.current = link;
+        transactionIdRef.current = uid('txn');
+        paymentEventIdRef.current = null;
+        await save();
+      };
+      // The queue's own op per id (≤1) — incl. a pending DELETE, which the
+      // read model hides from pendingTransactionOps.
+      const io = existingPaymentIO(householdId, (id) => {
+        const op = pending.opByEntity.get(id);
+        return op ? { op, failed: pending.failedTransactionIds.has(id) } : null;
+      });
       const eventId = paymentEventIdRef.current;
-      if (eventId && (await isPaymentEventHandled(householdId, eventId))) {
-        await leaveAlreadyHandled();
-        return;
+      if (sourceCandidateId && !reentryLink) {
+        const manualTxnId = await loadPaymentCandidateManualTransactionId(sourceCandidateId, householdId);
+        const verdict = await checkExistingPayment({ manualTxnId, eventId }, io);
+        if (verdict.kind === 'exists') {
+          await leaveAlreadyHandled(verdict);
+          return;
+        }
+        if (verdict.kind === 'unknown') {
+          stay(EXISTING_PAYMENT_MESSAGE.unknown);
+          return;
+        }
+        if (verdict.kind === 'stale') {
+          await offerReentry(verdict.link);
+          return;
+        }
       }
 
       const res = await createTransaction({
@@ -1075,10 +1135,24 @@ function TransactionForm({
 
       // With the derived id, a refused insert usually means the event's
       // transaction was saved first elsewhere (23505 whose row is not this
-      // request): kept as it is, nothing is added here.
-      if (eventId && (await confirmPaymentEventTransaction(householdId, eventId, transactionIdRef.current)) === 'exists') {
-        await leaveAlreadyHandled();
-        return;
+      // request): kept as it is, nothing is added here — if that row is
+      // alive. A deleted one holding the id is the user's to re-enter.
+      if (eventId) {
+        const refused = await checkRefusedPaymentInsert(eventId, transactionIdRef.current, io);
+        if (refused.kind === 'exists') {
+          await leaveAlreadyHandled(refused);
+          return;
+        }
+        if (refused.kind === 'unknown') {
+          settleCandidate('failed');
+          stay(EXISTING_PAYMENT_MESSAGE.unknown);
+          return;
+        }
+        if (refused.kind === 'stale') {
+          settleCandidate('failed');
+          await offerReentry(refused.link);
+          return;
+        }
       }
 
       // A non-transport terminal failure (identity / 23505 mismatch / …) —

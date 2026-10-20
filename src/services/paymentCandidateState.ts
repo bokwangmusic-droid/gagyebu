@@ -86,3 +86,19 @@ export function resolvePaymentCandidateTransactionId(
     .then((state) => paymentCandidateTransactionId(state, sourceCandidateId, householdId))
     .catch(() => null);
 }
+
+/**
+ * The transaction the user saved from this candidate in this household
+ * (manualTxnId), `null` = none recorded. Never rejects.
+ */
+export function loadPaymentCandidateManualTransactionId(
+  sourceCandidateId: string,
+  householdId: string,
+): Promise<string | null> {
+  return loadPaymentCandidateState()
+    .then((state) => {
+      const entry = state[sourceCandidateId];
+      return entry?.manualTxnId && entry.manualHouseholdId === householdId ? entry.manualTxnId : null;
+    })
+    .catch(() => null);
+}

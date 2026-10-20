@@ -317,6 +317,40 @@ export function markCandidateManualSaved(
   };
 }
 
+/** The server event link of a recorded manual save (markCandidateSavedAs). */
+export type ManualLinkState = 'linked' | 'pending' | 'never';
+
+/**
+ * /input: this candidate's payment is in the ledger as `transactionId` —
+ * found there alive, or saved again after the earlier one was deleted.
+ * Unlike markCandidateManualSaved this REPLACES an earlier record (that one
+ * is gone) and sets 처리 완료. `link`: 'linked' = the server event already
+ * points at it; 'pending' = link it later (autoSave.ts); 'never' = the event
+ * still points at the deleted transaction and is left as it is — no link is
+ * ever tried (manualLinkFailedAt).
+ */
+export function markCandidateSavedAs(
+  state: PaymentCandidateState,
+  fingerprint: string,
+  transactionId: string,
+  householdId: string,
+  now: number,
+  link: ManualLinkState,
+): PaymentCandidateState {
+  const { manualLinkedAt: _l, manualLinkFailedAt: _f, ...entry } = state[fingerprint] ?? {};
+  return {
+    ...state,
+    [fingerprint]: {
+      ...entry,
+      handledAt: entry.handledAt ?? now,
+      manualTxnId: transactionId,
+      manualHouseholdId: householdId,
+      manualSavedAt: now,
+      ...(link === 'linked' ? { manualLinkedAt: now } : link === 'never' ? { manualLinkFailedAt: now } : {}),
+    },
+  };
+}
+
 /**
  * 카드 결제 취소: the user had `transactionId` (its original payment) deleted
  * — 처리 완료 with the transaction recorded. The first record wins: a

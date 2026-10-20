@@ -27,7 +27,9 @@
 import {
   markCandidateHandled,
   markCandidateManualSaved,
+  markCandidateSavedAs,
   prunePaymentCandidateState,
+  type ManualLinkState,
   type PaymentCandidateState,
 } from '@/lib/paymentNotification/candidateInbox';
 
@@ -37,6 +39,12 @@ export type CreateSaveOutcome = 'saved' | 'queued' | 'failed' | 'queue-failed';
 export interface CreatedTransactionRef {
   transactionId: string;
   householdId: string;
+  /**
+   * Set when /input checked the earlier record (existingPayment.ts): the
+   * record is REPLACED with this transaction (markCandidateSavedAs). Unset =
+   * the first record wins (markCandidateManualSaved).
+   */
+  link?: ManualLinkState;
 }
 
 export interface CandidateStateIO {
@@ -77,7 +85,9 @@ export async function markStoredCandidateHandled(
     if (!entry) return false;
     let next = entry.handledAt != null ? state : markCandidateHandled(state, fingerprint, now);
     if (saved && saved.transactionId && saved.householdId) {
-      next = markCandidateManualSaved(next, fingerprint, saved.transactionId, saved.householdId, now);
+      next = saved.link
+        ? markCandidateSavedAs(next, fingerprint, saved.transactionId, saved.householdId, now, saved.link)
+        : markCandidateManualSaved(next, fingerprint, saved.transactionId, saved.householdId, now);
     }
     if (next !== state) await io.save(next);
     return true;

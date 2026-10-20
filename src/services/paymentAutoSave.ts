@@ -16,6 +16,12 @@ import type {
   PaymentEventLinkResult,
   PaymentLinkSource,
 } from '@/lib/paymentNotification/autoSave';
+import {
+  queuedTransactionLiveness,
+  type ExistingPaymentIO,
+  type PaymentTransactionLiveness,
+  type QueuedTransactionOp,
+} from '@/lib/paymentNotification/existingPayment';
 import { loadItem, saveItem } from '@/lib/storage';
 import { supabase } from '@/lib/supabase';
 import { isTransportError } from '@/lib/transportError';
@@ -114,13 +120,48 @@ export function paymentAutoSaveIO(args: { householdId: string; userId: string })
 }
 
 /**
- * /input, before saving a candidate with its derived id: `true` only when
- * the server says the event is already handled (by another phone or save).
- * Anything else — pending, offline, an error — `false`: the save goes on.
+ * Is this transaction alive in this household? Members may read the
+ * household's rows, soft-deleted ones included (transactions_select), so a
+ * deleted row reads as `deleted`; a row of another household / a reset one
+ * as `missing`. Any read failure is `unknown`. Never throws.
  */
-export async function isPaymentEventHandled(householdId: string, eventId: string): Promise<boolean> {
-  const res = await getLink(householdId, eventId);
-  return res.ok && res.status === 'handled';
+export async function paymentTransactionLiveness(
+  householdId: string,
+  transactionId: string,
+): Promise<PaymentTransactionLiveness> {
+  try {
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('id,deleted_at')
+      .eq('household_id', householdId)
+      .eq('id', transactionId)
+      .maybeSingle();
+    if (error) return 'unknown';
+    if (!data) return 'missing';
+    return (data as { deleted_at: string | null }).deleted_at == null ? 'live' : 'deleted';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * /input's "already in the ledger?" check (existingPayment.ts).
+ * `queuedOp`: this device's offline-queue op for the id — a queued create
+ * is alive and a pending delete is deleted before the server is asked
+ * (queuedTransactionLiveness).
+ */
+export function existingPaymentIO(
+  householdId: string,
+  queuedOp: (transactionId: string) => QueuedTransactionOp | null,
+): ExistingPaymentIO {
+  return {
+    getLink: (eventId) => getLink(householdId, eventId),
+    liveness: (transactionId) => {
+      const queued = queuedTransactionLiveness(queuedOp(transactionId));
+      return queued ? Promise.resolve(queued) : paymentTransactionLiveness(householdId, transactionId);
+    },
+    confirm: (eventId, transactionId) => confirmPaymentEventTransaction(householdId, eventId, transactionId),
+  };
 }
 
 /**
