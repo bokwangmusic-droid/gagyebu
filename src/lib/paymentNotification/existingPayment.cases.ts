@@ -21,7 +21,12 @@ import {
   type PaymentAutoSaveIO,
   type PaymentEventCompleteStatus,
 } from '@/lib/paymentNotification/autoSave';
-import { settleSourceCandidate, type CandidateStateIO } from '@/lib/paymentNotification/candidateAutoHandle';
+import {
+  createdSaveOutcome,
+  settleSourceCandidate,
+  type CandidateStateIO,
+  type CreateSaveOutcome,
+} from '@/lib/paymentNotification/candidateAutoHandle';
 import {
   markCandidatePending,
   markCandidateSavedAs,
@@ -37,6 +42,8 @@ import {
   type PaymentTransactionLiveness,
   type QueuedTransactionOp,
 } from '@/lib/paymentNotification/existingPayment';
+import { buildTransactionInsert, type TransactionInsertRow } from '@/lib/remoteFinanceWriteMapping';
+import { isReconcilableCreate } from '@/services/remoteFinanceWrite';
 
 export interface CaseResult {
   name: string;
@@ -54,7 +61,14 @@ const FP = 'pc1_abc123';
 interface FakeTxn {
   householdId: string;
   deleted: boolean;
+  /** The stored row (created_by USER) when a case needs createTransaction's 23505 reconcile; unset = never the same request. */
+  row?: TransactionInsertRow;
 }
+
+const USER = 'user-1';
+/** The draft every inputSave sends (the same request each time). */
+const DRAFT = { type: 'expense', category: 'food', amount: 5100, memo: '청계상회', date: '2026-11-09T03:04:05.000Z' } as const;
+const draftRow = (id: string) => buildTransactionInsert(DRAFT, { id, householdId: HH, knownCardIds: new Set() });
 
 /** The server: one event, the transactions table, call counters. */
 function fakeServer(init: {
@@ -114,11 +128,19 @@ function fakeServer(init: {
     },
     complete: async (_e, id) => ({ ok: true, status: complete(id) }),
   };
-  /** createTransaction: the PK refuses any id already taken — deleted rows too. */
-  const create = (id: string): 'ok' | 'refused' => {
+  /**
+   * createTransaction: the PK refuses any id already taken — deleted rows
+   * too; the 23505 then reconciles only by the real isReconcilableCreate
+   * (same request, same creator, alive).
+   */
+  const create = (id: string, row: TransactionInsertRow = draftRow(id)): 'ok' | 'reconciled' | 'refused' => {
     calls.creates.push(id);
-    if (txns[id]) return 'refused';
-    txns[id] = { householdId: HH, deleted: false };
+    const t = txns[id];
+    if (t) {
+      const stored = t.row && { ...t.row, created_by: USER, deleted_at: t.deleted ? '2026-11-09T05:00:00.000Z' : null };
+      return stored && t.householdId === HH && isReconcilableCreate(stored, row, USER) ? 'reconciled' : 'refused';
+    }
+    txns[id] = { householdId: HH, deleted: false, row };
     return 'ok';
   };
   return { event, txns, calls, io, autoIO, create };
@@ -160,8 +182,8 @@ async function inputSave(srv: FakeServer, store: Store, answer: { reenter: boole
   let eventId = derived?.eventId ?? null;
   let link: 'linked' | 'pending' | 'never' | null = null;
   let prompted = false;
-  const settle = (id: string, l: typeof link) =>
-    settleSourceCandidate(store.io, FP, 'saved', NOW, { transactionId: id, householdId: HH, ...(l ? { link: l } : {}) });
+  const settle = (id: string, l: typeof link, outcome: CreateSaveOutcome = 'saved') =>
+    settleSourceCandidate(store.io, FP, outcome, NOW, { transactionId: id, householdId: HH, ...(l ? { link: l } : {}) });
 
   const entry = state[FP];
   const manualTxnId = entry?.manualTxnId && entry.manualHouseholdId === HH ? entry.manualTxnId : null;
@@ -180,8 +202,12 @@ async function inputSave(srv: FakeServer, store: Store, answer: { reenter: boole
   }
 
   for (;;) {
-    if (srv.create(transactionId) === 'ok') {
-      await settle(transactionId, link);
+    const created = srv.create(transactionId);
+    if (created !== 'refused') {
+      // res.ok: a reconciled create is read back before the candidate is marked.
+      const liveness = created === 'reconciled' ? await srv.io.liveness(transactionId) : null;
+      if (liveness === 'deleted' || liveness === 'missing') return { result: 'failed', prompted };
+      await settle(transactionId, link, createdSaveOutcome(created === 'reconciled', liveness));
       return { result: 'saved', transactionId, prompted };
     }
     if (!eventId) return { result: 'failed', prompted };
@@ -454,6 +480,71 @@ export async function runExistingPaymentCases(): Promise<{
       r.result === 'exists' && r.transactionId === DERIVED && srv.calls.confirm === 1 &&
         srv.event!.linked === DERIVED && e.manualTxnId === DERIVED && e.manualLinkedAt != null,
       JSON.stringify({ r, e }),
+    );
+  }
+
+  // RETRY — the derived id's row is soft-deleted AND field-for-field this
+  // very request (the worst case: its 23505 used to reconcile as saved).
+  // The event is still pending (never linked), so the check before the
+  // insert says `new` and the derived id is tried.
+  {
+    const srv = fakeServer({
+      event: { status: 'pending', linked: null },
+      txns: { [DERIVED]: { householdId: HH, deleted: true, row: draftRow(DERIVED) } },
+    });
+    const store = memoryStore(registered());
+    const first = await inputSave(srv, store, NO);
+    const e1 = store.read()[FP];
+    check(
+      'RETRY-1 pending event + soft-deleted txn-pn row of the same request → not reconciled as saved; asked; candidate pending, nothing recorded, row stays deleted, event not linked',
+      first.result === 'cancelled' && first.prompted &&
+        JSON.stringify(srv.calls.creates) === JSON.stringify([DERIVED]) &&
+        e1.handledAt == null && e1.manualTxnId == null &&
+        srv.txns[DERIVED].deleted && srv.event!.status === 'pending' && srv.calls.complete === 0,
+      JSON.stringify({ first, calls: srv.calls, e1, event: srv.event }),
+    );
+
+    const second = await inputSave(srv, store, YES);
+    const links = await runLinks(srv, store);
+    const e2 = store.read()[FP];
+    check(
+      'RETRY-2 saved again → derived id refused again (never reconciled), 다시 입력 → NEW ordinary id created live; only then handled with it; no link, derived row still deleted',
+      second.result === 'saved' && second.transactionId === 'txn-new-1' && !second.transactionId.startsWith('txn-pn-') &&
+        JSON.stringify(srv.calls.creates) === JSON.stringify([DERIVED, DERIVED, 'txn-new-1']) &&
+        srv.txns['txn-new-1']?.deleted === false &&
+        e2.handledAt != null && e2.manualTxnId === 'txn-new-1' && e2.manualLinkFailedAt != null &&
+        links.jobs === 0 && srv.calls.complete === 0 && srv.event!.status === 'pending' && srv.txns[DERIVED].deleted,
+      JSON.stringify({ second, calls: srv.calls, e2, event: srv.event }),
+    );
+
+    // Opened once more (확인 대기로 되돌리기): the re-entered row is found, no third create.
+    store.write(markCandidatePending(store.read(), FP));
+    const third = await inputSave(srv, store, YES);
+    check(
+      'RETRY-2b after the re-entry, a further save → already (its own live row), no new create',
+      third.result === 'exists' && third.transactionId === 'txn-new-1' && srv.calls.creates.length === 3,
+      JSON.stringify({ third, calls: srv.calls }),
+    );
+  }
+
+  // RETRY-0 — the dedup that stays: the derived row is ALIVE and this very
+  // request (an earlier attempt landed, its reply lost) → reconciled, read
+  // back live, handled with the derived id; nobody is asked, nothing re-entered.
+  {
+    const srv = fakeServer({
+      event: { status: 'pending', linked: null },
+      txns: { [DERIVED]: { householdId: HH, deleted: false, row: draftRow(DERIVED) } },
+    });
+    const store = memoryStore(registered());
+    const r = await inputSave(srv, store, NO);
+    const links = await runLinks(srv, store);
+    const e = store.read()[FP];
+    check(
+      'RETRY-0 lost response: derived row alive + same request → reconciled, read back live, handled with txn-pn id, linked later',
+      r.result === 'saved' && r.transactionId === DERIVED && !r.prompted &&
+        JSON.stringify(srv.calls.creates) === JSON.stringify([DERIVED]) &&
+        e.handledAt != null && e.manualTxnId === DERIVED && links.jobs === 1 && srv.event!.linked === DERIVED,
+      JSON.stringify({ r, calls: srv.calls, e, links }),
     );
   }
   {

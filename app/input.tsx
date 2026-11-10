@@ -34,7 +34,7 @@ import { uid } from '@/lib/id';
 import { parseInputRouteSeed, type InputPrefill } from '@/lib/inputPrefill';
 import { parseNaturalInput, type NaturalParseResult } from '@/lib/naturalInput';
 import { parseCardMessage, type ParsedCardMessage } from '@/lib/parseCardMessage';
-import type { CreateSaveOutcome } from '@/lib/paymentNotification/candidateAutoHandle';
+import { createdSaveOutcome, type CreateSaveOutcome } from '@/lib/paymentNotification/candidateAutoHandle';
 import type { RemoteTransactionMeta } from '@/lib/remoteFinanceMapping';
 import { type NewTransactionDraft } from '@/lib/remoteFinanceWriteMapping';
 import {
@@ -1092,7 +1092,17 @@ function TransactionForm({
       });
 
       if (res.ok) {
-        settleCandidate('saved');
+        // A reconciled create inserted nothing this time: the candidate is
+        // marked only once that row reads back alive here. Deleted / missing
+        // = nothing is in the ledger — the form stays. Unreadable = the
+        // create's own read just found it alive; it is left, unmarked.
+        const liveness =
+          sourceCandidateId && res.reconciled ? await io.liveness(transactionIdRef.current) : null;
+        if (liveness === 'deleted' || liveness === 'missing') {
+          stay('거래를 저장하지 못했어요. 잠시 후 다시 시도해주세요.');
+          return;
+        }
+        settleCandidate(createdSaveOutcome(res.reconciled === true, liveness));
         // Authoritative remote refresh, then leave — no optimistic local
         // write, no stale-closure re-check (STEP 16-G2-A2 §13/§19).
         await refresh();

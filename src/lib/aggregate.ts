@@ -84,14 +84,16 @@ function dateMs(date: string): number {
 /**
  * Creation time recovered from a client-minted id: `<prefix>-<ms>-<rand>`
  * (src/lib/id.ts and src/store/store.tsx's private `uid`). An id that doesn't
- * carry a numeric middle segment yields 0 — the `id` string comparison in
- * `recentTransactions` is still there as the final, always-deterministic
- * tie-break.
+ * carry a numeric middle segment — 결제 알림's derived 'txn-pn-<event id>' —
+ * falls back to the transaction's own `date` (its real time; the read model
+ * has no created_at), never 0, so it is not pushed behind every same-date
+ * row. The `id` string comparison in `recentTransactions` is still there as
+ * the final, always-deterministic tie-break.
  */
-function createdMsFromId(id: string): number {
-  const seg = id.split('-')[1];
+function createdMs(t: Transaction): number {
+  const seg = t.id.split('-')[1];
   const n = seg ? Number(seg) : NaN;
-  return Number.isFinite(n) ? n : 0;
+  return Number.isFinite(n) ? n : dateMs(t.date);
 }
 
 /**
@@ -109,7 +111,8 @@ function createdMsFromId(id: string): number {
  *
  * Order:
  *   1. `date` descending — the same key app/all-transactions.tsx sorts by.
- *   2. tie-break: creation time descending, from the id's `<ms>` segment.
+ *   2. tie-break: creation time descending, from the id's `<ms>` segment
+ *      (no such segment: the row's `date`, see createdMs).
  *   3. final tie-break: `id` descending — fully deterministic even for two
  *      rows created in the same millisecond.
  *
@@ -125,7 +128,7 @@ export function recentTransactions(
     .sort((a, b) => {
       const byDate = dateMs(b.date) - dateMs(a.date);
       if (byDate !== 0) return byDate;
-      const byCreated = createdMsFromId(b.id) - createdMsFromId(a.id);
+      const byCreated = createdMs(b) - createdMs(a);
       if (byCreated !== 0) return byCreated;
       return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
     })

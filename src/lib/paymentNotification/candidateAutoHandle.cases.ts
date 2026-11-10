@@ -11,6 +11,7 @@
 import { toDateKey } from '@/lib/format';
 import { inputPrefillToParams, parseInputRouteSeed } from '@/lib/inputPrefill';
 import {
+  createdSaveOutcome,
   isCreateSaved,
   markStoredCandidateHandled,
   settleSourceCandidate,
@@ -23,6 +24,7 @@ import {
   type PaymentCandidateState,
   type PaymentInboxItem,
 } from '@/lib/paymentNotification/candidateInbox';
+import type { PaymentTransactionLiveness } from '@/lib/paymentNotification/existingPayment';
 import { KAKAOBANK_PACKAGE } from '@/lib/paymentNotification/kakaoBankParser';
 import type { CapturedNotification } from '@/lib/paymentNotificationBuffer';
 
@@ -320,6 +322,53 @@ export async function runCandidateAutoHandleCases(): Promise<{
       'MANUAL 5 malformed / unknown source ids → no candidate handled or recorded, A and B unchanged',
       outs.every((o) => !o) && store.saves() === 0 && JSON.stringify(store.read()) === before,
       JSON.stringify(outs),
+    );
+  }
+
+  // ── createTransaction ok: fresh insert vs reconciled (input.tsx) ──────
+  // /input reads a reconciled row back (paymentTransactionLiveness) and
+  // reports createdSaveOutcome(reconciled, liveness).
+  const afterCreate = async (reconciled: boolean, liveness: PaymentTransactionLiveness | null) => {
+    const { store, seed } = openFromInbox(card);
+    const outcome = createdSaveOutcome(reconciled, liveness);
+    const marked = await settleSourceCandidate(store.io, seed.sourceCandidateId, outcome, NOW, SAVED);
+    const entry = store.read()[card.fingerprint];
+    return { outcome, marked, status: statusOf(store.read(), card.fingerprint), manualTxnId: entry?.manualTxnId ?? null };
+  };
+  {
+    const r = await afterCreate(false, null);
+    check(
+      'RECON-0 fresh insert (not reconciled) → handled without a read back',
+      r.outcome === 'saved' && r.marked && r.status === 'handled' && r.manualTxnId === SAVED.transactionId,
+      JSON.stringify(r),
+    );
+  }
+  {
+    const r = await afterCreate(true, 'live');
+    check(
+      'RECON-3 reconciled + row read back live → handled, transaction recorded',
+      r.outcome === 'saved' && r.marked && r.status === 'handled' && r.manualTxnId === SAVED.transactionId,
+      JSON.stringify(r),
+    );
+  }
+  {
+    const deleted = await afterCreate(true, 'deleted');
+    const missing = await afterCreate(true, 'missing');
+    const unread = await afterCreate(true, null);
+    check(
+      'RECON-4 reconciled but row deleted / missing (or never read) → pending, nothing recorded',
+      [deleted, missing, unread].every(
+        (r) => r.outcome === 'failed' && !r.marked && r.status === 'pending' && r.manualTxnId === null,
+      ),
+      JSON.stringify({ deleted, missing, unread }),
+    );
+  }
+  {
+    const r = await afterCreate(true, 'unknown');
+    check(
+      'RECON-5 reconciled, liveness unknown → pending, nothing recorded',
+      r.outcome === 'failed' && !r.marked && r.status === 'pending' && r.manualTxnId === null,
+      JSON.stringify(r),
     );
   }
 

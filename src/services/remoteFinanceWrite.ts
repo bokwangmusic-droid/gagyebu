@@ -27,8 +27,9 @@
  * client-generated id that is stable across retries. If the INSERT comes
  * back as a unique violation (23505), this module re-reads that id within
  * the same household and only reports success when the stored row is
- * field-for-field the same request AND was created_by this same user. A
- * 23505 whose row differs, whose created_by differs, or one we can't read
+ * field-for-field the same request AND was created_by this same user AND
+ * is still alive (deleted_at null). A 23505 whose row differs, whose
+ * created_by differs, that was soft-deleted since, or one we can't read
  * back at all, is reported as a failure — never a blind success.
  */
 import type { PostgrestError } from '@supabase/supabase-js';
@@ -47,8 +48,8 @@ import type { TransactionSplit } from '@/store/types';
 export type CreateTransactionResult =
   /**
    * `reconciled: true` = no row was inserted by THIS call: a 23505 whose
-   * stored row is this exact request (an earlier attempt landed). Additive
-   * and optional; callers that only branch on `ok` are unaffected.
+   * stored row is this exact request (an earlier attempt landed) and alive.
+   * Additive and optional; callers that only branch on `ok` are unaffected.
    */
   | { ok: true; id: string; reconciled?: true }
   /**
@@ -196,6 +197,20 @@ function isSameRequest(
   );
 }
 
+/**
+ * A 23505's stored row counts as this create's own earlier, landed attempt
+ * only when it is the same request AND alive: a soft-deleted row still holds
+ * its id (the primary key) but is not in the ledger, so "saved" would be
+ * wrong — the caller gets a terminal failure instead.
+ */
+export function isReconcilableCreate(
+  existing: Record<string, unknown>,
+  row: TransactionInsertRow,
+  expectedUserId: string,
+): boolean {
+  return existing.deleted_at == null && isSameRequest(existing, row, expectedUserId);
+}
+
 export async function createTransaction(args: {
   /** Client-generated `txn-...` id, fixed for the form's lifetime (src/lib/id.ts). */
   id: string;
@@ -239,7 +254,7 @@ export async function createTransaction(args: {
     const { data: existing, error: readErr } = await supabase
       .from('transactions')
       .select(
-        'id,household_id,created_by,type,category,amount,memo,date,member_id,payment_method,card_id,source_asset_id,destination_asset_id,installment_months,splits',
+        'id,household_id,created_by,type,category,amount,memo,date,member_id,payment_method,card_id,source_asset_id,destination_asset_id,installment_months,splits,deleted_at',
       )
       .eq('household_id', args.householdId)
       .eq('id', args.id)
@@ -257,7 +272,7 @@ export async function createTransaction(args: {
       return { ok: false, message: GENERIC_ERROR };
     }
 
-    if (isSameRequest(existing as Record<string, unknown>, row, args.expectedUserId)) {
+    if (isReconcilableCreate(existing as Record<string, unknown>, row, args.expectedUserId)) {
       return { ok: true, id: args.id, reconciled: true };
     }
     return { ok: false, message: GENERIC_ERROR };

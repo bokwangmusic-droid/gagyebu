@@ -32,6 +32,7 @@ import {
   type ManualLinkState,
   type PaymentCandidateState,
 } from '@/lib/paymentNotification/candidateInbox';
+import type { PaymentTransactionLiveness } from '@/lib/paymentNotification/existingPayment';
 
 export type CreateSaveOutcome = 'saved' | 'queued' | 'failed' | 'queue-failed';
 
@@ -57,6 +58,21 @@ const FINGERPRINT_RE = /^pc1_[0-9a-z]{1,16}$/;
 
 export function isPaymentCandidateFingerprint(v: unknown): v is string {
   return typeof v === 'string' && FINGERPRINT_RE.test(v);
+}
+
+/**
+ * createTransaction came back ok: what that create counts as for the
+ * candidate. A fresh insert (`reconciled` false) is saved. A reconciled one
+ * inserted nothing this time — it is saved only once its row was read back
+ * alive in this household (`liveness`, paymentTransactionLiveness); deleted,
+ * missing or unreadable leaves the candidate pending ('failed').
+ */
+export function createdSaveOutcome(
+  reconciled: boolean,
+  liveness: PaymentTransactionLiveness | null,
+): CreateSaveOutcome {
+  if (!reconciled) return 'saved';
+  return liveness === 'live' ? 'saved' : 'failed';
 }
 
 /** Whether this create outcome counts as "the transaction was saved". */

@@ -182,6 +182,59 @@ export async function runAggregateCases(): Promise<{
     );
   }
 
+  // SORT — 결제 알림's derived id 'txn-pn-<event id>' has no `<ms>` segment;
+  // its creation time falls back to its own `date`, never 0.
+  const PN_1 = 'txn-pn-00000000-0000-4000-8000-000000000001';
+  const PN_2 = 'txn-pn-ffffffff-0000-4000-8000-000000000002';
+  const ms = (iso: string) => new Date(iso).getTime();
+
+  // SORT-1 — ordinary uids: newest date first, same-date by `<ms>` (unchanged).
+  {
+    const rows: Transaction[] = [
+      tx(`txn-${ms('2026-11-09T09:00:00.000Z')}-a`, '2026-11-09T09:00:00.000Z'),
+      tx(`txn-${ms('2026-11-10T08:00:00.000Z')}-b`, '2026-11-10T08:00:00.000Z'),
+      tx(`txn-${ms('2026-11-10T12:00:00.000Z')}-c`, '2026-11-10T00:00:00.000Z'),
+      tx(`txn-${ms('2026-11-10T11:00:00.000Z')}-d`, '2026-11-10T00:00:00.000Z'),
+    ];
+    const out = recentTransactions(shuffle(rows, 5), 5).map((t) => t.id.slice(-1));
+    check('SORT-1 ordinary uids keep date desc, then id <ms> desc', out.join('') === 'bcda', `got ${out.join('')}`);
+  }
+
+  // SORT-2 — a txn-pn row created at the same instant as its date is not
+  // pushed behind an OLDER ordinary row of the same date (old: 0 → last).
+  {
+    const date = '2026-11-10T00:00:00.000Z';
+    const rows: Transaction[] = [
+      tx(`txn-${ms(date) - 60_000}-old`, date), // minted a minute before
+      tx(PN_1, date),
+    ];
+    const out = recentTransactions(rows, 5).map((t) => t.id);
+    check('SORT-2 txn-pn is not sorted as created at 0', out[0] === PN_1, `got ${JSON.stringify(out)}`);
+  }
+
+  // SORT-3 — same day, ordinary and txn-pn rows (server rows and offline
+  // CREATE synthetic rows alike: both are `{ id, date }` here) interleave by
+  // their real time; two txn-pn rows of one instant stay deterministic.
+  {
+    const rows: Transaction[] = [
+      tx(PN_1, '2026-11-10T03:00:00.000Z'), // e.g. a queued create's synthetic row
+      tx(`txn-${ms('2026-11-10T05:00:00.000Z')}-o`, '2026-11-10T05:00:00.000Z'),
+      tx(PN_2, '2026-11-10T07:00:00.000Z'),
+      tx(`txn-${ms('2026-11-10T01:00:00.000Z')}-p`, '2026-11-10T01:00:00.000Z'),
+    ];
+    const out = recentTransactions(shuffle(rows, 11), 5).map((t) => t.id);
+    const want = [PN_2, rows[1].id, PN_1, rows[3].id];
+    const tie = recentTransactions(
+      [tx(PN_1, '2026-11-10T03:00:00.000Z'), tx(PN_2, '2026-11-10T03:00:00.000Z')],
+      5,
+    ).map((t) => t.id);
+    check(
+      'SORT-3 same-day ordinary + txn-pn rows by real time; txn-pn tie → id desc',
+      JSON.stringify(out) === JSON.stringify(want) && JSON.stringify(tie) === JSON.stringify([PN_2, PN_1]),
+      `got ${JSON.stringify(out)} tie=${JSON.stringify(tie)}`,
+    );
+  }
+
   const failed = results.filter((r) => !r.pass).length;
   return { results, passed: results.length - failed, failed };
 }

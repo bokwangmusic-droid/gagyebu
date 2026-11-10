@@ -15,7 +15,8 @@
  */
 import type { PostgrestError } from '@supabase/supabase-js';
 
-import { classifyReconcileReadError } from '@/services/remoteFinanceWrite';
+import { buildTransactionInsert } from '@/lib/remoteFinanceWriteMapping';
+import { classifyReconcileReadError, isReconcilableCreate } from '@/services/remoteFinanceWrite';
 
 export interface CaseResult {
   name: string;
@@ -105,6 +106,33 @@ export async function runRemoteWriteReconcileCases(): Promise<{
       'CASE 7b non-network readErr -> generic friendly copy',
       !!c && c.message === '거래를 저장하지 못했어요. 잠시 후 다시 시도해주세요.',
       JSON.stringify(c),
+    );
+  }
+
+  // RECON — createTransaction's 23505 verdict on the stored row
+  // (isReconcilableCreate): the same request counts only while alive.
+  {
+    const USER = 'user-1';
+    const row = buildTransactionInsert(
+      { type: 'expense', category: 'food', amount: 5100, memo: '청계상회', date: '2026-11-09T03:04:05.000Z' },
+      { id: 'txn-pn-00000000-0000-4000-8000-000000000001', householdId: 'house-1', knownCardIds: new Set() },
+    );
+    const stored = { ...row, created_by: USER, deleted_at: null } as Record<string, unknown>;
+    check(
+      'RECON-1 same id, same payload, live row → reconciled (lost response / duplicate replay)',
+      isReconcilableCreate(stored, row, USER),
+      JSON.stringify(stored),
+    );
+    check(
+      'RECON-2 same id, same payload, soft-deleted row → NOT reconciled',
+      !isReconcilableCreate({ ...stored, deleted_at: '2026-11-09T04:00:00.000Z' }, row, USER),
+      'deleted_at set',
+    );
+    check(
+      'RECON-2b live row but another payload / creator → NOT reconciled (unchanged)',
+      !isReconcilableCreate({ ...stored, amount: 5200 }, row, USER) &&
+        !isReconcilableCreate({ ...stored, created_by: 'user-2' }, row, USER),
+      'amount 5200 / created_by user-2',
     );
   }
 
