@@ -72,6 +72,11 @@ import {
   type PaymentCandidateState,
   type PaymentInboxItem,
 } from '@/lib/paymentNotification/candidateInbox';
+import {
+  diagnosePaymentCandidate,
+  type CandidateDiagnostic,
+  type QueuedTransactionDiagnostic,
+} from '@/lib/paymentNotification/candidateDiagnostics';
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import {
   REFUND_BLOCKER_MESSAGE,
@@ -87,7 +92,11 @@ import {
   normalizeAllowedPackages,
   type CapturedNotification,
 } from '@/lib/paymentNotificationBuffer';
-import { loadPaymentAutoSaveSince, savePaymentAutoSaveEnabled } from '@/services/paymentAutoSave';
+import {
+  loadPaymentAutoSaveSince,
+  paymentTransactionLiveness,
+  savePaymentAutoSaveEnabled,
+} from '@/services/paymentAutoSave';
 import { loadPaymentCandidateState, updatePaymentCandidateState } from '@/services/paymentCandidateState';
 import { processPaymentNotifications } from '@/services/paymentNotificationProcessor';
 import { paymentRefundIO } from '@/services/paymentRefund';
@@ -562,6 +571,9 @@ export default function PaymentNotifications() {
                   void reload();
                 }}
               />
+              {listOpen && !!householdId && (
+                <CandidateDiagnosticsList items={inbox.items} state={candidateState} householdId={householdId} />
+              )}
               {listOpen && captured.length === 0 && <Text style={bodyStyle}>아직 캡처된 알림이 없어요.</Text>}
               {listOpen &&
                 captured.map((item, index) => (
@@ -615,6 +627,103 @@ function Panel({ children }: { children: React.ReactNode }) {
       }}
     >
       {children}
+    </View>
+  );
+}
+
+/**
+ * QA diagnostics (read-only): each 후보's stored state and, for a recorded
+ * manual save, the liveness /input's existing-payment check would get and
+ * whether this device's offline queue or the server decided it
+ * (candidateDiagnostics.ts). Nothing here writes.
+ */
+function CandidateDiagnosticsList({
+  items,
+  state,
+  householdId,
+}: {
+  items: readonly PaymentInboxItem[];
+  state: PaymentCandidateState;
+  householdId: string;
+}) {
+  const pending = usePendingWrites();
+  const [rows, setRows] = useState<CandidateDiagnostic[] | null>(null);
+  const [reads, setReads] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    // The queue read /input's check uses (existingPaymentIO): op kind per id
+    // + the terminal-failed set; the record itself only adds its details.
+    const queued = (id: string): QueuedTransactionDiagnostic | null => {
+      const op = pending.opByEntity.get(id);
+      if (!op) return null;
+      const rec = pending.pendingTransactionOps.find((o) => o.entityId === id);
+      return {
+        op,
+        failed: pending.failedTransactionIds.has(id),
+        attemptCount: rec?.attemptCount ?? null,
+        enqueuedAt: rec?.enqueuedAt ?? null,
+        lastAttemptAt: rec?.lastAttemptAt ?? null,
+        lastError: rec?.lastError ?? null,
+        lastErrorReason: rec?.lastErrorReason ?? null,
+      };
+    };
+    const io = { queued, serverLiveness: (id: string) => paymentTransactionLiveness(householdId, id) };
+    void Promise.all(items.map((i) => diagnosePaymentCandidate(i.fingerprint, state[i.fingerprint], householdId, io))).then(
+      (out) => {
+        if (alive) setRows(out);
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, [items, state, householdId, pending.opByEntity, pending.pendingTransactionOps, pending.failedTransactionIds, reads]);
+
+  const at = (ms: number | null) => (ms == null ? '-' : `${formatPostedAt(ms)} (${ms})`);
+  const mono = { fontFamily: fontFamily.regular, fontSize: 11, lineHeight: 16, color: colors.textSub } as const;
+  return (
+    <View style={{ padding: 12, borderRadius: radii.md, borderWidth: 1, borderColor: colors.border, gap: 6 }}>
+      <Text style={{ fontFamily: fontFamily.bold, fontSize: 13, color: colors.text }}>후보 상태 진단 (읽기 전용 · QA)</Text>
+      <Text style={mono}>
+        household {householdId} · queue {pending.hydration} · 대기 op {pending.pendingTransactionOps.length}건 · 실패{' '}
+        {pending.failedTransactionIds.size}건
+      </Text>
+      <ActionButton label="진단 다시 읽기" onPress={() => setReads((n) => n + 1)} />
+      {rows == null && <Text style={mono}>읽는 중…</Text>}
+      {rows?.length === 0 && <Text style={mono}>후보 없음</Text>}
+      {rows?.map((d) => {
+        const item = items.find((i) => i.fingerprint === d.fingerprint);
+        const q = d.manual?.queued ?? null;
+        return (
+          <View key={d.fingerprint} style={{ paddingTop: 6, borderTopWidth: 1, borderTopColor: colors.border, gap: 2 }}>
+            <Text style={{ ...mono, fontFamily: fontFamily.bold, color: colors.text }}>
+              {item ? `${KIND_LABEL[item.kind]} ${fmt(item.candidate.amount ?? 0)}원 · ${item.candidate.merchantCandidate ?? item.candidate.counterparty ?? '-'} · ${item.status}` : '-'}
+            </Text>
+            <Text style={mono} selectable>
+              {[
+                `fingerprint ${d.fingerprint}`,
+                `registeredEventId ${d.registeredEventId ?? '-'}`,
+                `registeredHouseholdId ${d.registeredHouseholdId ?? '-'}`,
+                `manualTxnId ${d.manualTxnId ?? '-'}`,
+                `manualHouseholdId ${d.manualHouseholdId ?? '-'}`,
+                `manualSavedAt ${at(d.manualSavedAt)}`,
+                `manualLinkedAt ${at(d.manualLinkedAt)}`,
+                `manualLinkFailedAt ${at(d.manualLinkFailedAt)}`,
+                `handledAt ${at(d.handledAt)}`,
+                `sentAt ${at(d.sentAt)}`,
+                `autoSaveTxnId ${d.autoSaveTxnId ?? '-'}`,
+                ...(d.manual
+                  ? [
+                      `→ liveness ${d.manual.liveness} · source ${d.manual.source}${d.manual.sameHousehold ? '' : ' · 다른 household (입력 화면은 사용 안 함)'}`,
+                      q
+                        ? `→ queue op ${q.op} · ${q.failed ? 'failed (전송 실패, 보관됨)' : 'pending (전송 대기)'} · attempts ${q.attemptCount ?? '-'} · enqueued ${q.enqueuedAt ?? '-'} · lastAttempt ${q.lastAttemptAt ?? '-'} · reason ${q.lastErrorReason ?? '-'} · lastError ${q.lastError ?? '-'}`
+                        : '→ queue op 없음',
+                    ]
+                  : []),
+              ].join('\n')}
+            </Text>
+          </View>
+        );
+      })}
     </View>
   );
 }
