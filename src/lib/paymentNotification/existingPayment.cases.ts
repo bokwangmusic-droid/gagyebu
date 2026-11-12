@@ -14,6 +14,7 @@ import {
   autoSavePaymentCandidate,
   paymentAutoSaveTransactionId,
   paymentCandidateTransactionId,
+  PAYMENT_MANUAL_LINK_MAX_AGE_MS,
   PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED,
   runPaymentAutoSaveJobs,
   selectPaymentLinkJobs,
@@ -28,6 +29,7 @@ import {
   type CreateSaveOutcome,
 } from '@/lib/paymentNotification/candidateAutoHandle';
 import {
+  clearOrphanedManualSave,
   markCandidatePending,
   markCandidateSavedAs,
   prunePaymentCandidateState,
@@ -37,6 +39,7 @@ import {
 import {
   checkExistingPayment,
   checkRefusedPaymentInsert,
+  findOrphanedManualSaves,
   queuedTransactionLiveness,
   type ExistingPaymentIO,
   type PaymentTransactionLiveness,
@@ -110,6 +113,7 @@ function fakeServer(init: {
     return { ok: true, status: event.status, transactionId: event.linked };
   };
   const io: ExistingPaymentIO = {
+    queued: (id) => queued[id] ?? null,
     getLink,
     liveness,
     confirm: async (_e, id) => {
@@ -172,6 +176,7 @@ const registered = (extra: Record<string, unknown> = {}): PaymentCandidateState 
 
 type SaveResult =
   | { result: 'exists' | 'saved'; transactionId: string; prompted: boolean }
+  | { result: 'queued' | 'queued-failed'; transactionId: string; prompted: boolean }
   | { result: 'unknown' | 'cancelled' | 'failed'; prompted: boolean };
 
 /** /input save(), create branch, from candidate FP (app/input.tsx). */
@@ -192,8 +197,14 @@ async function inputSave(srv: FakeServer, store: Store, answer: { reenter: boole
     await settle(verdict.transactionId, verdict.link);
     return { result: 'exists', transactionId: verdict.transactionId, prompted };
   }
+  if (verdict.kind === 'queued') {
+    if (verdict.failed) return { result: 'queued-failed', transactionId: verdict.transactionId, prompted };
+    await settle(verdict.transactionId, null, 'queued');
+    return { result: 'queued', transactionId: verdict.transactionId, prompted };
+  }
   if (verdict.kind === 'unknown') return { result: 'unknown', prompted };
   if (verdict.kind === 'stale') {
+    if (verdict.orphaned) store.write(clearOrphanedManualSave(store.read(), FP, verdict.orphaned, HH));
     prompted = true;
     if (!answer.reenter) return { result: 'cancelled', prompted };
     link = verdict.link;
@@ -436,8 +447,8 @@ export async function runExistingPaymentCases(): Promise<{
     const store = memoryStore(registered({ manualTxnId: DERIVED, manualHouseholdId: HH, manualSavedAt: NOW - 5000 }));
     const r = await inputSave(srv, store, YES);
     check(
-      'CASE 9c own record still waiting in the offline queue as a create → alive: already, no second create',
-      r.result === 'exists' && r.transactionId === DERIVED && srv.calls.creates.length === 0,
+      'CASE 9c own record still waiting in the offline queue as a create → queued (not "already"), no second create',
+      r.result === 'queued' && r.transactionId === DERIVED && srv.calls.creates.length === 0,
       JSON.stringify(r),
     );
   }
@@ -620,8 +631,11 @@ export async function runExistingPaymentCases(): Promise<{
       const r = await inputSave(srv, store, YES);
       const links = await runLinks(srv, store);
       check(
-        `QUEUE C only a ${failed ? 'held (terminal-failed)' : 'pending'} CREATE → alive as before: already, no second create, link left pending (not refused)`,
-        r.result === 'exists' && r.transactionId === DERIVED && !r.prompted && srv.calls.creates.length === 0 &&
+        `QUEUE C only a ${failed ? 'held (terminal-failed)' : 'pending'} CREATE → ${failed ? 'queued-failed: left 확인 대기' : 'queued: 처리 완료 as at enqueue'}, never "already", no second create, link left pending (not refused)`,
+        r.result === (failed ? 'queued-failed' : 'queued') && r.transactionId === DERIVED && !r.prompted &&
+          srv.calls.creates.length === 0 &&
+          (failed ? store.read()[FP].handledAt == null : store.read()[FP].handledAt != null) &&
+          store.read()[FP].manualTxnId === DERIVED &&
           store.read()[FP].manualLinkFailedAt == null && links.out.every((o) => o.kind === 'link' && o.result === 'pending'),
         JSON.stringify({ r, links }),
       );
@@ -687,6 +701,204 @@ export async function runExistingPaymentCases(): Promise<{
       'QUEUE F refused insert, derived row alive but DELETE pending here → not linked, not "already": asked',
       r.result === 'cancelled' && r.prompted && srv.calls.confirm === 0 && srv.event!.status === 'pending',
       JSON.stringify({ r, calls: srv.calls }),
+    );
+  }
+
+  // BUG — "이미 저장됨" only for a transaction really in this household's
+  // ledger; a 처리 완료 whose manual save is not there at all goes back to
+  // 확인 대기 (findOrphanedManualSaves / clearOrphanedManualSave).
+  const manual = (txn: string, extra: Record<string, unknown> = {}): PaymentCandidateState => ({
+    // As on the device where registration never landed: no server event.
+    [FP]: { sentAt: NOW - 9000, handledAt: NOW - 8000, manualTxnId: txn, manualHouseholdId: HH, manualSavedAt: NOW - 8000, ...extra },
+  });
+  /** The 후보함 focus check over a fake server (+ this device's queue). */
+  const orphansOf = (srv: FakeServer, state: PaymentCandidateState, queued: Record<string, QueuedTransactionOp> = {}) =>
+    findOrphanedManualSaves(state, HH, {
+      queued: (id) => queued[id] ?? null,
+      serverLiveness: async (id) => {
+        const t = srv.txns[id];
+        if (!t || t.householdId !== HH) return 'missing';
+        return t.deleted ? 'deleted' : 'live';
+      },
+    });
+  {
+    const srv = fakeServer({ event: null });
+    const store = memoryStore(manual('txn-gone'));
+    const asked = await inputSave(srv, store, NO);
+    const afterAsk = store.read()[FP];
+    const r = await inputSave(srv, store, YES);
+    const e = store.read()[FP];
+    check(
+      'BUG-1 manualTxnId + handledAt but no transaction → not "already": back to 확인 대기 (record dropped), asked; 다시 입력 → one new create, handled with it',
+      asked.result === 'cancelled' && asked.prompted &&
+        afterAsk.handledAt == null && afterAsk.manualTxnId == null && afterAsk.manualSavedAt == null && afterAsk.sentAt === NOW - 9000 &&
+        r.result === 'saved' && r.transactionId === 'txn-ordinary' && !r.prompted &&
+        JSON.stringify(srv.calls.creates) === '["txn-ordinary"]' &&
+        e.handledAt != null && e.manualTxnId === 'txn-ordinary',
+      JSON.stringify({ asked, afterAsk, r, e }),
+    );
+  }
+  {
+    const srv = fakeServer({ event: null, txns: { 'txn-live': { householdId: HH, deleted: false } } });
+    const store = memoryStore(manual('txn-live'));
+    const r = await inputSave(srv, store, YES);
+    const orphans = await orphansOf(srv, store.read());
+    check(
+      'BUG-2 manualTxnId alive in this household → "already" as before, create 0, candidate kept; not an orphan',
+      r.result === 'exists' && r.transactionId === 'txn-live' && !r.prompted && srv.calls.creates.length === 0 &&
+        store.read()[FP].handledAt != null && orphans.length === 0,
+      JSON.stringify({ r, orphans }),
+    );
+  }
+  {
+    const srv = fakeServer({ event: null, txns: { 'txn-del': { householdId: HH, deleted: true } } });
+    const store = memoryStore(manual('txn-del'));
+    const before = JSON.stringify(store.read());
+    const asked = await inputSave(srv, store, NO);
+    const orphans = await orphansOf(srv, store.read());
+    check(
+      'BUG-3 manualTxnId soft-deleted → not "already": asked (re-entry as before); 취소 keeps the record; not cleared as an orphan',
+      asked.result === 'cancelled' && asked.prompted && srv.calls.creates.length === 0 &&
+        JSON.stringify(store.read()) === before && orphans.length === 0,
+      JSON.stringify({ asked, orphans }),
+    );
+  }
+  {
+    // The same id alive only in ANOTHER household.
+    const srv = fakeServer({ event: null, txns: { 'txn-x': { householdId: OTHER_HH, deleted: false } } });
+    const store = memoryStore(manual('txn-x'));
+    const r = await inputSave(srv, store, NO);
+    // A record made in the other household is not this household's to judge.
+    const otherRecord = manual('txn-x', { manualHouseholdId: OTHER_HH });
+    const srv2 = fakeServer({ event: null, txns: { 'txn-x': { householdId: OTHER_HH, deleted: false } } });
+    const store2 = memoryStore(otherRecord);
+    const r2 = await inputSave(srv2, store2, NO);
+    const orphans2 = await orphansOf(srv2, otherRecord);
+    check(
+      "BUG-4 another household's transaction with the same id → never \"already\" here (missing in this household); a record from the other household is neither used nor cleared",
+      r.result === 'cancelled' && r.prompted && srv.calls.creates.length === 0 &&
+        r2.result === 'saved' && r2.transactionId === 'txn-ordinary' && orphans2.length === 0,
+      JSON.stringify({ r, r2, orphans2 }),
+    );
+  }
+  {
+    const srv = fakeServer({ event: null });
+    const state: PaymentCandidateState = {
+      ...manual('txn-gone', { registeredAt: NOW - 9000, registeredHouseholdId: HH, linkConflictAt: NOW - 7000 }),
+      pc1_refund: { handledAt: NOW - 8000, manualTxnId: 'txn-r', manualHouseholdId: HH, manualSavedAt: NOW - 8000, refundTxnId: 'txn-orig', refundedAt: NOW - 8000 },
+      pc1_auto: { handledAt: NOW - 8000, manualTxnId: 'txn-a', manualHouseholdId: HH, manualSavedAt: NOW - 8000, autoSaveTxnId: 'txn-a2', autoSavedAt: NOW - 8000 },
+      pc1_queued: { handledAt: NOW - 8000, manualTxnId: 'txn-q', manualHouseholdId: HH, manualSavedAt: NOW - 8000 },
+      pc1_pending: { sentAt: NOW - 8000, manualTxnId: 'txn-p', manualHouseholdId: HH, manualSavedAt: NOW - 8000 },
+      pc1_promo: { sentAt: NOW - 8000 },
+    };
+    const orphans = await orphansOf(srv, state, { 'txn-q': { op: 'create', failed: false } });
+    let next = state;
+    for (const o of orphans) next = clearOrphanedManualSave(next, o.fingerprint, o.transactionId, HH);
+    const store = memoryStore(next);
+    const r = await inputSave(srv, store, NO);
+    const e = next[FP];
+    check(
+      'BUG-5 stale manual state recovered → only that candidate: 확인 대기, record dropped (registration / 보냄 / conflict kept); refund / auto / queued / pending / others untouched; /input then saves it as new, nobody asked',
+      JSON.stringify(orphans) === JSON.stringify([{ fingerprint: FP, transactionId: 'txn-gone' }]) &&
+        e.handledAt == null && e.manualTxnId == null && e.manualHouseholdId == null && e.manualSavedAt == null &&
+        e.registeredHouseholdId === HH && e.sentAt === NOW - 9000 && e.linkConflictAt === NOW - 7000 &&
+        ['pc1_refund', 'pc1_auto', 'pc1_queued', 'pc1_pending', 'pc1_promo'].every((k) => next[k] === state[k]) &&
+        clearOrphanedManualSave(state, FP, 'txn-other', HH) === state &&
+        r.result === 'saved' && !r.prompted && r.transactionId === 'txn-ordinary',
+      JSON.stringify({ orphans, e, r }),
+    );
+  }
+  for (const failed of [false, true]) {
+    const srv = fakeServer({ event: null, queued: { 'txn-q': { op: 'create', failed } } });
+    const store = memoryStore(manual('txn-q'));
+    store.write(markCandidatePending(store.read(), FP));
+    const r = await inputSave(srv, store, YES);
+    const orphans = await orphansOf(srv, manual('txn-q'), { 'txn-q': { op: 'create', failed } });
+    check(
+      `BUG-6 offline ${failed ? 'held (terminal-failed)' : 'pending'} create, nothing on the server → ${failed ? 'queued-failed (not handled)' : 'queued (handled as at enqueue — offline policy kept)'}; never "already", no second create, not an orphan`,
+      r.result === (failed ? 'queued-failed' : 'queued') && !r.prompted && srv.calls.creates.length === 0 &&
+        srv.calls.liveness === 0 &&
+        (failed ? store.read()[FP].handledAt == null : store.read()[FP].handledAt != null) &&
+        store.read()[FP].manualTxnId === 'txn-q' && orphans.length === 0,
+      JSON.stringify({ r, orphans }),
+    );
+  }
+  {
+    // Registered event, manual record, the transaction never landed: the
+    // link keeps answering transaction_missing until it gives up.
+    const savedAt = NOW - PAYMENT_MANUAL_LINK_MAX_AGE_MS - 1;
+    const srv = fakeServer({ event: { status: 'pending', linked: null } });
+    const store = memoryStore(registered({ handledAt: savedAt, manualTxnId: 'txn-never', manualHouseholdId: HH, manualSavedAt: savedAt }));
+    const links = await runLinks(srv, store);
+    const linkFailed = store.read()[FP];
+    const orphans = await orphansOf(srv, store.read());
+    let next = store.read();
+    for (const o of orphans) next = clearOrphanedManualSave(next, o.fingerprint, o.transactionId, HH);
+    store.write(next);
+    const r = await inputSave(srv, store, NO);
+    const relinked = await runLinks(srv, store);
+    check(
+      'BUG-7 event registered, link refused as transaction_missing → candidate not kept handled: orphan cleared → 확인 대기; /input then creates txn-pn-<event>, linked by the next pass',
+      links.out.length === 1 && links.out[0].kind === 'link' && links.out[0].result === 'refused' &&
+        linkFailed.manualLinkFailedAt != null && linkFailed.handledAt != null &&
+        orphans.length === 1 && next[FP].handledAt == null && next[FP].manualTxnId == null && next[FP].manualLinkFailedAt == null &&
+        next[FP].registeredEventId === EVENT &&
+        r.result === 'saved' && r.transactionId === DERIVED && !r.prompted &&
+        relinked.jobs === 1 && srv.event!.status === 'handled' && srv.event!.linked === DERIVED,
+      JSON.stringify({ links: links.out, linkFailed, orphans, next: next[FP], r, relinked: relinked.out }),
+    );
+  }
+
+  {
+    // As on the device (23,000원 / 4,800원, no public.transactions row at
+    // all): saved offline → enqueued → 처리 완료 with the queued id; the
+    // create never landed and its op left the queue.
+    const FP2 = 'pc1_def456';
+    const enqueued = async () => {
+      const store = memoryStore({ ...registered(), [FP2]: { sentAt: NOW - 1000 } });
+      await settleSourceCandidate(store.io, FP, 'queued', NOW - 5000, { transactionId: DERIVED, householdId: HH });
+      await settleSourceCandidate(store.io, FP2, 'queued', NOW - 5000, { transactionId: 'txn-q2', householdId: HH });
+      return store;
+    };
+    const focus = async (store: Store, srvLive: (id: string) => Promise<PaymentTransactionLiveness>, queued: Record<string, QueuedTransactionOp> = {}) => {
+      const orphans = await findOrphanedManualSaves(store.read(), HH, { queued: (id) => queued[id] ?? null, serverLiveness: srvLive });
+      let next = store.read();
+      for (const o of orphans) next = clearOrphanedManualSave(next, o.fingerprint, o.transactionId, HH);
+      store.write(next);
+      return orphans;
+    };
+    const gone = async () => 'missing' as const;
+
+    // Server read fails (offline / no session → unknown): nothing cleared, /input refuses blind.
+    const sU = await enqueued();
+    const beforeU = JSON.stringify(sU.read());
+    const oU = await focus(sU, async () => 'unknown');
+    const rU = await inputSave(fakeServer({ event: { status: 'pending', linked: null }, fail: { liveness: true } }), sU, YES);
+
+    // The create still held after a terminal failure: kept, /input says so.
+    const sF = await enqueued();
+    const held = { [DERIVED]: { op: 'create', failed: true }, 'txn-q2': { op: 'create', failed: true } } as const;
+    const oF = await focus(sF, gone, held);
+    sF.write(markCandidatePending(sF.read(), FP));
+    const rF = await inputSave(fakeServer({ event: { status: 'pending', linked: null }, queued: held }), sF, YES);
+
+    // Op gone, no row: both back to 확인 대기 on the 후보함 focus; /input then saves each once.
+    const sA = await enqueued();
+    const handledBefore = [FP, FP2].every((k) => sA.read()[k].handledAt != null);
+    const oA = await focus(sA, gone);
+    const after = sA.read();
+    const srvA = fakeServer({ event: { status: 'pending', linked: null } });
+    const rA = await inputSave(srvA, sA, NO);
+    check(
+      'BUG-8 device case (2 candidates, enqueued, op gone, no row) → focus clears both to 확인 대기 (registration / 보냄 kept); /input saves once with txn-pn-<event>, not "already"; unreadable server → nothing cleared, unknown; held create → kept, queued-failed',
+      handledBefore &&
+        oA.length === 2 &&
+        [FP, FP2].every((k) => after[k].handledAt == null && after[k].manualTxnId == null && after[k].sentAt === NOW - 1000) &&
+        after[FP].registeredEventId === EVENT &&
+        rA.result === 'saved' && rA.transactionId === DERIVED && !rA.prompted && JSON.stringify(srvA.calls.creates) === JSON.stringify([DERIVED]) &&
+        oU.length === 0 && JSON.stringify(sU.read()) === beforeU && rU.result === 'unknown' &&
+        oF.length === 0 && sF.read()[FP2].handledAt != null && rF.result === 'queued-failed',
+      JSON.stringify({ oA, after, rA, oU, rU, oF, rF }),
     );
   }
 

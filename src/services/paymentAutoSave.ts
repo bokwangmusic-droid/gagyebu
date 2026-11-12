@@ -124,12 +124,16 @@ export function paymentAutoSaveIO(args: { householdId: string; userId: string })
  * household's rows, soft-deleted ones included (transactions_select), so a
  * deleted row reads as `deleted`; a row of another household / a reset one
  * as `missing`. Any read failure is `unknown`. Never throws.
+ * Without a signed-in session the read runs as anon and RLS answers an
+ * empty result, not an error — that is `unknown`, never `missing`.
  */
 export async function paymentTransactionLiveness(
   householdId: string,
   transactionId: string,
 ): Promise<PaymentTransactionLiveness> {
   try {
+    const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+    if (sessionError || !sessionData.session?.user?.id) return 'unknown';
     const { data, error } = await supabase
       .from('transactions')
       .select('id,deleted_at')
@@ -155,6 +159,7 @@ export function existingPaymentIO(
   queuedOp: (transactionId: string) => QueuedTransactionOp | null,
 ): ExistingPaymentIO {
   return {
+    queued: queuedOp,
     getLink: (eventId) => getLink(householdId, eventId),
     liveness: (transactionId) => {
       const queued = queuedTransactionLiveness(queuedOp(transactionId));

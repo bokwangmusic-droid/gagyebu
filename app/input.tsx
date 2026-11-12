@@ -52,6 +52,7 @@ import {
 } from '@/lib/paymentNotification/existingPayment';
 import { existingPaymentIO } from '@/services/paymentAutoSave';
 import {
+  clearOrphanedPaymentCandidate,
   loadPaymentCandidateManualTransactionId,
   resolvePaymentCandidateTransactionId,
   settlePaymentCandidateAfterCreate,
@@ -1071,11 +1072,30 @@ function TransactionForm({
           await leaveAlreadyHandled(verdict);
           return;
         }
+        // Its own record is still only in this device's offline queue: not
+        // created again, and not reported as saved. A pending create keeps
+        // the offline policy (처리 완료 as at enqueue); a held one stays the
+        // user's to resend or discard.
+        if (verdict.kind === 'queued') {
+          if (verdict.failed) {
+            stay(EXISTING_PAYMENT_MESSAGE.queuedFailed);
+            return;
+          }
+          settleCandidate('queued', { transactionId: verdict.transactionId, link: null });
+          submittingRef.current = false;
+          setSubmitting(false);
+          toast.show(EXISTING_PAYMENT_MESSAGE.queued);
+          router.back();
+          return;
+        }
         if (verdict.kind === 'unknown') {
           stay(EXISTING_PAYMENT_MESSAGE.unknown);
           return;
         }
         if (verdict.kind === 'stale') {
+          // Its own record is not in this household at all: that 처리 완료
+          // was wrong — back to 확인 대기 whether or not it is entered again.
+          if (verdict.orphaned) await clearOrphanedPaymentCandidate(sourceCandidateId, verdict.orphaned, householdId);
           await offerReentry(verdict.link);
           return;
         }

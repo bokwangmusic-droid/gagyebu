@@ -59,6 +59,10 @@ function world(queue: Record<string, QueuedTransactionDiagnostic>, server: Recor
   const diag: CandidateDiagnosticIO = { queued: (id) => queue[id] ?? null, serverLiveness };
   // /input's existingPaymentIO over the same answers (no event: getLink unused).
   const input: ExistingPaymentIO = {
+    queued: (id) => {
+      const q = queue[id];
+      return q ? { op: q.op, failed: q.failed } : null;
+    },
     getLink: async () => ({ ok: false, transport: false }),
     liveness: async (id) => {
       const q = queue[id];
@@ -109,10 +113,10 @@ export async function runCandidateDiagnosticsCases(): Promise<{
     const d = await diagnosePaymentCandidate(FP, saved(), HH, w.diag);
     const verdict = await checkExistingPayment({ manualTxnId: TXN, eventId: null }, w.input);
     check(
-      'DIAG-3 manualTxnId + queue pending create → live · source queue · pending, attempts shown, server not read; /input says exists',
+      'DIAG-3 manualTxnId + queue pending create → live · source queue · pending, attempts shown, server not read; /input says queued (not "already")',
       d.manual?.liveness === 'live' && d.manual.source === 'queue' && d.manual.queued?.op === 'create' &&
         d.manual.queued.failed === false && d.manual.queued.attemptCount === 3 && w.calls.server === 0 &&
-        verdict.kind === 'exists',
+        verdict.kind === 'queued' && !verdict.failed,
       JSON.stringify({ d, verdict }),
     );
   }
@@ -123,10 +127,10 @@ export async function runCandidateDiagnosticsCases(): Promise<{
     const d = await diagnosePaymentCandidate(FP, saved(), HH, w.diag);
     const verdict = await checkExistingPayment({ manualTxnId: TXN, eventId: null }, w.input);
     check(
-      'DIAG-4 manualTxnId + queue terminal-failed create → STILL live · source queue · failed + lastError shown; /input says exists',
+      'DIAG-4 manualTxnId + queue terminal-failed create → STILL live · source queue · failed + lastError shown; /input says queued-failed (not "already")',
       d.manual?.liveness === 'live' && d.manual.source === 'queue' && d.manual.queued?.failed === true &&
         d.manual.queued.lastError === '거래를 저장하지 못했어요.' && d.manual.queued.lastErrorReason === 'error' &&
-        w.calls.server === 0 && verdict.kind === 'exists',
+        w.calls.server === 0 && verdict.kind === 'queued' && verdict.failed,
       JSON.stringify({ d, verdict }),
     );
   }

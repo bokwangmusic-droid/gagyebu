@@ -377,6 +377,43 @@ export function markCandidatePending(state: PaymentCandidateState, fingerprint: 
 }
 
 /**
+ * The manual save recorded on this candidate (`transactionId` in
+ * `householdId`) is not in the ledger — no such row, nothing queued
+ * (existingPayment.ts findOrphanedManualSaves). Only that record and the
+ * 처리 완료 it gave are dropped: the candidate is 확인 대기 again and can be
+ * entered anew; its server registration and 보냄 stay. A candidate with an
+ * automatic save or a refund on it, or whose record changed meanwhile, is
+ * left as it is.
+ */
+export function clearOrphanedManualSave(
+  state: PaymentCandidateState,
+  fingerprint: string,
+  transactionId: string,
+  householdId: string,
+): PaymentCandidateState {
+  const entry = state[fingerprint];
+  if (
+    !entry ||
+    entry.manualTxnId !== transactionId ||
+    entry.manualHouseholdId !== householdId ||
+    entry.autoSaveTxnId ||
+    entry.refundTxnId
+  ) {
+    return state;
+  }
+  const {
+    handledAt: _h,
+    manualTxnId: _t,
+    manualHouseholdId: _hh,
+    manualSavedAt: _s,
+    manualLinkedAt: _l,
+    manualLinkFailedAt: _f,
+    ...rest
+  } = entry;
+  return { ...state, [fingerprint]: rest };
+}
+
+/**
  * Validates stored state (anything malformed is dropped), forgets entries
  * untouched for 30 days — far past the 7-day capture buffer — and keeps at
  * most 300, most recently touched first.

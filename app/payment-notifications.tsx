@@ -65,6 +65,7 @@ import {
 } from '@/lib/paymentNotification/autoSave';
 import {
   buildPaymentInbox,
+  clearOrphanedManualSave,
   markCandidateHandled,
   splitPaymentInbox,
   markCandidatePending,
@@ -79,6 +80,7 @@ import {
   type QueuedTransactionDiagnostic,
 } from '@/lib/paymentNotification/candidateDiagnostics';
 import { capturedNotificationLabel, paymentCandidateStatusLabel } from '@/lib/paymentNotification/candidateStatusLabel';
+import { findOrphanedManualSaves } from '@/lib/paymentNotification/existingPayment';
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import {
   REFUND_BLOCKER_MESSAGE,
@@ -151,6 +153,7 @@ export default function PaymentNotifications() {
   // can never overwrite it with an empty map.
   const [candidateState, setCandidateState] = useState<PaymentCandidateState>({});
   const [candidateStateLoaded, setCandidateStateLoaded] = useState(false);
+  const [focusLoads, setFocusLoads] = useState(0);
   const candidateStateRef = useRef<PaymentCandidateState>({});
   // Bumped on every local change, so a focus reload that started before it
   // never replaces it.
@@ -196,6 +199,7 @@ export default function PaymentNotifications() {
         candidateStateRef.current = loaded;
         setCandidateState(loaded);
         setCandidateStateLoaded(true);
+        setFocusLoads((n) => n + 1);
       });
       return () => {
         alive = false;
@@ -250,6 +254,35 @@ export default function PaymentNotifications() {
   // no offline change pending can be deleted (the delete needs the token).
   const finance = useFinanceRead();
   const pending = usePendingWrites();
+
+  // A 처리 완료 from a manual save whose transaction is not in this
+  // household's ledger at all — no row, nothing queued — goes back to 확인
+  // 대기 (findOrphanedManualSaves → clearOrphanedManualSave). Once per focus,
+  // and only with the offline queue loaded: before that a queued create would
+  // read as missing.
+  const queueReady = pending.hydration === 'ready';
+  useEffect(() => {
+    if (!candidateStateLoaded || !householdId || !queueReady) return;
+    let alive = true;
+    const queued = (id: string) => {
+      const op = pending.opByEntity.get(id);
+      return op ? { op, failed: pending.failedTransactionIds.has(id) } : null;
+    };
+    void findOrphanedManualSaves(candidateStateRef.current, householdId, {
+      queued,
+      serverLiveness: (id) => paymentTransactionLiveness(householdId, id),
+    }).then((orphans) => {
+      if (!alive) return;
+      for (const o of orphans) {
+        updateCandidateState((state) => clearOrphanedManualSave(state, o.fingerprint, o.transactionId, householdId));
+      }
+    });
+    return () => {
+      alive = false;
+    };
+    // Once per focus load; the queue is read as it is at that moment.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusLoads, candidateStateLoaded, householdId, queueReady]);
   const deletableIds = useMemo(() => {
     const ids = new Set<string>();
     for (const t of finance.transactions) {

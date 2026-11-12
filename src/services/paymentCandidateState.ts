@@ -16,6 +16,7 @@ import {
 } from '@/lib/paymentNotification/candidateAutoHandle';
 import { paymentCandidateTransactionId } from '@/lib/paymentNotification/autoSave';
 import {
+  clearOrphanedManualSave,
   prunePaymentCandidateState,
   type PaymentCandidateState,
 } from '@/lib/paymentNotification/candidateInbox';
@@ -85,6 +86,27 @@ export function resolvePaymentCandidateTransactionId(
   return loadPaymentCandidateState()
     .then((state) => paymentCandidateTransactionId(state, sourceCandidateId, householdId))
     .catch(() => null);
+}
+
+/**
+ * The candidate's manual save `transactionId` was confirmed not in this
+ * household's ledger: its record and 처리 완료 are dropped
+ * (clearOrphanedManualSave). Never rejects; `false` = not changed.
+ */
+export function clearOrphanedPaymentCandidate(
+  sourceCandidateId: string,
+  transactionId: string,
+  householdId: string,
+): Promise<boolean> {
+  return serial(async () => {
+    const raw = await loadItem<unknown>(KEY, null);
+    if (raw == null) return false;
+    const state = prunePaymentCandidateState(raw, Date.now());
+    const next = clearOrphanedManualSave(state, sourceCandidateId, transactionId, householdId);
+    if (next === state) return false;
+    await saveItem(KEY, prunePaymentCandidateState(next, Date.now()));
+    return true;
+  }).catch(() => false);
 }
 
 /**
