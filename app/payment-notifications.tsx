@@ -70,6 +70,7 @@ import {
   markCandidatePending,
   markCandidateSent,
   type PaymentCandidateState,
+  type PaymentCandidateStateEntry,
   type PaymentInboxItem,
 } from '@/lib/paymentNotification/candidateInbox';
 import {
@@ -77,6 +78,7 @@ import {
   type CandidateDiagnostic,
   type QueuedTransactionDiagnostic,
 } from '@/lib/paymentNotification/candidateDiagnostics';
+import { capturedNotificationLabel, paymentCandidateStatusLabel } from '@/lib/paymentNotification/candidateStatusLabel';
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import {
   REFUND_BLOCKER_MESSAGE,
@@ -144,6 +146,7 @@ export default function PaymentNotifications() {
   const [packageDraft, setPackageDraft] = useState('');
   const [listOpen, setListOpen] = useState(false);
   const [handledOpen, setHandledOpen] = useState(false);
+  const [devInfoOpen, setDevInfoOpen] = useState(false);
   // 후보함 status (device-local). Actions wait for the stored state so a tap
   // can never overwrite it with an empty map.
   const [candidateState, setCandidateState] = useState<PaymentCandidateState>({});
@@ -508,7 +511,12 @@ export default function PaymentNotifications() {
                 )}
                 {autoSavedOpen &&
                   autoSavedItems.map((item) => (
-                    <InboxCard key={item.fingerprint} item={item} disabled={!candidateStateLoaded} />
+                    <InboxCard
+                      key={item.fingerprint}
+                      item={item}
+                      entry={candidateState[item.fingerprint]}
+                      disabled={!candidateStateLoaded}
+                    />
                   ))}
               </Panel>
             )}
@@ -520,6 +528,7 @@ export default function PaymentNotifications() {
                 <InboxCard
                   key={item.fingerprint}
                   item={item}
+                  entry={candidateState[item.fingerprint]}
                   disabled={!candidateStateLoaded}
                   autoSaveOn={PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED && autoSaveSince != null}
                   onInput={() => openInput(item)}
@@ -551,6 +560,7 @@ export default function PaymentNotifications() {
                   <InboxCard
                     key={item.fingerprint}
                     item={item}
+                    entry={candidateState[item.fingerprint]}
                     disabled={!candidateStateLoaded}
                     onPending={() => updateCandidateState((state) => markCandidatePending(state, item.fingerprint))}
                   />
@@ -571,7 +581,14 @@ export default function PaymentNotifications() {
                   void reload();
                 }}
               />
-              {listOpen && !!householdId && (
+              {/* Internal ids / queue / server state: development builds only, folded by default. */}
+              {__DEV__ && listOpen && !!householdId && (
+                <ActionButton
+                  label={devInfoOpen ? '개발자 정보 접기' : '개발자 정보 보기'}
+                  onPress={() => setDevInfoOpen((open) => !open)}
+                />
+              )}
+              {__DEV__ && listOpen && devInfoOpen && !!householdId && (
                 <CandidateDiagnosticsList items={inbox.items} state={candidateState} householdId={householdId} />
               )}
               {listOpen && captured.length === 0 && <Text style={bodyStyle}>아직 캡처된 알림이 없어요.</Text>}
@@ -632,7 +649,7 @@ function Panel({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * QA diagnostics (read-only): each 후보's stored state and, for a recorded
+ * QA diagnostics (read-only, __DEV__ builds only): each 후보's stored state and, for a recorded
  * manual save, the liveness /input's existing-payment check would get and
  * whether this device's offline queue or the server decided it
  * (candidateDiagnostics.ts). Nothing here writes.
@@ -765,6 +782,7 @@ interface RefundCardProps {
  */
 function InboxCard({
   item,
+  entry,
   disabled,
   autoSaveOn,
   onInput,
@@ -773,6 +791,8 @@ function InboxCard({
   refund,
 }: {
   item: PaymentInboxItem;
+  /** Its stored state — read for the status label only. */
+  entry: PaymentCandidateStateEntry | undefined;
   disabled: boolean;
   /** STEP 6: the setting is on — say why a card payment is not saved by itself. */
   autoSaveOn?: boolean;
@@ -802,14 +822,7 @@ function InboxCard({
       }}
     >
       <Text style={muted}>
-        {formatPostedAt(c.occurredAt)} · {CONFIDENCE_LABEL[c.confidence]}
-        {item.autoSaved
-          ? ' · 자동저장됨'
-          : item.status === 'handled'
-            ? ' · 처리 완료'
-            : item.sentToInput
-              ? ' · 입력 화면으로 보냄'
-              : ''}
+        {formatPostedAt(c.occurredAt)} · {CONFIDENCE_LABEL[c.confidence]} · {paymentCandidateStatusLabel(item, entry)}
       </Text>
       <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>
         {KIND_LABEL[item.kind]} · {fmt(c.amount ?? 0)}원
@@ -981,24 +994,23 @@ function CandidatePreview({ candidate }: { candidate: ParsedPaymentCandidate | n
   } as const;
   const line = { fontFamily: fontFamily.regular, fontSize: 12, color: colors.textSub } as const;
   const muted = { fontFamily: fontFamily.medium, fontSize: 11, color: colors.textMuted } as const;
-  if (candidate?.ignoredReason) {
+  const notCandidate = capturedNotificationLabel(candidate);
+  if (notCandidate || !candidate || candidate.amount == null) {
     return (
       <View style={boxStyle}>
         <Text style={muted}>해석 결과</Text>
-        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.textMuted }}>
-          거래 후보 아님 · 광고/혜택 알림
+        <Text
+          style={{
+            fontFamily: fontFamily.bold,
+            fontSize: 12,
+            color: candidate?.ignoredReason ? colors.textMuted : colors.warningText,
+          }}
+        >
+          {notCandidate}
         </Text>
-      </View>
-    );
-  }
-  if (!candidate || candidate.direction === 'unknown' || candidate.amount == null) {
-    return (
-      <View style={boxStyle}>
-        <Text style={muted}>해석 결과</Text>
-        <Text style={{ fontFamily: fontFamily.bold, fontSize: 12, color: colors.warningText }}>
-          해석 불가 / 확인 필요{!candidate ? ' · 지원하지 않는 알림' : ''}
-        </Text>
-        {!!candidate && candidate.reasons.length > 0 && <Text style={muted}>{candidate.reasons.join(' · ')}</Text>}
+        {!!candidate && !candidate.ignoredReason && candidate.reasons.length > 0 && (
+          <Text style={muted}>{candidate.reasons.join(' · ')}</Text>
+        )}
       </View>
     );
   }
