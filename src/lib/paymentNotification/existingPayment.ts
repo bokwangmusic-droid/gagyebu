@@ -24,15 +24,50 @@
  *   stale    saved before but deleted / gone → the user decides; a re-entry
  *            gets a NEW ordinary id (the deleted row may still hold the
  *            derived one) and is not linked to a handled event.
+ *   mismatch its own record is alive but not this payment's amount / type
+ *            → never "already": the user decides, as for stale; the row
+ *            itself is never touched.
  *   unknown  could not be checked → nothing is saved, nothing is recorded.
  * The automatic save (autoSave.ts) is not affected: a handled event is never
  * saved again there. Pure apart from the injected IO; never throws.
  */
 import type { PaymentEventLinkResult } from '@/lib/paymentNotification/autoSave';
+import type { TxnType } from '@/data/categories';
 import type { ManualLinkState, PaymentCandidateState } from '@/lib/paymentNotification/candidateInbox';
 
 /** `missing` = no such row in this household; `unknown` = could not be read. */
 export type PaymentTransactionLiveness = 'live' | 'deleted' | 'missing' | 'unknown';
+
+/** What the candidate itself says the payment was (its 시작값, not the form's). */
+export interface PaymentCandidateExpected {
+  amount: number;
+  type: TxnType;
+}
+
+/**
+ * The candidate's own record read back against the candidate: alive AND the
+ * same amount / type (`live-match`), alive but another payment
+ * (`live-mismatch`, with that row's amount), or as PaymentTransactionLiveness.
+ * The memo is never compared — the user may change it when saving.
+ */
+export type PaymentTransactionMatch =
+  | { state: 'live-match' }
+  | { state: 'live-mismatch'; amount: number }
+  | { state: 'deleted' | 'missing' | 'unknown' };
+
+/** Pure: a row (this household's, read by id) against the candidate. */
+export function matchPaymentTransactionRow(
+  row: { amount: unknown; type: unknown; deleted_at: unknown } | null,
+  expected: PaymentCandidateExpected,
+): PaymentTransactionMatch {
+  if (!row) return { state: 'missing' };
+  if (row.deleted_at != null) return { state: 'deleted' };
+  const amount = Number(row.amount);
+  if (!Number.isFinite(amount)) return { state: 'unknown' };
+  return amount === expected.amount && row.type === expected.type
+    ? { state: 'live-match' }
+    : { state: 'live-mismatch', amount };
+}
 
 /** This device's offline-queue op for the transaction (usePendingWrites; ≤1 per id). */
 export interface QueuedTransactionOp {
@@ -68,6 +103,11 @@ export interface ExistingPaymentIO {
   queued?: (transactionId: string) => QueuedTransactionOp | null;
   getLink: (eventId: string) => Promise<PaymentEventLinkResult>;
   liveness: (transactionId: string) => Promise<PaymentTransactionLiveness>;
+  /**
+   * The server row (never the queue) against the candidate
+   * (paymentTransactionMatch). Unset = only liveness is known.
+   */
+  match?: (transactionId: string, expected: PaymentCandidateExpected) => Promise<PaymentTransactionMatch>;
   /** complete_payment_notification_event(…, 'manual') — confirmPaymentEventTransaction. */
   confirm: (eventId: string, transactionId: string) => Promise<'exists' | 'missing' | 'unknown'>;
 }
@@ -85,6 +125,12 @@ export type ExistingPaymentVerdict =
   | { kind: 'queued'; transactionId: string; failed: boolean }
   /** `orphaned`: the candidate's own record, confirmed not in this household at all. */
   | { kind: 'stale'; link: ManualLinkState; orphaned?: string }
+  /**
+   * The candidate's own record is alive but another amount / type than the
+   * candidate — maybe a deliberate correction, maybe another payment: never
+   * "already", the user decides. `link`: as for stale, if entered anew.
+   */
+  | { kind: 'mismatch'; transactionId: string; amount: number; expectedAmount: number; link: ManualLinkState }
   | { kind: 'unknown' };
 
 export const EXISTING_PAYMENT_MESSAGE = {
@@ -94,30 +140,62 @@ export const EXISTING_PAYMENT_MESSAGE = {
   unknown: '기존 거래 확인이 필요해요. 인터넷 연결 후 다시 시도해 주세요.',
   staleTitle: '다시 입력할까요?',
   staleBody: '이 결제는 이전에 가계부에 입력됐지만 현재 거래가 삭제되어 있어요. 다시 입력할까요?',
+  mismatchTitle: '새로 입력할까요?',
+  mismatchNotice: '연결된 거래 금액이 달라요',
 } as const;
+
+/** The mismatch confirmation body (/input). */
+export function paymentMismatchBody(expectedAmount: number, linkedAmount: number): string {
+  const won = (n: number) => `${n.toLocaleString('ko-KR')}원`;
+  return `이 결제에 연결된 기존 거래의 금액이 달라요.\n\n알림 금액: ${won(expectedAmount)}\n연결된 거래: ${won(linkedAmount)}\n\n이 결제를 새로 입력할까요?`;
+}
+
+/**
+ * The candidate's own record: the queue's word first (a pending delete), then
+ * the server row — against the candidate when `expected` is known.
+ */
+async function ownRecordState(
+  transactionId: string,
+  queued: QueuedTransactionOp | null,
+  expected: PaymentCandidateExpected | null,
+  io: ExistingPaymentIO,
+): Promise<PaymentTransactionMatch> {
+  const fromQueue = queuedTransactionLiveness(queued);
+  if (fromQueue === 'deleted') return { state: 'deleted' };
+  if (expected && io.match) return io.match(transactionId, expected);
+  const live = await io.liveness(transactionId);
+  return live === 'live' ? { state: 'live-match' } : { state: live };
+}
 
 /**
  * Before the insert. `manualTxnId`: the candidate's own record in THIS
- * household; `eventId`: its registered server event in this household.
+ * household; `eventId`: its registered server event in this household;
+ * `expected`: the candidate's own amount / type — its record counts as this
+ * payment only when they match.
  */
 export async function checkExistingPayment(
-  known: { manualTxnId: string | null; eventId: string | null },
+  known: { manualTxnId: string | null; eventId: string | null; expected?: PaymentCandidateExpected | null },
   io: ExistingPaymentIO,
 ): Promise<ExistingPaymentVerdict> {
   try {
     let savedBefore = false;
     let orphaned: string | undefined;
+    let mismatch: { transactionId: string; amount: number; expectedAmount: number } | undefined;
     if (known.manualTxnId) {
       const queued = io.queued?.(known.manualTxnId) ?? null;
       if (queued?.op === 'create') return { kind: 'queued', transactionId: known.manualTxnId, failed: queued.failed };
-      const own = await io.liveness(known.manualTxnId);
-      if (own === 'live') return { kind: 'exists', transactionId: known.manualTxnId, link: null };
-      if (own === 'unknown') return { kind: 'unknown' };
+      const own = await ownRecordState(known.manualTxnId, queued, known.expected ?? null, io);
+      if (own.state === 'live-match') return { kind: 'exists', transactionId: known.manualTxnId, link: null };
+      if (own.state === 'unknown') return { kind: 'unknown' };
       savedBefore = true;
       // Not an orphan while ANY op for it is still queued (findOrphanedManualSaves).
-      if (own === 'missing' && !queued) orphaned = known.manualTxnId;
+      if (own.state === 'missing' && !queued) orphaned = known.manualTxnId;
+      if (own.state === 'live-mismatch' && known.expected) {
+        mismatch = { transactionId: known.manualTxnId, amount: own.amount, expectedAmount: known.expected.amount };
+      }
     }
-    const stale = (link: ManualLinkState): ExistingPaymentVerdict => ({ kind: 'stale', link, ...(orphaned ? { orphaned } : {}) });
+    const stale = (link: ManualLinkState): ExistingPaymentVerdict =>
+      mismatch ? { kind: 'mismatch', ...mismatch, link } : { kind: 'stale', link, ...(orphaned ? { orphaned } : {}) };
     if (!known.eventId) return savedBefore ? stale('never') : { kind: 'new' };
 
     const link = await io.getLink(known.eventId);
@@ -140,7 +218,7 @@ export async function checkExistingPayment(
 }
 
 export type RefusedInsertVerdict =
-  | Exclude<ExistingPaymentVerdict, { kind: 'new' } | { kind: 'queued' }>
+  | Exclude<ExistingPaymentVerdict, { kind: 'new' } | { kind: 'queued' } | { kind: 'mismatch' }>
   | { kind: 'failed' };
 
 /**
@@ -196,6 +274,40 @@ export async function findOrphanedManualSaves(
     try {
       if (io.queued(id)) continue;
       if ((await io.serverLiveness(id)) === 'missing') out.push({ fingerprint, transactionId: id });
+    } catch {
+      // unreadable: left as it is
+    }
+  }
+  return out;
+}
+
+/**
+ * 후보함: the candidates whose manual save is alive in this household but
+ * not their amount / type — shown as 확인 필요, never cleared from here (the
+ * user may have corrected the amount on purpose; /input asks). Same scope as
+ * findOrphanedManualSaves, handled or not; a candidate whose own amount is
+ * not known any more (`expected` null) is skipped. Read only; never throws.
+ */
+export async function findMismatchedManualSaves(
+  state: PaymentCandidateState,
+  householdId: string,
+  io: {
+    queued: (transactionId: string) => QueuedTransactionOp | null;
+    expected: (fingerprint: string) => PaymentCandidateExpected | null;
+    /** The server row alone (paymentTransactionMatch), never the queue. */
+    serverMatch: (transactionId: string, expected: PaymentCandidateExpected) => Promise<PaymentTransactionMatch>;
+  },
+): Promise<{ fingerprint: string; transactionId: string; amount: number }[]> {
+  const out: { fingerprint: string; transactionId: string; amount: number }[] = [];
+  for (const [fingerprint, entry] of Object.entries(state)) {
+    const id = entry.manualTxnId;
+    if (!id || entry.manualHouseholdId !== householdId) continue;
+    if (entry.autoSaveTxnId || entry.refundTxnId) continue;
+    try {
+      const expected = io.expected(fingerprint);
+      if (!expected || io.queued(id)) continue;
+      const m = await io.serverMatch(id, expected);
+      if (m.state === 'live-mismatch') out.push({ fingerprint, transactionId: id, amount: m.amount });
     } catch {
       // unreadable: left as it is
     }

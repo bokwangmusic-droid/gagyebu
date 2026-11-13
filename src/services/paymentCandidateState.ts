@@ -90,8 +90,10 @@ export function resolvePaymentCandidateTransactionId(
 
 /**
  * The candidate's manual save `transactionId` was confirmed not in this
- * household's ledger: its record and 처리 완료 are dropped
- * (clearOrphanedManualSave). Never rejects; `false` = not changed.
+ * household's ledger — or the user chose to enter it anew after it read
+ * back as another amount: its record and 처리 완료 are dropped
+ * (clearOrphanedManualSave; the transaction itself is never touched). Never
+ * rejects; `false` = not changed.
  */
 export function clearOrphanedPaymentCandidate(
   sourceCandidateId: string,

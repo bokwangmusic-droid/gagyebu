@@ -48,6 +48,7 @@ import {
   checkExistingPayment,
   checkRefusedPaymentInsert,
   EXISTING_PAYMENT_MESSAGE,
+  paymentMismatchBody,
   type ExistingPaymentVerdict,
 } from '@/lib/paymentNotification/existingPayment';
 import { existingPaymentIO } from '@/services/paymentAutoSave';
@@ -1036,23 +1037,34 @@ function TransactionForm({
         setSubmitting(false);
         toast.show(message);
       };
-      // Saved before, but that transaction is deleted / gone: only the user
-      // may add it again — with a new ordinary id, never the event's.
-      const offerReentry = async (link: NonNullable<typeof reentryLink>) => {
+      // Saved before, but that transaction is deleted / gone (or, asked
+      // otherwise, another payment): only the user may add it again — with a
+      // new ordinary id, never the event's. `beforeReentry` runs only once
+      // the user said yes.
+      const offerReentry = async (
+        link: NonNullable<typeof reentryLink>,
+        ask: { title: string; body: string; confirm: string } = {
+          title: EXISTING_PAYMENT_MESSAGE.staleTitle,
+          body: EXISTING_PAYMENT_MESSAGE.staleBody,
+          confirm: '다시 입력',
+        },
+        beforeReentry?: () => Promise<unknown>,
+      ) => {
         submittingRef.current = false;
         setSubmitting(false);
         const again = await new Promise<boolean>((resolve) =>
           Alert.alert(
-            EXISTING_PAYMENT_MESSAGE.staleTitle,
-            EXISTING_PAYMENT_MESSAGE.staleBody,
+            ask.title,
+            ask.body,
             [
               { text: '취소', style: 'cancel', onPress: () => resolve(false) },
-              { text: '다시 입력', onPress: () => resolve(true) },
+              { text: ask.confirm, onPress: () => resolve(true) },
             ],
             { cancelable: true, onDismiss: () => resolve(false) },
           ),
         );
         if (!again) return;
+        if (beforeReentry) await beforeReentry();
         reentryLinkRef.current = link;
         transactionIdRef.current = uid('txn');
         paymentEventIdRef.current = null;
@@ -1067,7 +1079,8 @@ function TransactionForm({
       const eventId = paymentEventIdRef.current;
       if (sourceCandidateId && !reentryLink) {
         const manualTxnId = await loadPaymentCandidateManualTransactionId(sourceCandidateId, householdId);
-        const verdict = await checkExistingPayment({ manualTxnId, eventId }, io);
+        const expected = prefill ? { amount: prefill.amount, type: prefill.type } : null;
+        const verdict = await checkExistingPayment({ manualTxnId, eventId, expected }, io);
         if (verdict.kind === 'exists') {
           await leaveAlreadyHandled(verdict);
           return;
@@ -1097,6 +1110,23 @@ function TransactionForm({
           // was wrong — back to 확인 대기 whether or not it is entered again.
           if (verdict.orphaned) await clearOrphanedPaymentCandidate(sourceCandidateId, verdict.orphaned, householdId);
           await offerReentry(verdict.link);
+          return;
+        }
+        // Its own record is alive but another amount / type: maybe corrected
+        // on purpose, maybe another payment — the user decides. Only a yes
+        // drops that record from the candidate; the transaction itself is
+        // never touched, and the new one gets a new ordinary id.
+        if (verdict.kind === 'mismatch') {
+          const stale = verdict.transactionId;
+          await offerReentry(
+            verdict.link,
+            {
+              title: EXISTING_PAYMENT_MESSAGE.mismatchTitle,
+              body: paymentMismatchBody(verdict.expectedAmount, verdict.amount),
+              confirm: '새로 입력',
+            },
+            () => clearOrphanedPaymentCandidate(sourceCandidateId, stale, householdId),
+          );
           return;
         }
       }

@@ -17,9 +17,12 @@ import type {
   PaymentLinkSource,
 } from '@/lib/paymentNotification/autoSave';
 import {
+  matchPaymentTransactionRow,
   queuedTransactionLiveness,
   type ExistingPaymentIO,
+  type PaymentCandidateExpected,
   type PaymentTransactionLiveness,
+  type PaymentTransactionMatch,
   type QueuedTransactionOp,
 } from '@/lib/paymentNotification/existingPayment';
 import { loadItem, saveItem } from '@/lib/storage';
@@ -149,6 +152,35 @@ export async function paymentTransactionLiveness(
 }
 
 /**
+ * The candidate's own record against the candidate (existingPayment.ts
+ * matchPaymentTransactionRow): this household's row only, amount / type
+ * compared, the memo never. Read only — the row is never changed. No session
+ * / any read failure is `unknown`, as for paymentTransactionLiveness.
+ * Never throws.
+ */
+export async function paymentTransactionMatch(
+  householdId: string,
+  transactionId: string,
+  expected: PaymentCandidateExpected,
+): Promise<PaymentTransactionMatch> {
+  try {
+    const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+    if (sessionError || !sessionData.session?.user?.id) return { state: 'unknown' };
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('id,household_id,amount,type,deleted_at')
+      .eq('household_id', householdId)
+      .eq('id', transactionId)
+      .maybeSingle();
+    if (error) return { state: 'unknown' };
+    const row = data as { household_id: string; amount: unknown; type: unknown; deleted_at: unknown } | null;
+    return matchPaymentTransactionRow(row && row.household_id === householdId ? row : null, expected);
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
+/**
  * /input's "already in the ledger?" check (existingPayment.ts).
  * `queuedOp`: this device's offline-queue op for the id — a queued create
  * is alive and a pending delete is deleted before the server is asked
@@ -165,6 +197,7 @@ export function existingPaymentIO(
       const queued = queuedTransactionLiveness(queuedOp(transactionId));
       return queued ? Promise.resolve(queued) : paymentTransactionLiveness(householdId, transactionId);
     },
+    match: (transactionId, expected) => paymentTransactionMatch(householdId, transactionId, expected),
     confirm: (eventId, transactionId) => confirmPaymentEventTransaction(householdId, eventId, transactionId),
   };
 }

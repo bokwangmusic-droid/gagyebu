@@ -80,7 +80,11 @@ import {
   type QueuedTransactionDiagnostic,
 } from '@/lib/paymentNotification/candidateDiagnostics';
 import { capturedNotificationLabel, paymentCandidateStatusLabel } from '@/lib/paymentNotification/candidateStatusLabel';
-import { findOrphanedManualSaves } from '@/lib/paymentNotification/existingPayment';
+import {
+  EXISTING_PAYMENT_MESSAGE,
+  findMismatchedManualSaves,
+  findOrphanedManualSaves,
+} from '@/lib/paymentNotification/existingPayment';
 import type { ParsedPaymentCandidate } from '@/lib/paymentNotification/parserTypes';
 import {
   REFUND_BLOCKER_MESSAGE,
@@ -99,6 +103,7 @@ import {
 import {
   loadPaymentAutoSaveSince,
   paymentTransactionLiveness,
+  paymentTransactionMatch,
   savePaymentAutoSaveEnabled,
 } from '@/services/paymentAutoSave';
 import { loadPaymentCandidateState, updatePaymentCandidateState } from '@/services/paymentCandidateState';
@@ -283,6 +288,41 @@ export default function PaymentNotifications() {
     // Once per focus load; the queue is read as it is at that moment.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusLoads, candidateStateLoaded, householdId, queueReady]);
+
+  // A manual save alive in this household but not the candidate's amount /
+  // type: only SHOWN (확인 필요) — the amount may have been corrected on
+  // purpose. Nothing is cleared here; /input asks before entering it anew.
+  // Screen-only, never stored.
+  const [mismatched, setMismatched] = useState<Record<string, { transactionId: string; amount: number }>>({});
+  const inboxItemCount = inbox.items.length;
+  useEffect(() => {
+    if (!candidateStateLoaded || !householdId || !queueReady) return;
+    let alive = true;
+    const prefillOf = new Map(inbox.items.map((i) => [i.fingerprint, i.prefill] as const));
+    void findMismatchedManualSaves(candidateStateRef.current, householdId, {
+      queued: (id) => {
+        const op = pending.opByEntity.get(id);
+        return op ? { op, failed: pending.failedTransactionIds.has(id) } : null;
+      },
+      expected: (fingerprint) => {
+        const p = prefillOf.get(fingerprint);
+        return p ? { amount: p.amount, type: p.type } : null;
+      },
+      serverMatch: (id, expected) => paymentTransactionMatch(householdId, id, expected),
+    }).then((found) => {
+      if (!alive) return;
+      setMismatched(Object.fromEntries(found.map((m) => [m.fingerprint, { transactionId: m.transactionId, amount: m.amount }])));
+    });
+    return () => {
+      alive = false;
+    };
+    // Once per focus load (and once the notifications are read).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusLoads, candidateStateLoaded, householdId, queueReady, inboxItemCount]);
+  const mismatchAmountOf = (fingerprint: string): number | undefined => {
+    const m = mismatched[fingerprint];
+    return m && candidateState[fingerprint]?.manualTxnId === m.transactionId ? m.amount : undefined;
+  };
   const deletableIds = useMemo(() => {
     const ids = new Set<string>();
     for (const t of finance.transactions) {
@@ -562,6 +602,7 @@ export default function PaymentNotifications() {
                   key={item.fingerprint}
                   item={item}
                   entry={candidateState[item.fingerprint]}
+                  mismatchAmount={mismatchAmountOf(item.fingerprint)}
                   disabled={!candidateStateLoaded}
                   autoSaveOn={PAYMENT_NOTIFICATION_AUTO_SAVE_ENABLED && autoSaveSince != null}
                   onInput={() => openInput(item)}
@@ -594,6 +635,7 @@ export default function PaymentNotifications() {
                     key={item.fingerprint}
                     item={item}
                     entry={candidateState[item.fingerprint]}
+                    mismatchAmount={mismatchAmountOf(item.fingerprint)}
                     disabled={!candidateStateLoaded}
                     onPending={() => updateCandidateState((state) => markCandidatePending(state, item.fingerprint))}
                   />
@@ -816,6 +858,7 @@ interface RefundCardProps {
 function InboxCard({
   item,
   entry,
+  mismatchAmount,
   disabled,
   autoSaveOn,
   onInput,
@@ -826,6 +869,8 @@ function InboxCard({
   item: PaymentInboxItem;
   /** Its stored state — read for the status label only. */
   entry: PaymentCandidateStateEntry | undefined;
+  /** Its manual save is alive but this amount (findMismatchedManualSaves). */
+  mismatchAmount?: number;
   disabled: boolean;
   /** STEP 6: the setting is on — say why a card payment is not saved by itself. */
   autoSaveOn?: boolean;
@@ -860,6 +905,11 @@ function InboxCard({
       <Text style={{ fontFamily: fontFamily.bold, fontSize: 14, color: colors.text }}>
         {KIND_LABEL[item.kind]} · {fmt(c.amount ?? 0)}원
       </Text>
+      {mismatchAmount != null && (
+        <Text style={notice}>
+          확인 필요 · {EXISTING_PAYMENT_MESSAGE.mismatchNotice} (연결된 거래 {fmt(mismatchAmount)}원)
+        </Text>
+      )}
       {isCard ? (
         <>
           <Text style={line}>가맹점: {c.merchantCandidate ?? '확인 필요'}</Text>

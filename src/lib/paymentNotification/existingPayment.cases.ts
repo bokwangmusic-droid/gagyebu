@@ -39,8 +39,11 @@ import {
 import {
   checkExistingPayment,
   checkRefusedPaymentInsert,
+  findMismatchedManualSaves,
   findOrphanedManualSaves,
+  matchPaymentTransactionRow,
   queuedTransactionLiveness,
+  type PaymentCandidateExpected,
   type ExistingPaymentIO,
   type PaymentTransactionLiveness,
   type QueuedTransactionOp,
@@ -64,6 +67,10 @@ const FP = 'pc1_abc123';
 interface FakeTxn {
   householdId: string;
   deleted: boolean;
+  /** Its amount / type (unset: the stored row's, else the candidate's). */
+  amount?: number;
+  type?: string;
+  memo?: string;
   /** The stored row (created_by USER) when a case needs createTransaction's 23505 reconcile; unset = never the same request. */
   row?: TransactionInsertRow;
 }
@@ -116,6 +123,21 @@ function fakeServer(init: {
     queued: (id) => queued[id] ?? null,
     getLink,
     liveness,
+    // paymentTransactionMatch: the server row alone, this household only.
+    match: async (id, expected) => {
+      calls.liveness += 1;
+      if (init.fail?.liveness) return { state: 'unknown' };
+      const t = txns[id];
+      if (!t || t.householdId !== HH) return { state: 'missing' };
+      return matchPaymentTransactionRow(
+        {
+          amount: t.amount ?? t.row?.amount ?? expected.amount,
+          type: t.type ?? t.row?.type ?? expected.type,
+          deleted_at: t.deleted ? '2026-11-09T05:00:00.000Z' : null,
+        },
+        expected,
+      );
+    },
     confirm: async (_e, id) => {
       calls.confirm += 1;
       const s = complete(id);
@@ -180,7 +202,12 @@ type SaveResult =
   | { result: 'unknown' | 'cancelled' | 'failed'; prompted: boolean };
 
 /** /input save(), create branch, from candidate FP (app/input.tsx). */
-async function inputSave(srv: FakeServer, store: Store, answer: { reenter: boolean; newId: string }): Promise<SaveResult> {
+async function inputSave(
+  srv: FakeServer,
+  store: Store,
+  answer: { reenter: boolean; newId: string },
+  expected: PaymentCandidateExpected | null = null,
+): Promise<SaveResult> {
   const state = store.read();
   const derived = paymentCandidateTransactionId(state, FP, HH);
   let transactionId = derived?.transactionId ?? 'txn-ordinary';
@@ -192,7 +219,7 @@ async function inputSave(srv: FakeServer, store: Store, answer: { reenter: boole
 
   const entry = state[FP];
   const manualTxnId = entry?.manualTxnId && entry.manualHouseholdId === HH ? entry.manualTxnId : null;
-  const verdict = await checkExistingPayment({ manualTxnId, eventId }, srv.io);
+  const verdict = await checkExistingPayment({ manualTxnId, eventId, expected }, srv.io);
   if (verdict.kind === 'exists') {
     await settle(verdict.transactionId, verdict.link);
     return { result: 'exists', transactionId: verdict.transactionId, prompted };
@@ -207,6 +234,15 @@ async function inputSave(srv: FakeServer, store: Store, answer: { reenter: boole
     if (verdict.orphaned) store.write(clearOrphanedManualSave(store.read(), FP, verdict.orphaned, HH));
     prompted = true;
     if (!answer.reenter) return { result: 'cancelled', prompted };
+    link = verdict.link;
+    transactionId = answer.newId;
+    eventId = null;
+  }
+  if (verdict.kind === 'mismatch') {
+    prompted = true;
+    if (!answer.reenter) return { result: 'cancelled', prompted };
+    // Only on a yes: the record is dropped, the row itself never touched.
+    store.write(clearOrphanedManualSave(store.read(), FP, verdict.transactionId, HH));
     link = verdict.link;
     transactionId = answer.newId;
     eventId = null;
@@ -900,6 +936,197 @@ export async function runExistingPaymentCases(): Promise<{
         oF.length === 0 && sF.read()[FP2].handledAt != null && rF.result === 'queued-failed',
       JSON.stringify({ oA, after, rA, oU, rU, oF, rF }),
     );
+  }
+
+  // MISMATCH — the candidate's own record counts as this payment only with
+  // its amount / type (memo never compared). Another amount is never
+  // "already": the user is asked; only a yes drops the record, the row stays.
+  {
+    const EXP = { amount: 23_000, type: 'expense' } as const;
+    const X = 'txn-x';
+    const x18 = (extra: Partial<FakeTxn> = {}): Record<string, FakeTxn> => ({
+      [X]: { householdId: HH, deleted: false, amount: 18_900, type: 'expense', ...extra },
+    });
+    const snap = (srv: FakeServer) => JSON.stringify(srv.txns[X] ?? null);
+    const NEW = { reenter: true, newId: 'txn-fresh' };
+
+    {
+      const srv = fakeServer({ event: null, txns: x18() });
+      const v = await checkExistingPayment({ manualTxnId: X, eventId: null, expected: EXP }, srv.io);
+      check(
+        'MISMATCH-1 candidate 23,000 / its record X 18,900, same household, live → not exists: mismatch (amounts reported, link never)',
+        v.kind === 'mismatch' && v.transactionId === X && v.amount === 18_900 && v.expectedAmount === 23_000 && v.link === 'never',
+        JSON.stringify(v),
+      );
+    }
+    {
+      const srv = fakeServer({ event: null, txns: x18({ amount: 23_000, memo: '메모 수정됨' }) });
+      const store = memoryStore(manual(X));
+      const r = await inputSave(srv, store, YES, EXP);
+      // The amount as numeric text from PostgREST also matches.
+      const asText = matchPaymentTransactionRow({ amount: '23000', type: 'expense', deleted_at: null }, EXP);
+      check(
+        'MISMATCH-2 candidate 23,000 / X 23,000 (memo changed), same household, live → exists as before, create 0, kept handled',
+        r.result === 'exists' && r.transactionId === X && !r.prompted && srv.calls.creates.length === 0 &&
+          store.read()[FP].handledAt != null && asText.state === 'live-match',
+        JSON.stringify({ r, asText }),
+      );
+    }
+    {
+      const srv = fakeServer({ event: null, txns: x18() });
+      const before = snap(srv);
+      const store = memoryStore(manual(X, { registeredAt: NOW - 9000 }));
+      const r = await inputSave(srv, store, NEW, EXP);
+      const e = store.read()[FP];
+      check(
+        'MISMATCH-3 mismatch + 새로 입력 → asked; record replaced by ONE new transaction (new ordinary id, never X), handled with it; X untouched',
+        r.result === 'saved' && r.prompted && r.transactionId === 'txn-fresh' &&
+          JSON.stringify(srv.calls.creates) === '["txn-fresh"]' && snap(srv) === before &&
+          e.handledAt != null && e.manualTxnId === 'txn-fresh' && e.manualHouseholdId === HH && e.sentAt === NOW - 9000,
+        JSON.stringify({ r, e }),
+      );
+    }
+    {
+      // Registered candidate, its record the derived id at another amount,
+      // event linked to it: the re-entry is not linked — the server dedup stays.
+      const srv = fakeServer({
+        event: { status: 'handled', linked: DERIVED },
+        txns: { [DERIVED]: { householdId: HH, deleted: false, amount: 18_900, type: 'expense' } },
+      });
+      const store = memoryStore(
+        registered({ handledAt: NOW - 8000, manualTxnId: DERIVED, manualHouseholdId: HH, manualSavedAt: NOW - 8000, manualLinkedAt: NOW - 8000 }),
+      );
+      const r = await inputSave(srv, store, NEW, EXP);
+      const e = store.read()[FP];
+      const links = await runLinks(srv, store);
+      check(
+        'MISMATCH-3b registered, event linked to the mismatching derived row → 새로 입력: new ordinary id, link never, registration kept, event and row unchanged',
+        r.result === 'saved' && r.prompted && r.transactionId === 'txn-fresh' &&
+          e.manualTxnId === 'txn-fresh' && e.manualLinkFailedAt != null && e.registeredEventId === EVENT &&
+          links.jobs === 0 && srv.event!.linked === DERIVED && srv.txns[DERIVED].amount === 18_900 && !srv.txns[DERIVED].deleted,
+        JSON.stringify({ r, e, event: srv.event }),
+      );
+    }
+    {
+      const srv = fakeServer({ event: null, txns: x18() });
+      const before = snap(srv);
+      const store = memoryStore(manual(X));
+      const stateBefore = JSON.stringify(store.read());
+      const r = await inputSave(srv, store, NO, EXP);
+      check(
+        'MISMATCH-4 mismatch + 취소 → candidate state unchanged (still handled with X), create 0, X untouched',
+        r.result === 'cancelled' && r.prompted && srv.calls.creates.length === 0 &&
+          JSON.stringify(store.read()) === stateBefore && snap(srv) === before,
+        JSON.stringify(r),
+      );
+    }
+    {
+      // The device: 처리한 후보 → 확인 대기로 되돌리기 (handledAt only) → 가계부에 입력.
+      const srv = fakeServer({ event: null, txns: x18() });
+      const store = memoryStore(manual(X));
+      store.write(markCandidatePending(store.read(), FP));
+      const kept = store.read()[FP].manualTxnId;
+      const cancelled = await inputSave(srv, store, NO, EXP);
+      const afterCancel = store.read()[FP];
+      const r = await inputSave(srv, store, NEW, EXP);
+      check(
+        'MISMATCH-5 확인 대기로 되돌린 후 stale manualTxnId X → not re-fixed as "already": asked; 취소 stays 확인 대기; 새로 입력 → saved once',
+        kept === X && cancelled.result === 'cancelled' && cancelled.prompted &&
+          afterCancel.handledAt == null && afterCancel.manualTxnId === X &&
+          r.result === 'saved' && r.prompted && JSON.stringify(srv.calls.creates) === '["txn-fresh"]' &&
+          store.read()[FP].handledAt != null && store.read()[FP].manualTxnId === 'txn-fresh',
+        JSON.stringify({ cancelled, afterCancel, r }),
+      );
+    }
+    {
+      const srv = fakeServer({ event: null, txns: { [X]: { householdId: OTHER_HH, deleted: false, amount: 23_000, type: 'expense' } } });
+      const before = snap(srv);
+      const v = await checkExistingPayment({ manualTxnId: X, eventId: null, expected: EXP }, srv.io);
+      // A record made in the other household is never this household's.
+      const store = memoryStore(manual(X, { manualHouseholdId: OTHER_HH }));
+      const r = await inputSave(srv, store, NO, EXP);
+      check(
+        'MISMATCH-6 X only in ANOTHER household → never exists here (missing → stale, orphaned); the other household record unused; its row untouched',
+        v.kind === 'stale' && v.orphaned === X && r.result === 'saved' && r.transactionId === 'txn-ordinary' && snap(srv) === before,
+        JSON.stringify({ v, r }),
+      );
+    }
+    {
+      const v = await checkExistingPayment(
+        { manualTxnId: X, eventId: null, expected: EXP },
+        fakeServer({ event: null, txns: x18({ amount: 23_000, deleted: true }) }).io,
+      );
+      const mis = await checkExistingPayment(
+        { manualTxnId: X, eventId: null, expected: EXP },
+        fakeServer({ event: null, txns: x18({ deleted: true }) }).io,
+      );
+      check(
+        'MISMATCH-7 deleted row (same or other amount) → the deleted policy as before: stale, not orphaned, not mismatch',
+        v.kind === 'stale' && !v.orphaned && mis.kind === 'stale' && !mis.orphaned,
+        JSON.stringify({ v, mis }),
+      );
+    }
+    for (const failed of [false, true]) {
+      const srv = fakeServer({ event: null, txns: x18(), queued: { [X]: { op: 'create', failed } } });
+      const store = memoryStore(manual(X));
+      const r = await inputSave(srv, store, YES, EXP);
+      const shown = await findMismatchedManualSaves(manual(X), HH, {
+        queued: (id) => (id === X ? { op: 'create', failed } : null),
+        expected: () => EXP,
+        serverMatch: srv.io.match!,
+      });
+      check(
+        `MISMATCH-8 queue ${failed ? 'failed' : 'pending'} create of X (server row 18,900) → ${failed ? 'queued-failed' : 'queued'} as before; server amount never read, nothing shown`,
+        r.result === (failed ? 'queued-failed' : 'queued') && srv.calls.liveness === 0 && srv.calls.creates.length === 0 && shown.length === 0,
+        JSON.stringify({ r, shown }),
+      );
+    }
+    {
+      const srv = fakeServer({ event: null, txns: x18(), fail: { liveness: true } });
+      const store = memoryStore(manual(X));
+      const before = JSON.stringify(store.read());
+      const r = await inputSave(srv, store, YES, EXP);
+      const shown = await findMismatchedManualSaves(store.read(), HH, { queued: () => null, expected: () => EXP, serverMatch: srv.io.match! });
+      const bad = matchPaymentTransactionRow({ amount: 'x', type: 'expense', deleted_at: null }, EXP);
+      check(
+        'MISMATCH-9 no session / network error (unknown) → unknown: nothing asked, created, cleared or shown; an unreadable amount is unknown too',
+        r.result === 'unknown' && !r.prompted && srv.calls.creates.length === 0 && JSON.stringify(store.read()) === before &&
+          shown.length === 0 && bad.state === 'unknown',
+        JSON.stringify({ r, shown, bad }),
+      );
+    }
+    {
+      // 후보함: shown only — refund / auto / matching / no longer captured skipped, nothing written.
+      const srv = fakeServer({
+        event: null,
+        txns: {
+          ...x18(),
+          'txn-ok': { householdId: HH, deleted: false, amount: 23_000, type: 'expense' },
+          'txn-inc': { householdId: HH, deleted: false, amount: 23_000, type: 'income' },
+        },
+      });
+      const state: PaymentCandidateState = {
+        ...manual(X),
+        pc1_ok: { handledAt: NOW - 8000, manualTxnId: 'txn-ok', manualHouseholdId: HH, manualSavedAt: NOW - 8000 },
+        pc1_inc: { manualTxnId: 'txn-inc', manualHouseholdId: HH, manualSavedAt: NOW - 8000 },
+        pc1_refund: { handledAt: NOW - 8000, manualTxnId: X, manualHouseholdId: HH, manualSavedAt: NOW - 8000, refundTxnId: 'txn-o', refundedAt: NOW - 8000 },
+        pc1_auto: { handledAt: NOW - 8000, manualTxnId: X, manualHouseholdId: HH, manualSavedAt: NOW - 8000, autoSaveTxnId: 'txn-a', autoSavedAt: NOW - 8000 },
+        pc1_gone: { handledAt: NOW - 8000, manualTxnId: X, manualHouseholdId: HH, manualSavedAt: NOW - 8000 },
+      };
+      const before = JSON.stringify(state);
+      const shown = await findMismatchedManualSaves(state, HH, {
+        queued: () => null,
+        expected: (fp) => (fp === 'pc1_gone' ? null : EXP),
+        serverMatch: srv.io.match!,
+      });
+      const orphans = await orphansOf(srv, state);
+      check(
+        'MISMATCH-10 후보함 scan → only mismatching manual saves (amount or type), handled or 확인 대기; refund / auto / matching / no longer captured skipped; state not written; never an orphan',
+        JSON.stringify(shown.map((m) => [m.fingerprint, m.amount])) === JSON.stringify([[FP, 18_900], ['pc1_inc', 23_000]]) &&
+          JSON.stringify(state) === before && orphans.length === 0,
+        JSON.stringify({ shown, orphans }),
+      );
+    }
   }
 
   // CASE 10 — the automatic save keeps its policy, and stays off.
